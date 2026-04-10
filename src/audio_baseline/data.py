@@ -1,0 +1,94 @@
+"""Audio Dataset and Preprocessing (librosa + transformers)."""
+
+import torch
+from torch.utils.data import Dataset
+import librosa
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from transformers import Wav2Vec2FeatureExtractor
+
+class AudioEmotionDataset(Dataset):
+    def __init__(
+        self, 
+        csv_path: Path, 
+        data_root: Path, 
+        feature_extractor: Wav2Vec2FeatureExtractor, 
+        label2id: dict[str, int],
+        max_samples: int = 160000,
+        sampling_rate: int = 16000
+    ):
+        self.df = pd.read_csv(csv_path)
+        self.data_root = data_root
+        self.feature_extractor = feature_extractor
+        self.label2id = label2id
+        self.max_samples = max_samples
+        self.sampling_rate = sampling_rate
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        
+        # 1. Map labels
+        label_str = row["emotion_final"]
+        label = self.label2id[label_str]
+        
+        # 2. Construct absolute audio path
+        # Folder (e.g. videoplayback (1)) + rel_path (e.g. audios/clip.wav)
+        folder = row["folder"]
+        rel_path = row["audio_relpath"]
+        audio_path = self.data_root / folder / rel_path
+        
+        # 3. Load audio with librosa
+        # We load at 16kHz mono
+        try:
+            speech, sr = librosa.load(audio_path, sr=self.sampling_rate)
+        except Exception as e:
+            print(f"Error loading {audio_path}: {e}")
+            # Fallback to zero waveform if file is missing/corrupt
+            speech = np.zeros(self.max_samples, dtype=np.float32)
+        
+        # 4. Truncate / Pad
+        if len(speech) > self.max_samples:
+            speech = speech[:self.max_samples]
+        
+        # 5. Extract features
+        # Returns a dict with 'input_values' (and possibly 'attention_mask')
+        inputs = self.feature_extractor(
+            speech, 
+            sampling_rate=self.sampling_rate, 
+            return_tensors="pt",
+            padding=False
+        )
+        
+        # Remove the batch dimension added by the extractor
+        input_values = inputs.input_values.squeeze(0)
+        
+        return {
+            "input_values": input_values,
+            "labels": torch.tensor(label, dtype=torch.long)
+        }
+
+def collate_audio_fn(batch):
+    """Pad a batch of waveforms to the same length."""
+    input_values = [item["input_values"] for item in batch]
+    labels = [item["labels"] for item in batch]
+    
+    # Pad to the longest in the batch
+    # (batch, longest_seq)
+    inputs_padded = torch.nn.utils.rnn.pad_sequence(
+        input_values, batch_first=True, padding_value=0.0
+    )
+    
+    # Create attention mask (1 for real, 0 for padding)
+    # Most Wav2Vec2/WavLM models don't strictly need masks for short clips, 
+    # but it's safer to have.
+    attention_mask = (inputs_padded != 0).long()
+    
+    return {
+        "input_values": inputs_padded,
+        "attention_mask": attention_mask,
+        "labels": torch.stack(labels)
+    }

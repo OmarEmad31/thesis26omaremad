@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Project Specific - LARGE DATA (Do NOT push these)
+dataset/
+data/
+checkpoints/
+outputs/
+
+# IDE / System files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Antigravity / Agent files
+.gemini/
+.agents/
+.agent/
+_agents/
+_agent/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Logs
+*.log
+text_train_log.txt

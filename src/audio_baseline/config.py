@@ -1,0 +1,30 @@
+"""Configuration for the Audio Baseline (emotion2vec+)."""
+
+from pathlib import Path
+
+# --- MODEL CONFIG ---
+# Official Alibaba ModelScope/HuggingFace Path
+MODEL_NAME = "damo/emotion2vec_plus_base"
+
+# --- DATA CONFIG ---
+DATA_ROOT = Path("dataset/Final Modalink Dataset MERGED")
+SPLIT_CSV_DIR = Path("data/processed/splits/text_hc")
+
+SAMPLING_RATE = 16000
+MAX_DURATION_SEC = 10  # Truncate clips longer than this
+MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
+
+# --- TRAINING CONFIG ---
+BATCH_SIZE = 8       # Audio transformers are heavy; keep batch size small
+GRADIENT_ACCUMULATION_STEPS = 2
+EPOCHS = 10
+LEARNING_RATE = 2e-5
+WEIGHT_DECAY = 0.01
+
+# --- FOLD CONFIG ---
+NUM_FOLDS = 5
+CHECKPOINT_DIR = Path("D:/thesis_checkpoints/audio_baseline_emotion2vec")
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- INFERENCE ---
+DEVICE = "cuda"  # Will fallback in code if not available
