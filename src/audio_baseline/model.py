@@ -52,8 +52,13 @@ class Emotion2VecBaseline(nn.Module):
             # granularity="utterance" gives us one vector for the whole clip
             result = self.feature_extractor(audio_data, granularity="utterance", extract_embedding=True)
             
-            # result['feats'] is the numeric representation of the emotion
-            feat = torch.tensor(result['feats']).to(device) # Shape: [1, 768]
+            # The pipeline returns a list of results - grab the first one
+            if isinstance(result, list):
+                feat_data = result[0]['feats']
+            else:
+                feat_data = result['feats']
+                
+            feat = torch.tensor(feat_data).to(device) # Shape: [1, 768]
             embeddings.append(feat)
             
         # Stack into [batch, 1, 768]
