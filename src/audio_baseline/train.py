@@ -7,12 +7,30 @@ import random
 import sys
 import gc
 import logging
+import warnings
 from pathlib import Path
 import numpy as np
 
-# SILENCE THE NOISY LIBRARIES
+# 🤫 SUPER-SILENCE MODE (100% CLEAN LOGS)
+warnings.filterwarnings("ignore")
 logging.getLogger('modelscope').setLevel(logging.ERROR)
 logging.getLogger('funasr').setLevel(logging.ERROR)
+from transformers import logging as transformers_logging
+transformers_logging.set_verbosity_error()
+
+# SAVE LOGS TO DRIVE
+log_file = config.CHECKPOINT_DIR.parent / "audio_training_log.txt"
+if not log_file.parent.exists(): log_file.parent.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    handlers=[
+        logging.FileHandler(log_file, mode='a', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -243,7 +261,7 @@ def main():
         for epoch in range(config.EPOCHS):
             loss = trainer.train_epoch()
             metrics = trainer.evaluate()
-            print(f"  Epoch {epoch}: Loss={loss:.4f}, Val F1={metrics['f1_macro']:.4f}, Val Acc={metrics['accuracy']:.4f}")
+            logger.info(f"  Epoch {epoch}: Loss={loss:.4f}, Val F1={metrics['f1_macro']:.4f}, Val Acc={metrics['accuracy']:.4f}")
             
             if metrics["f1_weighted"] > best_f1:
                 best_f1 = metrics["f1_weighted"]
