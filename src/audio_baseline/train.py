@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 from tqdm import tqdm
 from transformers import (
     Wav2Vec2FeatureExtractor,
-    get_linear_schedule_with_warmup
+    get_linear_schedule_with_warmup,
+    set_seed
 )
 from transformers import logging as transformers_logging
 transformers_logging.set_verbosity_error()
