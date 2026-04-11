@@ -6,8 +6,13 @@ import json
 import random
 import sys
 import gc
+import logging
 from pathlib import Path
 import numpy as np
+
+# SILENCE THE NOISY LIBRARIES
+logging.getLogger('modelscope').setLevel(logging.ERROR)
+logging.getLogger('funasr').setLevel(logging.ERROR)
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -238,10 +243,10 @@ def main():
         for epoch in range(config.EPOCHS):
             loss = trainer.train_epoch()
             metrics = trainer.evaluate()
-            print(f"  Epoch {epoch}: Loss={loss:.4f}, Val F1={metrics['macro_f1']:.4f}, Val Acc={metrics['accuracy']:.4f}")
+            print(f"  Epoch {epoch}: Loss={loss:.4f}, Val F1={metrics['f1_macro']:.4f}, Val Acc={metrics['accuracy']:.4f}")
             
-            if metrics["weighted_f1"] > best_f1:
-                best_f1 = metrics["weighted_f1"]
+            if metrics["f1_weighted"] > best_f1:
+                best_f1 = metrics["f1_weighted"]
                 fold_dir = config.CHECKPOINT_DIR / f"fold_{fold}"
                 fold_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), fold_dir / "best_model.pt")
