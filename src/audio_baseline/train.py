@@ -123,40 +123,42 @@ class AudioSCLTrainer:
 # ---------------------------------------------------------------------------
 
 def get_audio_optimizer_params(model, base_lr, layerwise_lr_decay):
-    """Build LLRD for WavLM/emotion2vec architecture."""
-    # Group by layers
-    # Backbone is accessable via model.backbone
-    # Note: emotion2vec follows Wav2Vec2 structure: backbone.feature_extractor, backbone.encoder.layers
+    """Build optimizer parameters. Optimized for ModelScope/Pipeline architecture."""
+    # Group parameters: Pipeline (Backbone) vs Head
     params = []
     
-    # 1. Head + Pooling parameters (Full LR)
-    head_params = {
-        "params": [p for n, p in model.named_parameters() if "backbone" not in n],
-        "lr": base_lr,
-        "weight_decay": 0.01
-    }
-    params.append(head_params)
+    # 1. Identify Head vs Backbone parameters
+    # We look for anything that isn't the 'feature_extractor' (ModelScope backbone)
+    head_params = []
+    backbone_params = []
     
-    # 2. Backbone Layers with decay
-    if hasattr(model.backbone, "encoder"):
-        layers = model.backbone.encoder.layers
-        num_layers = len(layers)
-        for i, layer in enumerate(layers):
-            lr = base_lr * (layerwise_lr_decay ** (num_layers - i))
-            params.append({
-                "params": layer.parameters(),
-                "lr": lr,
-                "weight_decay": 0.01
-            })
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "feature_extractor" in n or "backbone" in n:
+            backbone_params.append(p)
+        else:
+            head_params.append(p)
             
-    # 3. Feature Extractor (Fixed or very low LR)
-    if hasattr(model.backbone, "feature_extractor"):
-        lr = base_lr * (layerwise_lr_decay ** (num_layers + 1))
+    # 2. Add to optimizer groups
+    if head_params:
         params.append({
-            "params": model.backbone.feature_extractor.parameters(),
-            "lr": lr,
+            "params": head_params,
+            "lr": base_lr,
             "weight_decay": 0.01
         })
+        
+    if backbone_params:
+        # We give the backbone a slightly lower learning rate to preserve its pre-trained knowledge
+        params.append({
+            "params": backbone_params,
+            "lr": base_lr * 0.1, 
+            "weight_decay": 0.01
+        })
+        
+    # If we couldn't find specific groups, just return everything
+    if not params:
+        params = [{'params': [p for p in model.parameters() if p.requires_grad], 'lr': base_lr}]
         
     return params
 
