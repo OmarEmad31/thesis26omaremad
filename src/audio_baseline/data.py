@@ -56,7 +56,7 @@ class AudioEmotionDataset(Dataset):
             
             speech, sr = librosa.load(audio_path, sr=self.sampling_rate)
         except Exception as e:
-            # We already confirmed 5702 files exist, so this should rarely happen now
+            # Reverted: Show skipping message as per user request
             print(f"⚠️ Skipping {folder_name}/{rel_path} (File not found)")
             speech = np.zeros(self.max_samples, dtype=np.float32)
         # 4. Truncate / Pad

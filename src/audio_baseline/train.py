@@ -276,13 +276,38 @@ def main():
                 torch.save(model.state_dict(), fold_dir / "best_model.pt")
         
         all_fold_metrics.append(best_f1)
+        logger.info(f"✅ Fold {fold} Complete. Best Val F1: {best_f1:.4f}")
         
         # Cleanup
         del model, trainer, optimizer, scheduler
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    print(f"\nTraining Complete. Average Val F1: {np.mean(all_fold_metrics):.4f}")
+    # --- FINAL GRAND SUMMARY ---
+    mean_f1 = np.mean(all_fold_metrics)
+    std_f1 = np.std(all_fold_metrics)
+    
+    summary = [
+        "\n" + "="*40,
+        "🏆 FINAL CROSS-VALIDATION REPORT",
+        "="*40,
+        f"Model: {config.MODEL_NAME}",
+        f"Folds: {config.NUM_FOLDS}",
+        f"Epochs per Fold: {config.EPOCHS}",
+        "-"*40,
+    ]
+    for i, m in enumerate(all_fold_metrics):
+        summary.append(f"Fold {i}: F1 = {m:.4f}")
+    
+    summary.extend([
+        "-"*40,
+        f"📊 AVERAGE F1: {mean_f1:.4f} (±{std_f1:.4f})",
+        "="*40,
+        "Results saved to Google Drive log."
+    ])
+    
+    final_text = "\n".join(summary)
+    logger.info(final_text)
 
 if __name__ == "__main__":
     main()
