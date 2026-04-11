@@ -20,7 +20,7 @@ else:
 
 # --- MODEL CONFIG ---
 # Official Alibaba ModelScope/HuggingFace Path
-MODEL_NAME = "damo/emotion2vec_plus_base"
+MODEL_NAME = "emotion2vec/emotion2vec_plus_base"
 
 # --- DATA CONFIG ---
 # (Paths are now defined above)
