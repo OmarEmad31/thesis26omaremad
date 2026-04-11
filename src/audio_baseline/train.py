@@ -184,7 +184,7 @@ def main():
 
     # 3. K-Fold Cross Validation
     skf = StratifiedKFold(n_splits=config.NUM_FOLDS, shuffle=True, random_state=42)
-    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.MODEL_NAME)
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-base")
     
     all_fold_metrics = []
 

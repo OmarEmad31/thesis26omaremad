@@ -16,7 +16,7 @@ def dry_run():
     # 1. Setup
     device = torch.device("cpu") # Dry run on CPU for safety
     label2id = {"Neutral": 0, "Anger": 1, "Happiness": 2, "Sadness": 3, "Fear": 4, "Disgust": 5, "Surprise": 6}
-    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.MODEL_NAME)
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-base")
     
     # 2. Check individual sample loading
     print(f"Checking data mapping from {config.SPLIT_CSV_DIR/'test.csv'}...")

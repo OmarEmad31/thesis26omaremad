@@ -11,14 +11,17 @@ from transformers import Wav2Vec2FeatureExtractor
 class AudioEmotionDataset(Dataset):
     def __init__(
         self, 
-        csv_path: Path, 
+        csv_path: Path | None, 
         data_root: Path, 
         feature_extractor: Wav2Vec2FeatureExtractor, 
         label2id: dict[str, int],
         max_samples: int = 160000,
         sampling_rate: int = 16000
     ):
-        self.df = pd.read_csv(csv_path)
+        if csv_path is not None:
+            self.df = pd.read_csv(csv_path)
+        else:
+            self.df = None # To be set by fold logic
         self.data_root = data_root
         self.feature_extractor = feature_extractor
         self.label2id = label2id
