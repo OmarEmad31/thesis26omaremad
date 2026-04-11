@@ -58,19 +58,24 @@ class Emotion2VecBaseline(nn.Module):
             else:
                 feat_data = result['feats']
                 
-            feat = torch.tensor(feat_data).to(device) # Shape: [1, 768]
+            # feat_data is [768], we make it [768]
+            feat = torch.tensor(feat_data, dtype=torch.float32).to(device)
             embeddings.append(feat)
             
-        # Stack into [batch, 1, 768]
-        x = torch.stack(embeddings)
+        # 1. Stack into [batch, 768]
+        x_stacked = torch.stack(embeddings)
         
-        # Pass through LSTM
+        # 2. Reshape into 3D for LSTM: [batch, sequence_len=1, hidden_size=768]
+        # This is where the error was - LSTM MUST have 3 dimensions!
+        x = x_stacked.unsqueeze(1) 
+        
+        # 3. Pass through LSTM
         # lstm_out shape: [batch, 1, 512]
         lstm_out, _ = self.lstm(x)
         
-        # Take the last time step
-        pooled = lstm_out[:, -1, :]
+        # 4. Take the last (and only) time step output: [batch, 512]
+        pooled = lstm_out.squeeze(1)
         
-        # Final Classification
+        # 5. Final Classification
         logits = self.classifier(pooled)
         return logits
