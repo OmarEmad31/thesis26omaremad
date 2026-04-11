@@ -38,26 +38,27 @@ class AudioEmotionDataset(Dataset):
         label_str = row["emotion_final"]
         label = self.label2id[label_str]
         
-        # 2. Construct absolute audio path
-        # Folder (e.g. videoplayback (1)) + rel_path (e.g. audios/clip.wav)
-        folder = str(row["folder"])
-        rel_path = str(row["audio_relpath"])
+        # 2. Optimized Path Reconstruction
+        # Ensure we are using strings and healthy slashes
+        folder_name = str(row["folder"]).strip()
+        rel_path = str(row["audio_relpath"]).replace("\\", "/").lstrip("/")
         
-        # Strip any leading slashes or old paths that might be in the CSV
-        clean_rel = rel_path.lstrip("/").split("/")[-1] # Filename only
-        subfolders = rel_path.lstrip("/").split("/")[:-1] # Subfolders only
-        
-        audio_path = self.data_root / folder / "/".join(subfolders) / clean_rel
+        # The true path on SSD
+        audio_path = self.data_root / folder_name / rel_path
         
         # 3. Load audio with librosa
-        # We load at 16kHz mono
         try:
+            if not audio_path.exists():
+                # Try a fallback in case there's an extra 'dataset' folder in the way
+                alt_path = self.data_root.parent / folder_name / rel_path
+                if alt_path.exists():
+                    audio_path = alt_path
+            
             speech, sr = librosa.load(audio_path, sr=self.sampling_rate)
         except Exception as e:
-            print(f"Error loading {audio_path}: {e}")
-            # Fallback to zero waveform if file is missing/corrupt
+            # We already confirmed 5702 files exist, so this should rarely happen now
+            print(f"⚠️ Skipping {folder_name}/{rel_path} (File not found)")
             speech = np.zeros(self.max_samples, dtype=np.float32)
-        
         # 4. Truncate / Pad
         if len(speech) > self.max_samples:
             speech = speech[:self.max_samples]
