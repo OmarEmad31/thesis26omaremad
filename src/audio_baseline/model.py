@@ -38,21 +38,26 @@ class Emotion2VecBaseline(nn.Module):
             nn.Linear(256, num_labels)
         )
 
+    def set_backbone_trainable(self, trainable: bool):
+        """Enable/Disable training for the underlying emotion2vec+ backbone."""
+        # The ModelScope pipeline holds the underlying model in .model
+        if hasattr(self.feature_extractor, "model"):
+            for param in self.feature_extractor.model.parameters():
+                param.requires_grad = trainable
+        print(f"🔓 Backbone Trainable: {trainable}")
+
     def forward(self, input_values, attention_mask=None, **kwargs):
         """
         Input: torch.Tensor of shape [batch, 160000]
+        Returns: logits, embeddings
         """
         device = input_values.device
         embeddings = []
         
         # We extract features for each item in the batch
-        # Note: emotion2vec+ works best on CPU for feature extraction 
-        # or we can pass tensors if the pipeline supports it.
         for i in range(input_values.shape[0]):
             audio_data = input_values[i].cpu().numpy()
             
-            # extract_embedding=True gets us the 768-d vector
-            # granularity="utterance" gives us one vector for the whole clip
             with open(os.devnull, 'w') as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
                 result = self.feature_extractor(audio_data, granularity="utterance", extract_embedding=True)
             
@@ -62,7 +67,6 @@ class Emotion2VecBaseline(nn.Module):
             else:
                 feat_data = result['feats']
                 
-            # feat_data is [768], we make it [768]
             feat = torch.tensor(feat_data, dtype=torch.float32).to(device)
             embeddings.append(feat)
             
@@ -70,16 +74,16 @@ class Emotion2VecBaseline(nn.Module):
         x_stacked = torch.stack(embeddings)
         
         # 2. Reshape into 3D for LSTM: [batch, sequence_len=1, hidden_size=768]
-        # This is where the error was - LSTM MUST have 3 dimensions!
         x = x_stacked.unsqueeze(1) 
         
         # 3. Pass through LSTM
-        # lstm_out shape: [batch, 1, 512]
         lstm_out, _ = self.lstm(x)
         
-        # 4. Take the last (and only) time step output: [batch, 512]
+        # 4. Take the last time step output: [batch, 512]
         pooled = lstm_out.squeeze(1)
         
         # 5. Final Classification
         logits = self.classifier(pooled)
-        return logits
+        
+        # Return BOTH logits (for CrossEntropy) and pooled (for SCL)
+        return logits, pooled

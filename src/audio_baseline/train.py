@@ -117,27 +117,58 @@ class AudioSCLTrainer:
             # to return embeddings too if needed, or extract them here if we can.
             # For now, let's assume model() returns logits for the basic Baseline.
             logits = self.model(inputs, attention_mask=mask)
+            # Forward: Get Logits (for CE) and Embeddings (for SCL)
+            logits, embeddings = self.model(inputs, attention_mask=mask)
             
-            loss = self.criterion(logits, labels)
+            # 1. Cross Entropy Loss
+            ce_loss = self.criterion(logits, labels)
             
+            # 2. SCL Loss (The "Clustering" math)
+            if config.USE_SCL:
+                scl_loss = self.compute_scl_loss(embeddings, labels)
+                loss = ce_loss + (config.SCL_WEIGHT * scl_loss)
+                total_scl += scl_loss.item()
+            else:
+                loss = ce_loss
+                
             loss.backward()
             self.optimizer.step()
             self.scheduler.step()
-            total_loss += loss.item()
             
-        return total_loss / len(self.train_loader)
+            total_loss += loss.item()
+            total_ce += ce_loss.item()
+            
+            # Metrics
+            preds = torch.argmax(logits, dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            
+            pbar.set_postfix({"loss": f"{loss.item():.3f}", "acc": f"{correct/total:.3f}"})
+            
+        return {
+            "loss": total_loss / len(self.train_loader),
+            "ce_loss": total_ce / len(self.train_loader),
+            "scl_loss": total_scl / len(self.train_loader),
+            "accuracy": correct / total
+        }
 
-    def evaluate(self):
+    def evaluate(self, loader=None):
+        if loader is None: loader = self.val_loader
         self.model.eval()
         all_logits = []
         all_labels = []
+        total_loss = 0
+        
         with torch.no_grad():
-            for batch in self.val_loader:
+            for batch in loader:
                 inputs = batch["input_values"].to(self.device)
                 mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
                 
-                logits = self.model(inputs, attention_mask=mask)
+                logits, _ = self.model(inputs, attention_mask=mask)
+                loss = self.criterion(logits, labels)
+                total_loss += loss.item()
+                
                 all_logits.append(logits.cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
         
@@ -145,7 +176,9 @@ class AudioSCLTrainer:
         labels = np.concatenate(all_labels, axis=0)
         preds = np.argmax(logits, axis=1)
         
-        return evaluate_predictions(labels, preds)
+        metrics = evaluate_predictions(labels, preds)
+        metrics["loss"] = total_loss / len(loader)
+        return metrics
 
 # ---------------------------------------------------------------------------
 # Optimizer Helpers
@@ -192,122 +225,102 @@ def get_audio_optimizer_params(model, base_lr, layerwise_lr_decay):
     return params
 
 # ---------------------------------------------------------------------------
-# Main Execution
+# Main Execution: POWER MODE
 # ---------------------------------------------------------------------------
 
 def main():
     set_seed(42)
     device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"🚀 [POWER MODE] Device: {device}")
 
-    # 1. Load Data Splits
-    # We use the text project's HC splits to ensure we are training on the exact same clips
+    # 1. Load Data Splits (The FULL 5,700 Dataset)
+    print(f"📁 Loading Full Dataset Splits from {config.SPLIT_CSV_DIR.name}...")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     test_df = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
     
-    full_df = pd.concat([train_df, val_df]).reset_index(drop=True)
-    
     # 2. Prepare Label Mapping
-    label_names = sorted(full_df["emotion_final"].unique())
+    label_names = sorted(train_df["emotion_final"].unique())
     label2id = {name: i for i, name in enumerate(label_names)}
-    print(f"Clasess: {label2id}")
+    print(f"🎭 Emotions: {label2id}")
 
-    # 3. K-Fold Cross Validation
-    skf = StratifiedKFold(n_splits=config.NUM_FOLDS, shuffle=True, random_state=42)
+    # 3. Data Loaders
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-base")
     
-    all_fold_metrics = []
-
-    for fold, (train_idx, val_idx) in enumerate(skf.split(full_df, full_df["emotion_final"])):
-        print(f"\n{'='*20} Fold {fold} {'='*20}")
-        
-        fold_train_df = full_df.iloc[train_idx]
-        fold_val_df = full_df.iloc[val_idx]
-        
-        train_ds = AudioEmotionDataset(
-            csv_path=None, # Not used in current mod, we pass DF
-            data_root=config.DATA_ROOT,
-            feature_extractor=feature_extractor,
-            label2id=label2id,
-            max_samples=config.MAX_AUDIO_SAMPLES
-        )
-        # Override the df for each fold
-        train_ds.df = fold_train_df
-        
-        val_ds = AudioEmotionDataset(
-            csv_path=None,
-            data_root=config.DATA_ROOT,
-            feature_extractor=feature_extractor,
-            label2id=label2id,
-            max_samples=config.MAX_AUDIO_SAMPLES
-        )
-        val_ds.df = fold_val_df
-        
-        train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=collate_audio_fn)
-        val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False, collate_fn=collate_audio_fn)
-        
-        # Initialize Model
-        model = Emotion2VecBaseline(config.MODEL_NAME, num_labels=len(label2id))
-        
-        # Class Weights
-        weights = compute_class_weight("balanced", classes=np.arange(len(label2id)), y=fold_train_df["emotion_final"].map(label2id))
-        class_weights = torch.tensor(weights, dtype=torch.float)
-        
-        # Optimizer & Scheduler
-        params = get_audio_optimizer_params(model, config.LEARNING_RATE, 0.95)
-        optimizer = torch.optim.AdamW(params)
-        num_steps = len(train_loader) * config.EPOCHS
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1*num_steps), num_training_steps=num_steps)
-        
-        # Trainer
-        trainer = AudioSCLTrainer(model, train_loader, val_loader, optimizer, scheduler, device, class_weights)
-        
-        best_f1 = 0
-        for epoch in range(config.EPOCHS):
-            loss = trainer.train_epoch()
-            metrics = trainer.evaluate()
-            logger.info(f"  Epoch {epoch}: Loss={loss:.4f}, Val F1={metrics['f1_macro']:.4f}, Val Acc={metrics['accuracy']:.4f}")
-            
-            if metrics["f1_weighted"] > best_f1:
-                best_f1 = metrics["f1_weighted"]
-                fold_dir = config.CHECKPOINT_DIR / f"fold_{fold}"
-                fold_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(model.state_dict(), fold_dir / "best_model.pt")
-        
-        all_fold_metrics.append(best_f1)
-        logger.info(f"✅ Fold {fold} Complete. Best Val F1: {best_f1:.4f}")
-        
-        # Cleanup
-        del model, trainer, optimizer, scheduler
-        gc.collect()
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-    # --- FINAL GRAND SUMMARY ---
-    mean_f1 = np.mean(all_fold_metrics)
-    std_f1 = np.std(all_fold_metrics)
+    train_ds = AudioEmotionDataset(None, config.DATA_ROOT, feature_extractor, label2id, config.MAX_AUDIO_SAMPLES)
+    train_ds.df = train_df
     
-    summary = [
+    val_ds = AudioEmotionDataset(None, config.DATA_ROOT, feature_extractor, label2id, config.MAX_AUDIO_SAMPLES)
+    val_ds.df = val_df
+    
+    train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=collate_audio_fn, num_workers=2)
+    val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False, collate_fn=collate_audio_fn, num_workers=2)
+    
+    # 4. Initialize Model & Training Tools
+    model = Emotion2VecBaseline(config.MODEL_NAME, num_labels=len(label2id))
+    
+    # Start with frozen backbone (Initial Warmup)
+    model.set_backbone_trainable(False)
+    
+    weights = compute_class_weight("balanced", classes=np.arange(len(label2id)), y=train_df["emotion_final"].map(label2id))
+    class_weights = torch.tensor(weights, dtype=torch.float)
+    
+    params = get_audio_optimizer_params(model, config.LEARNING_RATE, 0.95)
+    optimizer = torch.optim.AdamW(params)
+    
+    num_steps = len(train_loader) * config.EPOCHS
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1*num_steps), num_training_steps=num_steps)
+    
+    trainer = AudioSCLTrainer(model, train_loader, val_loader, optimizer, scheduler, device, class_weights)
+    
+    # 5. Training Loop
+    best_val_f1 = 0
+    print(f"\n⚡ STARTING POWER MODE TRAINING ({config.EPOCHS} Epochs)...")
+    
+    for epoch in range(config.EPOCHS):
+        # TRAIN
+        train_m = trainer.train_epoch(epoch)
+        
+        # VALIDATE
+        val_m = trainer.evaluate()
+        
+        # LOGGING
+        msg = (
+            f"Epoch {epoch} | "
+            f"Loss: {train_m['loss']:.3f} (CE: {train_m['ce_loss']:.3f}, SCL: {train_m['scl_loss']:.3f}) | "
+            f"Train Acc: {train_m['accuracy']:.3f} | "
+            f"Val Acc: {val_m['accuracy']:.3f} | "
+            f"F1 Macro: {val_m['f1_macro']:.4f} | "
+            f"F1 Weighted: {val_m['f1_weighted']:.4f}"
+        )
+        logger.info(msg)
+        
+        # Save Best
+        if val_m["f1_macro"] > best_val_f1:
+            best_val_f1 = val_m["f1_macro"]
+            save_path = config.CHECKPOINT_DIR / "best_power_model.pt"
+            torch.save(model.state_dict(), save_path)
+            logger.info(f"🏅 New Record! F1={best_val_f1:.4f} -> Saved to Drive.")
+
+    # 6. FINAL TEST
+    logger.info("\n" + "🏁" * 20)
+    logger.info("FINAL EVALUATION ON TEST SET")
+    test_ds = AudioEmotionDataset(None, config.DATA_ROOT, feature_extractor, label2id, config.MAX_AUDIO_SAMPLES)
+    test_ds.df = test_df
+    test_loader = DataLoader(test_ds, batch_size=config.BATCH_SIZE, shuffle=False, collate_fn=collate_audio_fn)
+    
+    test_m = trainer.evaluate(test_loader)
+    
+    final_report = [
         "\n" + "="*40,
-        "🏆 FINAL CROSS-VALIDATION REPORT",
+        "🏆 POWER MODE FINAL REPORT",
         "="*40,
-        f"Model: {config.MODEL_NAME}",
-        f"Folds: {config.NUM_FOLDS}",
-        f"Epochs per Fold: {config.EPOCHS}",
-        "-"*40,
+        f"Test Accuracy: {test_m['accuracy']:.4f}",
+        f"Test F1 Macro: {test_m['f1_macro']:.4f}",
+        f"Test F1 Weighted: {test_m['f1_weighted']:.4f}",
+        "="*40
     ]
-    for i, m in enumerate(all_fold_metrics):
-        summary.append(f"Fold {i}: F1 = {m:.4f}")
-    
-    summary.extend([
-        "-"*40,
-        f"📊 AVERAGE F1: {mean_f1:.4f} (±{std_f1:.4f})",
-        "="*40,
-        "Results saved to Google Drive log."
-    ])
-    
-    final_text = "\n".join(summary)
-    logger.info(final_text)
+    logger.info("\n".join(final_report))
 
 if __name__ == "__main__":
     main()
