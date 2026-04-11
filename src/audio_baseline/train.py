@@ -10,15 +10,26 @@ import logging
 import warnings
 from pathlib import Path
 import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 # 🤫 SUPER-SILENCE MODE (100% CLEAN LOGS)
+# We move these UP before config so they apply early
 warnings.filterwarnings("ignore")
 logging.getLogger('modelscope').setLevel(logging.ERROR)
 logging.getLogger('funasr').setLevel(logging.ERROR)
-from transformers import logging as transformers_logging
-transformers_logging.set_verbosity_error()
 
-# SAVE LOGS TO DRIVE
+# Project imports
+from src.audio_baseline import config
+from src.audio_baseline.model import Emotion2VecBaseline
+from src.audio_baseline.data import AudioEmotionDataset, collate_audio_fn
+from src.text_baseline.metrics_utils import compute_metrics, evaluate_predictions
+
+# 📄 PERSISTENT LOGGER SETUP
+# Now that config is imported, we can safely use it
 log_file = config.CHECKPOINT_DIR.parent / "audio_training_log.txt"
 if not log_file.parent.exists(): log_file.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -31,22 +42,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from sklearn.model_selection import StratifiedKFold
-from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
 from transformers import (
     Wav2Vec2FeatureExtractor,
-    get_linear_schedule_with_warmup,
-    set_seed
+    get_linear_schedule_with_warmup
 )
+from transformers import logging as transformers_logging
+transformers_logging.set_verbosity_error()
 
-# Project specific imports
-from src.audio_baseline import config
+from sklearn.model_selection import StratifiedKFold
+from sklearn.utils.class_weight import compute_class_weight
 from src.audio_baseline.model import Emotion2VecBaseline
 from src.audio_baseline.data import AudioEmotionDataset, collate_audio_fn
 from src.text_baseline.metrics_utils import compute_metrics, evaluate_predictions
