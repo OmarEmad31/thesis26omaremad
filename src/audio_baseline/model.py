@@ -1,3 +1,6 @@
+import os
+import sys
+import contextlib
 import torch
 import torch.nn as nn
 from modelscope.pipelines import pipeline
@@ -50,7 +53,8 @@ class Emotion2VecBaseline(nn.Module):
             
             # extract_embedding=True gets us the 768-d vector
             # granularity="utterance" gives us one vector for the whole clip
-            result = self.feature_extractor(audio_data, granularity="utterance", extract_embedding=True)
+            with open(os.devnull, 'w') as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
+                result = self.feature_extractor(audio_data, granularity="utterance", extract_embedding=True)
             
             # The pipeline returns a list of results - grab the first one
             if isinstance(result, list):
