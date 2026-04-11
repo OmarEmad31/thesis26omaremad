@@ -1,64 +1,71 @@
-"""Audio Emotion Classification Model (emotion2vec+ MSD)."""
-
 import torch
 import torch.nn as nn
-from transformers import Wav2Vec2Model, Wav2Vec2Config
+from modelscope.pipelines import pipeline
+from modelscope.utils.constant import Tasks
 
 class Emotion2VecBaseline(nn.Module):
     def __init__(self, model_name: str, num_labels: int):
-        super().__init__()
+        super(Emotion2VecBaseline, self).__init__()
         
-        # 1. Load the emotion2vec+ backbone
-        # We use output_hidden_states=True for Weighted Layer Pooling
-        self.config = Wav2Vec2Config.from_pretrained(model_name)
-        self.config.output_hidden_states = True
-        self.backbone = Wav2Vec2Model.from_pretrained(model_name, config=self.config, trust_remote_code=True)
+        print(f"--- 🧠 Initializing emotion2vec+ via ModelScope ---")
+        # 1. Load the official emotion2vec+ pipeline
+        # This model is the best for emotional prosody in AI today
+        self.feature_extractor = pipeline(
+            task=Tasks.emotion_recognition, 
+            model="iic/emotion2vec_plus_base"
+        )
         
-        # 2. Weighted Layer Pooling
-        # We have 13 layers (Embeddings + 12 Transformer Layers)
-        num_layers = self.config.num_hidden_layers + 1
-        self.layer_weights = nn.Parameter(torch.ones(num_layers))
+        # 2. Classifier Head (BiLSTM + Dense)
+        # emotion2vec-base produces 768-dimensional embeddings
+        hidden_size = 768
         
-        # 3. Multi-Sample Dropout (MSD)
-        # We use 5 dropout paths just like the text baseline
-        self.dropout_ops = nn.ModuleList([nn.Dropout(0.2) for _ in range(5)])
+        self.lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=256,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.3
+        )
         
-        # 4. Final Classifier
-        hidden_size = self.config.hidden_size
-        self.classifier = nn.Linear(hidden_size, num_labels)
+        self.classifier = nn.Sequential(
+            nn.Linear(256 * 2, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_labels)
+        )
 
-    def forward(self, input_values: torch.Tensor, attention_mask: torch.Tensor | None = None):
+    def forward(self, input_values):
         """
-        Args:
-            input_values: (batch, seq_len)
-            attention_mask: (batch, seq_len)
+        Input: torch.Tensor of shape [batch, 160000] (10 seconds of 16kHz audio)
         """
-        # Backbone forward
-        outputs = self.backbone(input_values, attention_mask=attention_mask)
+        device = input_values.device
+        embeddings = []
         
-        # Get all hidden states (list of 13 tensors: (batch, seq_len, hidden_size))
-        all_hidden_states = outputs.hidden_states
+        # We extract features for each item in the batch
+        # Note: emotion2vec+ works best on CPU for feature extraction 
+        # or we can pass tensors if the pipeline supports it.
+        for i in range(input_values.shape[0]):
+            audio_data = input_values[i].cpu().numpy()
+            
+            # extract_embedding=True gets us the 768-d vector
+            # granularity="utterance" gives us one vector for the whole clip
+            result = self.feature_extractor(audio_data, granularity="utterance", extract_embedding=True)
+            
+            # result['feats'] is the numeric representation of the emotion
+            feat = torch.tensor(result['feats']).to(device) # Shape: [1, 768]
+            embeddings.append(feat)
+            
+        # Stack into [batch, 1, 768]
+        x = torch.stack(embeddings)
         
-        # Compute Weighted Layer Pooling
-        # (batch, seq_len, hidden_size, 13)
-        stacked_hidden_states = torch.stack(all_hidden_states, dim=-1)
+        # Pass through LSTM
+        # lstm_out shape: [batch, 1, 512]
+        lstm_out, _ = self.lstm(x)
         
-        # Normalize weights using softmax
-        weights = torch.softmax(self.layer_weights, dim=0)
+        # Take the last time step
+        pooled = lstm_out[:, -1, :]
         
-        # Weighted sum: (batch, seq_len, hidden_size)
-        fused_hidden_states = (stacked_hidden_states * weights).sum(dim=-1)
-        
-        # Global Average Pooling (Mean pooling over time)
-        # (batch, hidden_size)
-        pooled_output = fused_hidden_states.mean(dim=1)
-        
-        # Multi-Sample Dropout
-        # We average the results of 5 different dropout paths
-        logits = 0
-        for dropout in self.dropout_ops:
-            logits += self.classifier(dropout(pooled_output))
-        
-        logits = logits / len(self.dropout_ops)
-        
+        # Final Classification
+        logits = self.classifier(pooled)
         return logits
