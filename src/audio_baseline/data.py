@@ -40,9 +40,14 @@ class AudioEmotionDataset(Dataset):
         
         # 2. Construct absolute audio path
         # Folder (e.g. videoplayback (1)) + rel_path (e.g. audios/clip.wav)
-        folder = row["folder"]
-        rel_path = row["audio_relpath"]
-        audio_path = self.data_root / folder / rel_path
+        folder = str(row["folder"])
+        rel_path = str(row["audio_relpath"])
+        
+        # Strip any leading slashes or old paths that might be in the CSV
+        clean_rel = rel_path.lstrip("/").split("/")[-1] # Filename only
+        subfolders = rel_path.lstrip("/").split("/")[:-1] # Subfolders only
+        
+        audio_path = self.data_root / folder / "/".join(subfolders) / clean_rel
         
         # 3. Load audio with librosa
         # We load at 16kHz mono
