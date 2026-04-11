@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoConfig
+from transformers import Wav2Vec2Model, Wav2Vec2Config
 
 class Emotion2VecBaseline(nn.Module):
     def __init__(self, model_name: str, num_labels: int):
@@ -10,9 +10,9 @@ class Emotion2VecBaseline(nn.Module):
         
         # 1. Load the emotion2vec+ backbone
         # We use output_hidden_states=True for Weighted Layer Pooling
-        self.config = AutoConfig.from_pretrained(model_name)
+        self.config = Wav2Vec2Config.from_pretrained(model_name)
         self.config.output_hidden_states = True
-        self.backbone = AutoModel.from_pretrained(model_name, config=self.config)
+        self.backbone = Wav2Vec2Model.from_pretrained(model_name, config=self.config, trust_remote_code=True)
         
         # 2. Weighted Layer Pooling
         # We have 13 layers (Embeddings + 12 Transformer Layers)

@@ -10,7 +10,7 @@ if IS_COLAB:
     if os.path.exists("/content/data") and os.path.exists("/content/Thesis Project"):
         print("🚀 Using LOCAL SSD for maximum speed!")
         DRIVE_BASE = Path("/content/Thesis Project")
-        DATA_ROOT = Path("/content/data/Final Modalink Dataset MERGED")
+        DATA_ROOT = DRIVE_BASE / "dataset/Final Modalink Dataset MERGED"
         SPLIT_CSV_DIR = Path("/content/data/processed/splits/text_hc")
         CHECKPOINT_DIR = Path("/content/checkpoints/audio_baseline_emotion2vec")
     else:
