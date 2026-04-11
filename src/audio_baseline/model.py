@@ -35,9 +35,9 @@ class Emotion2VecBaseline(nn.Module):
             nn.Linear(256, num_labels)
         )
 
-    def forward(self, input_values):
+    def forward(self, input_values, attention_mask=None, **kwargs):
         """
-        Input: torch.Tensor of shape [batch, 160000] (10 seconds of 16kHz audio)
+        Input: torch.Tensor of shape [batch, 160000]
         """
         device = input_values.device
         embeddings = []
