@@ -12,7 +12,8 @@ if IS_COLAB:
         DRIVE_BASE = Path("/content/Thesis Project")
         DATA_ROOT = DRIVE_BASE / "dataset/Final Modalink Dataset MERGED"
         SPLIT_CSV_DIR = Path("/content/data/processed/splits/text_hc")
-        CHECKPOINT_DIR = Path("/content/checkpoints/audio_baseline_emotion2vec")
+        # SAVE TO DRIVE FOR SAFETY
+        CHECKPOINT_DIR = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_baseline_emotion2vec")
     else:
         print("📁 Using Google Drive (Slow mode). Tip: Unzip your dataset to /content/ for 10x speed.")
         DRIVE_BASE = Path("/content/drive/MyDrive/Thesis Project")
