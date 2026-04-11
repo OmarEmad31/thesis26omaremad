@@ -3,15 +3,22 @@ from pathlib import Path
 
 # --- ENVIRONMENT DETECTION ---
 # Check if we are running in Google Colab
-IS_COLAB = "COLAB_GPU" in os.environ or "COLAB_JUPYTER_IP" in os.environ
+IS_COLAB = "COLAB_GPU" in os.environ or os.path.exists("/content")
 
 if IS_COLAB:
-    # Path in Google Drive after mounting
-    # We assume you put your folders in "My Drive/Thesis Project"
-    DRIVE_BASE = Path("/content/drive/MyDrive/Thesis Project")
-    DATA_ROOT = DRIVE_BASE / "dataset/Final Modalink Dataset MERGED"
-    SPLIT_CSV_DIR = DRIVE_BASE / "data/processed/splits/text_hc"
-    CHECKPOINT_DIR = DRIVE_BASE / "checkpoints/audio_baseline_emotion2vec"
+    # Check if we unzipped to the local SSD (/content/)
+    if os.path.exists("/content/data") and os.path.exists("/content/Thesis Project"):
+        print("🚀 Using LOCAL SSD for maximum speed!")
+        DRIVE_BASE = Path("/content/Thesis Project")
+        DATA_ROOT = Path("/content/data/Final Modalink Dataset MERGED")
+        SPLIT_CSV_DIR = Path("/content/data/processed/splits/text_hc")
+        CHECKPOINT_DIR = Path("/content/checkpoints/audio_baseline_emotion2vec")
+    else:
+        print("📁 Using Google Drive (Slow mode). Tip: Unzip your dataset to /content/ for 10x speed.")
+        DRIVE_BASE = Path("/content/drive/MyDrive/Thesis Project")
+        DATA_ROOT = DRIVE_BASE / "dataset/Final Modalink Dataset MERGED"
+        SPLIT_CSV_DIR = DRIVE_BASE / "data/processed/splits/text_hc"
+        CHECKPOINT_DIR = DRIVE_BASE / "checkpoints/audio_baseline_emotion2vec"
 else:
     # Standard Local Paths
     DATA_ROOT = Path("dataset/Final Modalink Dataset MERGED")

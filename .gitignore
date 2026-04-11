@@ -21,12 +21,12 @@ outputs/
 .DS_Store
 Thumbs.db
 
-# Antigravity / Agent files
-.gemini/
-.agents/
-.agent/
-_agents/
-_agent/
+# Antigravity / Agent# Dataset Transfers
+*.zip
+Thesis_Mini_Upload/
+Thesis_Full_Audio_Upload/
+ThesisWork/
+Thesis_Audio_Full.zip
 
 # Jupyter
 .ipynb_checkpoints
