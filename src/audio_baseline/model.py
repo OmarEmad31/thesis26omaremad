@@ -12,7 +12,8 @@ class Emotion2VecBaseline(nn.Module):
         print(f"--- 🧠 Initializing emotion2vec+ via AutoModel ---")
         # 1. Load the official emotion2vec+ backbone
         # We use AutoModel directly for better parameter control
-        self.backbone = AutoModel(model=model_name)
+        # we use hub='ms' to ensure ModelScope registry is used
+        self.backbone = AutoModel(model=model_name, hub='ms', trust_remote_code=True)
         
         # 2. Classifier Head (BiLSTM + Dense)
         hidden_size = 768

@@ -34,7 +34,7 @@ UNFREEZE_EPOCH = 5       # We start deep fine-tuning at this epoch
 SCL_TEMP = 0.1           # Temperature for contrastive loss
 
 # --- MODEL CONFIG ---
-MODEL_NAME = "emotion2vec/emotion2vec_plus_base"
+MODEL_NAME = "iic/emotion2vec_plus_base"
 
 # --- DATA CONFIG ---
 SAMPLING_RATE = 16000
