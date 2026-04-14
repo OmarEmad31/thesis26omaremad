@@ -3,23 +3,18 @@ import sys
 import contextlib
 import torch
 import torch.nn as nn
-from modelscope.pipelines import pipeline
-from modelscope.utils.constant import Tasks
+from funasr import AutoModel
 
 class Emotion2VecBaseline(nn.Module):
     def __init__(self, model_name: str, num_labels: int):
         super(Emotion2VecBaseline, self).__init__()
         
-        print(f"--- 🧠 Initializing emotion2vec+ via ModelScope ---")
-        # 1. Load the official emotion2vec+ pipeline
-        # This model is the best for emotional prosody in AI today
-        self.feature_extractor = pipeline(
-            task=Tasks.emotion_recognition, 
-            model="iic/emotion2vec_plus_base"
-        )
+        print(f"--- 🧠 Initializing emotion2vec+ via AutoModel ---")
+        # 1. Load the official emotion2vec+ backbone
+        # We use AutoModel directly for better parameter control
+        self.backbone = AutoModel(model=model_name)
         
         # 2. Classifier Head (BiLSTM + Dense)
-        # emotion2vec-base produces 768-dimensional embeddings
         hidden_size = 768
         
         self.lstm = nn.LSTM(
@@ -40,9 +35,13 @@ class Emotion2VecBaseline(nn.Module):
 
     def set_backbone_trainable(self, trainable: bool):
         """Enable/Disable training for the underlying emotion2vec+ backbone."""
-        # The ModelScope pipeline holds the underlying model in .model
-        if hasattr(self.feature_extractor, "model"):
-            for param in self.feature_extractor.model.parameters():
+        # AutoModel exposes .model which is the actual nn.Module
+        if hasattr(self.backbone, "model"):
+            for param in self.backbone.model.parameters():
+                param.requires_grad = trainable
+        else:
+            # Fallback if structure varies
+            for param in self.backbone.parameters():
                 param.requires_grad = trainable
         print(f"🔓 Backbone Trainable: {trainable}")
 
@@ -52,26 +51,20 @@ class Emotion2VecBaseline(nn.Module):
         Returns: logits, embeddings
         """
         device = input_values.device
-        embeddings = []
+        batch_feats = []
         
-        # We extract features for each item in the batch
-        for i in range(input_values.shape[0]):
-            audio_data = input_values[i].cpu().numpy()
+        with torch.no_grad() if not any(p.requires_grad for p in self.backbone.parameters()) else contextlib.nullcontext():
+            # AutoModel can process the whole batch at once! Much faster than the old loop.
+            # We use extract_embedding=True to get the utterance-level features
+            res = self.backbone.generate(input=input_values, granularity="utterance", extract_embedding=True)
             
-            with open(os.devnull, 'w') as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
-                result = self.feature_extractor(audio_data, granularity="utterance", extract_embedding=True)
-            
-            # The pipeline returns a list of results - grab the first one
-            if isinstance(result, list):
-                feat_data = result[0]['feats']
-            else:
-                feat_data = result['feats']
-                
-            feat = torch.tensor(feat_data, dtype=torch.float32).to(device)
-            embeddings.append(feat)
+            # The result is a list of feature dictionaries
+            for item in res:
+                feat = torch.tensor(item['feats'], dtype=torch.float32).to(device)
+                batch_feats.append(feat)
             
         # 1. Stack into [batch, 768]
-        x_stacked = torch.stack(embeddings)
+        x_stacked = torch.stack(batch_feats)
         
         # 2. Reshape into 3D for LSTM: [batch, sequence_len=1, hidden_size=768]
         x = x_stacked.unsqueeze(1) 

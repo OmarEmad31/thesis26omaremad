@@ -17,9 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # 🤫 SUPER-SILENCE MODE (100% CLEAN LOGS)
-# We move these UP before config so they apply early
 warnings.filterwarnings("ignore")
-logging.getLogger('modelscope').setLevel(logging.ERROR)
 logging.getLogger('funasr').setLevel(logging.ERROR)
 
 # Project imports

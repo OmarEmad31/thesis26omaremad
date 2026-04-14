@@ -44,7 +44,7 @@ MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 # --- TRAINING CONFIG ---
 BATCH_SIZE = 8       
 GRADIENT_ACCUMULATION_STEPS = 4 # Increased for more stability with SCL
-EPOCHS = 12                     # More epochs for deep fine-tuning
+EPOCHS = 20                     # Increased for Colab Pro to allow deeper mastery
 LEARNING_RATE = 1e-5           # Lower LR for more stable fine-tuning
 WEIGHT_DECAY = 0.01
 
