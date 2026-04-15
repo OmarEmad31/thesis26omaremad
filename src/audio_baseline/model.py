@@ -3,19 +3,16 @@ import sys
 import contextlib
 import torch
 import torch.nn as nn
-from modelscope.pipelines import pipeline
-from modelscope.utils.constant import Tasks
+from funasr import AutoModel
 
 class Emotion2VecBaseline(nn.Module):
     def __init__(self, model_name: str, num_labels: int):
         super(Emotion2VecBaseline, self).__init__()
         
-        print(f"--- 🧠 Initializing emotion2vec+ via ModelScope ---")
-        # 1. Load the official emotion2vec+ pipeline
-        self.backbone = pipeline(
-            task=Tasks.emotion_recognition, 
-            model=model_name
-        )
+        print(f"--- 🧠 Initializing emotion2vec+ via HuggingFace ---")
+        # 1. Load the official emotion2vec+ backbone from HF hub
+        # Better stability for Colab network
+        self.backbone = AutoModel(model=model_name, hub="hf", trust_remote_code=True)
         
         # 2. Classifier Head (BiLSTM + Dense)
         hidden_size = 768
@@ -38,13 +35,8 @@ class Emotion2VecBaseline(nn.Module):
 
     def set_backbone_trainable(self, trainable: bool):
         """Enable/Disable training for the underlying emotion2vec+ backbone."""
-        # Find the actual torch parameters deep inside the ModelScope wrapper
+        # AutoModel exposes .model which is the actual nn.Module
         target = self.backbone.model
-        
-        # If it's a GenericFunASR wrapper, the real module is in .model
-        if hasattr(target, "model") and isinstance(target.model, torch.nn.Module):
-            target = target.model
-            
         for param in target.parameters():
             param.requires_grad = trainable
             
@@ -56,29 +48,19 @@ class Emotion2VecBaseline(nn.Module):
         Returns: logits, embeddings
         """
         device = input_values.device
-        batch_feats = []
         
-        # DISCOVERY: Find the real module to check requires_grad
-        target_mod = self.backbone.model
-        if hasattr(target_mod, "model"):
-            target_mod = target_mod.model
-        
-        # Switch to training mode if backbone is being fine-tuned
-        is_finetuning = any(p.requires_grad for p in target_mod.parameters())
+        # Check if we are fine-tuning
+        is_finetuning = any(p.requires_grad for p in self.backbone.model.parameters())
         
         with torch.set_grad_enabled(is_finetuning):
-            # Process each item (pipeline usually expects single items or lists)
-            for i in range(input_values.shape[0]):
-                audio_data = input_values[i].cpu().numpy()
-                
-                # Silence internal pipeline logging for speed
-                with open(os.devnull, 'w') as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
-                    result = self.backbone(audio_data, granularity="utterance", extract_embedding=True)
-                
-                if isinstance(result, list): result = result[0]
-                feat = torch.tensor(result['feats'], dtype=torch.float32).to(device)
-                batch_feats.append(feat)
+            # AutoModel from funasr handles batches directly! 🚀
+            res = self.backbone.generate(input=input_values, granularity="utterance", extract_embedding=True)
             
+            # Extract utterance embeddings [batch, 768]
+            batch_feats = []
+            for item in res:
+                feat = torch.tensor(item['feats'], dtype=torch.float32).to(device)
+                batch_feats.append(feat)
         # 1. Stack into [batch, 768]
         x_stacked = torch.stack(batch_feats)
         
