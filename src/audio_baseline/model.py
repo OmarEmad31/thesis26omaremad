@@ -47,34 +47,36 @@ class Emotion2VecBaseline(nn.Module):
         Input: torch.Tensor of shape [batch, 160000]
         Returns: logits, embeddings
         """
-        device = input_values.device
+        # 1. Native Batch Pass
+        # We call .model directly to stay in the original torch graph
+        # and support proper batch processing (8 items at once).
+        outputs = self.backbone.model(input_values)
         
-        # Check if we are fine-tuning
-        is_finetuning = any(p.requires_grad for p in self.backbone.model.parameters())
-        
-        with torch.set_grad_enabled(is_finetuning):
-            # AutoModel from funasr handles batches directly! 🚀
-            res = self.backbone.generate(input=input_values, granularity="utterance", extract_embedding=True)
+        # 2. Extract Hidden States
+        # emotion2vec+ (based on Wav2Vec2) usually returns a tuple/dict
+        # where the first element is the hidden states [batch, seq_len, 768]
+        if isinstance(outputs, (list, tuple)):
+            last_hidden_state = outputs[0]
+        elif hasattr(outputs, "last_hidden_state"):
+            last_hidden_state = outputs.last_hidden_state
+        else:
+            # Fallback for direct tensor output
+            last_hidden_state = outputs
             
-            # Extract utterance embeddings [batch, 768]
-            batch_feats = []
-            for item in res:
-                feat = torch.tensor(item['feats'], dtype=torch.float32).to(device)
-                batch_feats.append(feat)
-        # 1. Stack into [batch, 768]
-        x_stacked = torch.stack(batch_feats)
+        # 3. Global Average Pooling (over the sequence/time dimension)
+        # last_hidden_state is [batch, seq_len, 768] -> we want [batch, 768]
+        # We mean over dim=1 (time) to get a single vector per audio clip
+        embeddings = torch.mean(last_hidden_state, dim=1)
         
-        # 2. Reshape into 3D for LSTM: [batch, sequence_len=1, hidden_size=768]
-        x = x_stacked.unsqueeze(1) 
-        
-        # 3. Pass through LSTM
+        # 4. BiLSTM + Classification Head
+        # Reshape for LSTM: [batch, sequence_len=1, hidden_size=768]
+        x = embeddings.unsqueeze(1) 
         lstm_out, _ = self.lstm(x)
         
-        # 4. Take the last time step output: [batch, 512]
+        # Pooled output from LSTM [batch, 512]
         pooled = lstm_out.squeeze(1)
         
         # 5. Final Classification
         logits = self.classifier(pooled)
         
-        # Return BOTH logits (for CrossEntropy) and pooled (for SCL)
         return logits, pooled
