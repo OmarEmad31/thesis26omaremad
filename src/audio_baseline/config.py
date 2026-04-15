@@ -27,19 +27,33 @@ if IS_COLAB:
 
     SPLIT_CSV_DIR   = Path("/content/data/processed/splits/audio_eligible")
     CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_power_mode")
-    EMBEDDING_CACHE = Path("/content/audio_embeddings.npz")
+    # NEW cache name (frame-level + augmented) — old utterance cache won't be loaded
+    EMBEDDING_CACHE = Path("/content/audio_embeddings_frame_aug.npz")
 
 else:
     DATA_ROOT       = Path("dataset/Final Modalink Dataset MERGED")
     SPLIT_CSV_DIR   = Path("data/processed/splits/audio_eligible")
     CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_power_mode")
-    EMBEDDING_CACHE = Path("audio_embeddings.npz")
+    EMBEDDING_CACHE = Path("audio_embeddings_frame_aug.npz")
 
 # ---------------------------------------------------------------------------
 # BACKBONE — emotion2vec_plus_base proven better than large on this dataset.
-# (large gives 1024-dim embeddings that are HARDER to fit with small N)
+# (large gives 1024-dim embeddings that are harder to fit with small N)
 # ---------------------------------------------------------------------------
 MODEL_NAME = "iic/emotion2vec_plus_base"
+
+# ---------------------------------------------------------------------------
+# EMBEDDING EXTRACTION
+# ---------------------------------------------------------------------------
+# Phase 3: use frame-level embeddings aggregated as concat(mean, std, max)
+# This gives 768×3 = 2304-dim — richer than single utterance-level vector
+EMBED_GRANULARITY = "frame"   # "frame" or "utterance"
+
+# Phase 2: augment training audio before embedding extraction
+# Each train file gets 4 versions → ~2200 training samples instead of 648
+AUGMENT_TRAIN    = True
+AUG_SPEED_RATES  = [0.85, 1.15]   # time-stretch rates (slow, fast)
+AUG_NOISE_STD    = 0.003          # Gaussian noise std multiplier (of signal std)
 
 # ---------------------------------------------------------------------------
 # AUDIO

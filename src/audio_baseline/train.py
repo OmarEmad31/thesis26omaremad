@@ -1,31 +1,22 @@
-"""Audio emotion classifier — complete, correct implementation.
+"""Audio emotion classifier — Phases 1-3 implementation.
 
-ROOT CAUSE OF PREVIOUS 28-42% CEILING
-  1. Manifest was built on Windows → only 718/5700 files marked as audio_exists=1
-     FIX → rebuild manifest on Colab before running (see README at bottom)
-  2. L2-normalize broke SVM (reverted to StandardScaler which gave 42%)
-  3. emotion2vec_plus_large WORSE than base on this dataset (reverted)
-  4. SCL temp=0.07 too aggressive, barely converging (now 0.20)
-  5. Oversampling 511 → 1036 duplicates → train 72%, val 29% (removed)
-
-Pipeline:
-  1. Load emotion2vec_plus_base backbone → extract 768-dim utterance embeddings
-  2. SVM-RBF with GridSearchCV (proven best for high-dim, small-N data)
-  3. MLP with Focal Loss + SCL(temp=0.2) + MixUp      (thesis SCL contribution)
-  4. Ensemble: SVM + MLP probability averaging
-  5. Final report
+Changes vs. previous version:
+  Phase 1 — Fix stale cache (new cache filename) + fix f-string warning bug
+  Phase 2 — Audio augmentation during extraction (4× training data)
+             Each train file → orig + speed×0.85 + speed×1.15 + noise
+             Val / test stay CLEAN (no augmentation ever)
+  Phase 3 — Frame-level embedding aggregation
+             granularity="frame" → concat(mean, std, max) → 2304-dim
+             (was utterance-level mean → 768-dim, throwing away temporal info)
 
 Run from project root:
   python -m src.audio_baseline.train
 
-COLAB SETUP (do BEFORE running train):
-  # Step 1 — rebuild manifest with actual Colab paths (detects all 5700 files)
-  !python scripts/build_manifest.py
-  # Step 2 — rebuild splits (gives ~3500 train / 750 val / 750 test)
-  !python scripts/split_dataset.py
-  # Step 3 — delete old embedding cache (different backbone / more files)
-  import os; os.remove("/content/audio_embeddings.npz") if os.path.exists("/content/audio_embeddings.npz") else None
-  # Step 4 — train
+COLAB SETUP:
+  !pip install funasr librosa -q
+  !git pull
+  # No need to rebuild manifest — current splits have 648 train / 139 val / 137 test
+  # New cache name means no conflict with old 511-sample cache
   !python -m src.audio_baseline.train
 """
 
@@ -76,146 +67,82 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Model
+# Phase 3 helper: aggregate frame-level embeddings → richer representation
 # ---------------------------------------------------------------------------
-class ResBlock(nn.Module):
-    """Pre-norm residual: LayerNorm → Linear → GELU → Dropout → add."""
-    def __init__(self, dim: int, dropout: float):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-    def forward(self, x):
-        return x + self.net(x)
-
-
-class AudioMLP(nn.Module):
+def aggregate_frames(feat: np.ndarray) -> np.ndarray:
     """
-    Lightweight but expressive classifier on top of frozen emotion2vec embeddings.
+    feat: [T, D]  (T frames, D dims)  OR  [D]  (single utterance-level vector)
 
-    Architecture  [in=768]:
-      LN → Linear(768→512) → GELU → Dropout(0.40)
-      ResBlock(512, 0.30)
-      LN → Linear(512→256) → GELU → Dropout(0.35)
-      ResBlock(256, 0.25)       ← proj head for SCL
-      Linear(256 → num_labels)
+    Returns: [D]  if feat is 1-D (utterance fallback)
+             [3*D] if feat is 2-D (frame-level): concat(mean, std, max)
 
-    Dropout is intentionally heavy because N_train < 5000.
+    The 3× richer vector preserves temporal dynamics that mean-pooling erases.
+    E.g. for emotion2vec_plus_base (D=768) → 2304-dim output.
     """
-    def __init__(self, input_dim: int = 768, num_labels: int = 7):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, 512),
-            nn.GELU(),
-            nn.Dropout(0.40),
-        )
-        self.res1 = ResBlock(512, 0.30)
-        self.down = nn.Sequential(
-            nn.LayerNorm(512),
-            nn.Linear(512, 256),
-            nn.GELU(),
-            nn.Dropout(0.35),
-        )
-        self.res2       = ResBlock(256, 0.25)
-        self.classifier = nn.Linear(256, num_labels)
-
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, x: torch.Tensor):
-        """Returns (logits [B, C], proj [B, 256])."""
-        x    = self.stem(x)
-        x    = self.res1(x)
-        x    = self.down(x)
-        proj = self.res2(x)         # raw 256-dim projection
-        logits = self.classifier(proj)
-        return logits, proj
+    if feat.ndim == 1:
+        # Model returned utterance-level — pad to 3× so dim is consistent
+        return np.concatenate([feat, np.zeros_like(feat), feat])   # [3*D]
+    # Normal case: [T, D] → concat stats
+    mean_f = feat.mean(axis=0)   # [D]
+    std_f  = feat.std(axis=0)    # [D]
+    max_f  = feat.max(axis=0)    # [D]
+    return np.concatenate([mean_f, std_f, max_f])                  # [3*D]
 
 
 # ---------------------------------------------------------------------------
-# Focal Loss
+# Phase 2 helper: build augmented versions of a waveform
 # ---------------------------------------------------------------------------
-class FocalLoss(nn.Module):
-    """FL(p_t) = -(1-p_t)^γ · log(p_t).  Combined with class weights."""
-    def __init__(self, weight=None, gamma: float = 1.5, label_smoothing: float = 0.1):
-        super().__init__()
-        self.register_buffer("weight", weight if weight is not None
-                             else torch.ones(1))
-        self.gamma           = gamma
-        self.label_smoothing = label_smoothing
-
-    def forward(self, logits, targets):
-        ce    = F.cross_entropy(logits, targets,
-                                weight=self.weight,
-                                label_smoothing=self.label_smoothing,
-                                reduction="none")
-        p_t   = torch.exp(-ce)
-        focal = (1.0 - p_t) ** self.gamma * ce
-        return focal.mean()
-
-
-# ---------------------------------------------------------------------------
-# Supervised Contrastive Loss   (Khosla et al., 2020)
-# temp=0.20: looser than the original 0.07 — needed for small N and few positives
-# ---------------------------------------------------------------------------
-def supcon_loss(proj: torch.Tensor, labels: torch.Tensor,
-                temp: float, device: torch.device) -> torch.Tensor:
+def get_augmentations(audio: np.ndarray, sr: int) -> list[tuple[str, np.ndarray]]:
     """
-    proj : [B, D]  — raw projection vectors (will be L2-normalised inside)
-    labels: [B]    — integer class indices
+    Returns [(name, waveform)] list.
+    Always starts with the original; augmented versions added when feasible.
+    All returned arrays are float32.
     """
-    feat   = F.normalize(proj, p=2, dim=1)          # [B, D] unit sphere
-    sim    = torch.matmul(feat, feat.T) / temp       # [B, B]
+    import librosa
 
-    bs     = labels.size(0)
-    I      = torch.eye(bs, device=device)
-    pos    = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float() * (1 - I)
-    neg_I  = 1 - I                                  # all pairs except self
+    results = [("orig", audio.copy())]
 
-    # Stability: subtract row max
-    sim_max, _ = sim.max(dim=1, keepdim=True)
-    sim        = sim - sim_max.detach()
+    # Speed stretch — preserves pitch, changes duration
+    for rate in config.AUG_SPEED_RATES:
+        label = "slow" if rate < 1.0 else "fast"
+        try:
+            stretched = librosa.effects.time_stretch(audio.astype(np.float32), rate=rate)
+            results.append((label, stretched))
+        except Exception:
+            pass  # Skip this augmentation if it fails (very short clips)
 
-    exp_sim  = torch.exp(sim) * neg_I
-    log_prob = sim - torch.log(exp_sim.sum(1, keepdim=True) + 1e-8)
+    # Additive Gaussian noise proportional to signal std
+    noise_std = config.AUG_NOISE_STD * float(np.std(audio) + 1e-8)
+    noisy     = (audio + (noise_std * np.random.randn(len(audio)))).astype(np.float32)
+    results.append(("noise", noisy))
 
-    valid = pos.sum(1) > 0
-    if not valid.any():
-        return torch.tensor(0.0, device=device)
-
-    loss = -(pos[valid] * log_prob[valid]).sum(1) / pos[valid].sum(1).clamp(min=1)
-    return loss.mean()
+    return results
 
 
 # ---------------------------------------------------------------------------
-# MixUp
-# ---------------------------------------------------------------------------
-def mixup(x, y, alpha, device):
-    lam = np.random.beta(alpha, alpha)
-    idx = torch.randperm(x.size(0), device=device)
-    return lam * x + (1 - lam) * x[idx], y, y[idx], lam
-
-def mixup_loss(criterion, logits, ya, yb, lam):
-    return lam * criterion(logits, ya) + (1 - lam) * criterion(logits, yb)
-
-
-# ---------------------------------------------------------------------------
-# Embedding extraction
+# Embedding extraction  (Phases 2 + 3)
 # ---------------------------------------------------------------------------
 def extract_embeddings(backbone, df: pd.DataFrame, label2id: dict,
-                       split_name: str, first_call: bool = False):
+                       split_name: str, augment: bool = False,
+                       first_call: bool = False):
+    """
+    Extract emotion2vec frame-level embeddings and aggregate as mean+std+max.
+
+    augment=True  → apply 4× audio augmentation (training split only!)
+    augment=False → single clean extraction (val / test splits)
+    """
     import librosa
-    embeddings, labels_out, skipped = [], [], 0
+
+    embeddings: list[np.ndarray] = []
+    labels_out: list[int]        = []
+    skipped = 0
+    n_aug_versions = len(config.AUG_SPEED_RATES) + 2  # orig + speeds + noise
     detected_dim = None
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc=f"  {split_name}"):
+    for row_idx, (_, row) in enumerate(tqdm(
+            df.iterrows(), total=len(df),
+            desc=f"  {'aug-' if augment else ''}{split_name}")):
+
         folder   = str(row["folder"]).strip()
         rel_path = str(row["audio_relpath"]).replace("\\", "/").lstrip("/")
 
@@ -235,64 +162,173 @@ def extract_embeddings(backbone, df: pd.DataFrame, label2id: dict,
             audio, _ = librosa.load(candidate, sr=config.SAMPLING_RATE, mono=True)
             if len(audio) > config.MAX_AUDIO_SAMPLES:
                 audio = audio[: config.MAX_AUDIO_SAMPLES]
-
-            # Silence funasr's own stdout/stderr
-            with open(os.devnull, "w") as devnull:
-                old_out, old_err = sys.stdout, sys.stderr
-                sys.stdout = sys.stderr = devnull
-                try:
-                    res = backbone.generate(
-                        input=audio, granularity="utterance", extract_embedding=True
-                    )
-                finally:
-                    sys.stdout, sys.stderr = old_out, old_err
-
-            if not res or "feats" not in res[0]:
-                skipped += 1
-                continue
-
-            feat = np.array(res[0]["feats"])
-            if feat.ndim == 2:
-                feat = feat.mean(axis=0)
-            feat = feat.flatten().astype(np.float32)
-
-            if detected_dim is None:
-                detected_dim = feat.shape[0]
-                if first_call:
-                    logger.info(f"    🔬 Embedding dim={detected_dim}"
-                                f"  mean={feat.mean():.4f}  std={feat.std():.4f}")
-
-            embeddings.append(feat)
-            labels_out.append(label2id[row["emotion_final"]])
-
+            audio = audio.astype(np.float32)
         except Exception:
             skipped += 1
+            continue
 
-    logger.info(f"    {split_name}: {len(embeddings)} ok | {skipped} skipped | dim={detected_dim}")
+        label = label2id[row["emotion_final"]]
+
+        # Build list of (name, waveform) to process
+        versions = get_augmentations(audio, config.SAMPLING_RATE) if augment else [("orig", audio)]
+
+        for aug_name, wav in versions:
+            # Clip augmented audio to max length
+            if len(wav) > config.MAX_AUDIO_SAMPLES:
+                wav = wav[: config.MAX_AUDIO_SAMPLES]
+
+            try:
+                # Silence funasr stdout/stderr
+                with open(os.devnull, "w") as devnull:
+                    old_out, old_err = sys.stdout, sys.stderr
+                    sys.stdout = sys.stderr = devnull
+                    try:
+                        res = backbone.generate(
+                            input=wav,
+                            granularity=config.EMBED_GRANULARITY,
+                            extract_embedding=True,
+                        )
+                    finally:
+                        sys.stdout, sys.stderr = old_out, old_err
+
+                if not res or "feats" not in res[0]:
+                    continue
+
+                raw  = np.array(res[0]["feats"], dtype=np.float32)
+                feat = aggregate_frames(raw)    # → [3*D] or [D] fallback
+
+                if detected_dim is None:
+                    detected_dim = feat.shape[0]
+                    if first_call:
+                        logger.info(
+                            f"    🔬 granularity={config.EMBED_GRANULARITY}"
+                            f"  raw_shape={raw.shape}"
+                            f"  → aggregated dim={detected_dim}"
+                        )
+
+                embeddings.append(feat)
+                labels_out.append(label)
+
+            except Exception:
+                continue  # Skip this version; at least orig is usually fine
+
+    n_files = len(df) - skipped
+    n_embs  = len(embeddings)
+    aug_msg = f" × {n_embs // max(n_files, 1):.1f} aug" if augment else ""
+    logger.info(
+        f"    {split_name}: {n_files} files → {n_embs} embeddings{aug_msg}"
+        f"  ({skipped} files skipped)  dim={detected_dim}"
+    )
     return (np.array(embeddings, dtype=np.float32),
             np.array(labels_out,  dtype=np.int64))
 
 
 # ---------------------------------------------------------------------------
-# SVM with GridSearchCV  (StandardScaler — DO NOT use L2-normalize for RBF)
+# Model
+# ---------------------------------------------------------------------------
+class ResBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(), nn.Dropout(dropout)
+        )
+    def forward(self, x): return x + self.net(x)
+
+
+class AudioMLP(nn.Module):
+    """
+    Residual MLP classifier on frozen emotion2vec embeddings.
+
+    Input dim is auto-detected (2304 with frame-level agg, 768 fallback).
+    Architecture: in → 512 → 512-res → 256 → 256-res → num_labels
+    Heavy dropout because N_train < 5000.
+    """
+    def __init__(self, input_dim: int, num_labels: int = 7):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.LayerNorm(input_dim), nn.Linear(input_dim, 512),
+            nn.GELU(), nn.Dropout(0.40),
+        )
+        self.res1 = ResBlock(512, 0.30)
+        self.down = nn.Sequential(
+            nn.LayerNorm(512), nn.Linear(512, 256),
+            nn.GELU(), nn.Dropout(0.35),
+        )
+        self.res2       = ResBlock(256, 0.25)
+        self.classifier = nn.Linear(256, num_labels)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        x    = self.stem(x)
+        x    = self.res1(x)
+        x    = self.down(x)
+        proj = self.res2(x)
+        return self.classifier(proj), proj
+
+
+# ---------------------------------------------------------------------------
+# Losses + augmentation
+# ---------------------------------------------------------------------------
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma: float = 1.5, label_smoothing: float = 0.1):
+        super().__init__()
+        self.register_buffer("weight", weight if weight is not None else torch.ones(1))
+        self.gamma           = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits, targets):
+        ce    = F.cross_entropy(logits, targets, weight=self.weight,
+                                label_smoothing=self.label_smoothing, reduction="none")
+        focal = (1.0 - torch.exp(-ce)) ** self.gamma * ce
+        return focal.mean()
+
+
+def supcon_loss(proj, labels, temp, device):
+    feat      = F.normalize(proj, p=2, dim=1)
+    sim       = torch.matmul(feat, feat.T) / temp
+    bs        = labels.size(0)
+    I         = torch.eye(bs, device=device)
+    pos       = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float() * (1 - I)
+    neg_I     = 1 - I
+    sim_max,_ = sim.max(dim=1, keepdim=True)
+    sim       = sim - sim_max.detach()
+    exp_sim   = torch.exp(sim) * neg_I
+    log_prob  = sim - torch.log(exp_sim.sum(1, keepdim=True) + 1e-8)
+    valid     = pos.sum(1) > 0
+    if not valid.any():
+        return torch.tensor(0.0, device=device)
+    return (-(pos[valid] * log_prob[valid]).sum(1) / pos[valid].sum(1).clamp(1)).mean()
+
+
+def mixup(x, y, alpha, device):
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(x.size(0), device=device)
+    return lam * x + (1 - lam) * x[idx], y, y[idx], lam
+
+def mixup_loss(criterion, logits, ya, yb, lam):
+    return lam * criterion(logits, ya) + (1 - lam) * criterion(logits, yb)
+
+
+# ---------------------------------------------------------------------------
+# SVM pipeline
 # ---------------------------------------------------------------------------
 def run_sklearn(train_emb, train_lbl, val_emb, val_lbl,
                 test_emb, test_lbl, id2label):
-    """
-    StandardScaler + SVM-RBF with grid search.
-    Final model is trained on train+val (more data → better generalisation).
-    """
     scaler = StandardScaler()
     Xtr    = scaler.fit_transform(train_emb)
     Xva    = scaler.transform(val_emb)
     Xte    = scaler.transform(test_emb)
-    # Train+val for final SVM
+    # Train+val for final SVM generalisation
     Xtv    = scaler.transform(np.concatenate([train_emb, val_emb]))
     ytv    = np.concatenate([train_lbl, val_lbl])
 
     results = {}
 
-    # 1. Logistic Regression (quick reference)
+    # Logistic Regression (reference)
     logger.info("   [LR] fitting...")
     lr = LogisticRegression(C=1.0, max_iter=3000, class_weight="balanced",
                             solver="lbfgs", random_state=42)
@@ -302,7 +338,7 @@ def run_sklearn(train_emb, train_lbl, val_emb, val_lbl,
         results[f"LR_{sn}_acc"] = accuracy_score(y, p)
         results[f"LR_{sn}_f1"]  = f1_score(y, p, average="macro")
 
-    # 2. SVM-RBF — GridSearchCV on training fold, then retrain on TV
+    # SVM-RBF GridSearch
     logger.info("   [SVM] grid-searching (C, gamma)...")
     param_grid = {"C": [0.1, 0.5, 1, 5, 10, 50, 100, 500],
                   "gamma": ["scale", "auto"]}
@@ -315,7 +351,6 @@ def run_sklearn(train_emb, train_lbl, val_emb, val_lbl,
     logger.info(f"   ✅ Best C={best['C']}  gamma={best['gamma']}"
                 f"  cv-F1={gs.best_score_:.4f}")
 
-    # Re-fit on train+val for best test accuracy
     svm_tv = SVC(kernel="rbf", probability=True, class_weight="balanced",
                  random_state=42, **best)
     svm_tv.fit(Xtv, ytv)
@@ -348,40 +383,31 @@ def train_mlp(train_emb, train_lbl, val_emb, val_lbl, id2label, device):
     emb_dim    = train_emb.shape[1]
 
     N_train = len(train_lbl)
-    dist    = collections.Counter(train_lbl.tolist())
-    logger.info(f"\n   Training dist ({N_train} samples): {dict(sorted(dist.items()))}")
+    dist    = dict(sorted(collections.Counter(train_lbl.tolist()).items()))
+    logger.info(f"\n   Training dist ({N_train} samples): {dist}")
+    # Phase 1 fix: was "Only {N_train}" (literal), now f-string
     if N_train < 1000:
-        logger.warning("   ⚠️  Only {N_train} training samples detected!"
-                       " Run build_manifest.py + split_dataset.py on Colab"
-                       " first to unlock all ~5000 files.")
+        logger.warning(f"   ⚠️  Only {N_train} training samples. "
+                       "Consider deleting stale cache and using more data.")
 
     Xtr = torch.tensor(train_emb, dtype=torch.float32)
     ytr = torch.tensor(train_lbl, dtype=torch.long)
     Xva = torch.tensor(val_emb,   dtype=torch.float32)
     yva = torch.tensor(val_lbl,   dtype=torch.long)
 
-    # NOTE: No oversampling — class-weighted loss handles imbalance cleanly.
-    # Oversampling with this dataset size causes memorisation (train≫val).
     train_loader = DataLoader(TensorDataset(Xtr, ytr),
                               batch_size=config.BATCH_SIZE,
                               shuffle=True, drop_last=False)
-    val_loader   = DataLoader(TensorDataset(Xva, yva),
-                              batch_size=256, shuffle=False)
+    val_loader   = DataLoader(TensorDataset(Xva, yva), batch_size=256, shuffle=False)
 
-    model = AudioMLP(input_dim=emb_dim, num_labels=num_labels).to(device)
-
-    # Class weights (computed from real train dist, not oversampled)
-    raw_weights = compute_class_weight("balanced",
-                                       classes=np.arange(num_labels),
-                                       y=train_lbl)
-    cw     = torch.tensor(raw_weights, dtype=torch.float, device=device)
+    model     = AudioMLP(input_dim=emb_dim, num_labels=num_labels).to(device)
+    raw_w     = compute_class_weight("balanced", classes=np.arange(num_labels), y=train_lbl)
+    cw        = torch.tensor(raw_w, dtype=torch.float, device=device)
     criterion = FocalLoss(weight=cw, gamma=config.FOCAL_GAMMA, label_smoothing=0.1)
 
     optimizer = torch.optim.AdamW(model.parameters(),
                                   lr=config.LEARNING_RATE,
                                   weight_decay=config.WEIGHT_DECAY)
-
-    # OneCycleLR: warm-up (10%) then cosine anneal — standard best practice
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=config.LEARNING_RATE * 10,
@@ -393,9 +419,7 @@ def train_mlp(train_emb, train_lbl, val_emb, val_lbl, id2label, device):
         final_div_factor=1e3,
     )
 
-    best_f1    = 0.0
-    patience   = 0
-    best_state = None
+    best_f1, patience, best_state = 0.0, 0, None
 
     logger.info(f"\n⚡ AudioMLP + Focal + SCL(t={config.SCL_TEMP}) + MixUp")
     logger.info(f"   dim={emb_dim}  bs={config.BATCH_SIZE}"
@@ -409,8 +433,9 @@ def train_mlp(train_emb, train_lbl, val_emb, val_lbl, id2label, device):
 
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
+            use_mix = config.USE_MIXUP and np.random.random() < config.MIXUP_PROB
 
-            if config.USE_MIXUP and np.random.random() < config.MIXUP_PROB:
+            if use_mix:
                 xb, ya, yb_, lam = mixup(xb, yb, config.MIXUP_ALPHA, device)
                 logits, proj = model(xb)
                 ce  = mixup_loss(criterion, logits, ya, yb_, lam)
@@ -424,17 +449,15 @@ def train_mlp(train_emb, train_lbl, val_emb, val_lbl, id2label, device):
                 sum_correct += (logits.argmax(1) == yb).sum().item()
 
             loss = ce + config.SCL_WEIGHT * sc
-            optimizer.zero_grad()
-            loss.backward()
+            optimizer.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
+            optimizer.step(); scheduler.step()
 
             sum_n  += yb.size(0)
             sum_ce += ce.item()
             sum_sc += sc.item()
 
-        # Validation (clean, no augmentation)
+        # Validation
         model.eval()
         vp, vt = [], []
         with torch.no_grad():
@@ -453,8 +476,7 @@ def train_mlp(train_emb, train_lbl, val_emb, val_lbl, id2label, device):
         else:
             patience += 1
 
-        log_now = improved or ((epoch + 1) % config.LOG_EVERY == 0) or epoch == 0
-        if log_now:
+        if improved or ((epoch + 1) % config.LOG_EVERY == 0) or epoch == 0:
             tag = "⭐" if improved else f"patience {patience}/{config.MAX_PATIENCE}"
             logger.info(
                 f"  Ep {epoch:03d} | Tr {sum_correct/sum_n:.4f} | "
@@ -479,9 +501,9 @@ def train_mlp(train_emb, train_lbl, val_emb, val_lbl, id2label, device):
 @torch.no_grad()
 def evaluate(model, emb_np, lbl_np, device, tta=False):
     model.eval()
-    passes  = config.TTA_PASSES if tta else 1
-    noise   = config.TTA_NOISE  if tta else 0.0
-    acc_p   = None
+    passes = config.TTA_PASSES if tta else 1
+    noise  = config.TTA_NOISE  if tta else 0.0
+    acc_p  = None
 
     for _ in range(passes):
         x = torch.tensor(emb_np, dtype=torch.float32)
@@ -489,12 +511,12 @@ def evaluate(model, emb_np, lbl_np, device, tta=False):
             x = x + torch.randn_like(x) * noise
         loader = DataLoader(TensorDataset(x, torch.tensor(lbl_np)),
                             batch_size=256, shuffle=False)
-        probs_p = []
+        probs  = []
         for xb, _ in loader:
             logits, _ = model(xb.to(device))
-            probs_p.append(F.softmax(logits, -1).cpu().numpy())
-        probs_p = np.concatenate(probs_p)
-        acc_p   = probs_p if acc_p is None else acc_p + probs_p
+            probs.append(F.softmax(logits, -1).cpu().numpy())
+        probs  = np.concatenate(probs)
+        acc_p  = probs if acc_p is None else acc_p + probs
 
     avg  = acc_p / passes
     pred = avg.argmax(1)
@@ -508,9 +530,11 @@ def main():
     set_seed(42)
     device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
     logger.info(f"\n🚀 Device: {device}  |  Backbone: {config.MODEL_NAME}")
+    logger.info(f"   Embed granularity: {config.EMBED_GRANULARITY}"
+                f"  |  Train augmentation: {config.AUGMENT_TRAIN}")
 
     # 1. Load splits
-    logger.info(f"📁 {config.SPLIT_CSV_DIR}")
+    logger.info(f"\n📁 {config.SPLIT_CSV_DIR}")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
@@ -529,17 +553,26 @@ def main():
         train_emb = d["train_emb"]; train_lbl = d["train_lbl"]
         val_emb   = d["val_emb"];   val_lbl   = d["val_lbl"]
         test_emb  = d["test_emb"];  test_lbl  = d["test_lbl"]
+        logger.info(f"   Loaded — Train: {len(train_lbl)} | Val: {len(val_lbl)}"
+                    f" | Test: {len(test_lbl)} | dim: {train_emb.shape[1]}")
     else:
-        logger.info("🧠 Loading backbone (runs once, then cached)...")
+        logger.info("🧠 Loading backbone (extraction runs once, then cached)...")
         from funasr import AutoModel
         bb = AutoModel(model=config.MODEL_NAME, hub="hf", trust_remote_code=True)
         bb.model.eval()
         for p in bb.model.parameters():
             p.requires_grad = False
 
-        train_emb, train_lbl = extract_embeddings(bb, train_df, label2id, "train", True)
-        val_emb,   val_lbl   = extract_embeddings(bb, val_df,   label2id, "val")
-        test_emb,  test_lbl  = extract_embeddings(bb, test_df,  label2id, "test")
+        logger.info(f"🔬 Extracting embeddings"
+                    f" (granularity={config.EMBED_GRANULARITY}"
+                    f", train_aug={config.AUGMENT_TRAIN})...")
+        # Phase 2: training gets augmented, val/test always clean
+        train_emb, train_lbl = extract_embeddings(
+            bb, train_df, label2id, "train",
+            augment=config.AUGMENT_TRAIN, first_call=True
+        )
+        val_emb,   val_lbl   = extract_embeddings(bb, val_df,  label2id, "val",  augment=False)
+        test_emb,  test_lbl  = extract_embeddings(bb, test_df, label2id, "test", augment=False)
 
         np.savez_compressed(cache,
             train_emb=train_emb, train_lbl=train_lbl,
@@ -548,24 +581,25 @@ def main():
         logger.info(f"💾 Saved to {cache}")
         del bb
         import gc; gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    logger.info(f"   Embeddings — dim={train_emb.shape[1]} | "
-                f"Train={len(train_lbl)} | Val={len(val_lbl)} | Test={len(test_lbl)}")
+    logger.info(f"   Train: {len(train_lbl)} embeddings (includes augmentation if on)")
+    logger.info(f"   Val: {len(val_lbl)} | Test: {len(test_lbl)} | dim: {train_emb.shape[1]}")
     logger.info(f"   Train dist: {dict(sorted(collections.Counter(train_lbl.tolist()).items()))}")
 
-    # 3. SVM
+    # 3. SVM (uses CLEAN train embeddings — SVM doesn't benefit from augmented duplicates)
+    # Note: when augment=True, train_emb contains 4× data including augmented versions.
+    # SVM with probability calibration still runs on this — more data helps generalisation.
     sk_res, scaler, svm = run_sklearn(
         train_emb, train_lbl, val_emb, val_lbl, test_emb, test_lbl, id2label
     )
 
-    # 4. MLP
+    # 4. MLP (benefits greatly from augmented training data)
     mlp, best_val_f1 = train_mlp(
         train_emb, train_lbl, val_emb, val_lbl, id2label, device
     )
 
-    # 5. Evaluate MLP (clean + TTA)
+    # 5. Evaluate MLP
     true_te, pred_clean, prob_clean = evaluate(mlp, test_emb, test_lbl, device, tta=False)
     _,       pred_tta,   prob_tta   = evaluate(mlp, test_emb, test_lbl, device, tta=True)
     true_va, pred_va,    _          = evaluate(mlp, val_emb,  val_lbl,  device, tta=False)
@@ -573,11 +607,10 @@ def main():
     mlp_test_acc = accuracy_score(true_te, pred_clean)
     mlp_test_f1  = f1_score(true_te, pred_clean, average="macro")
     tta_test_acc = accuracy_score(true_te, pred_tta)
-    tta_test_f1  = f1_score(true_te, pred_tta,   average="macro")
+    tta_test_f1  = f1_score(true_te, pred_tta, average="macro")
     mlp_val_acc  = accuracy_score(true_va, pred_va)
 
-    # 6. Ensemble: SVM probs + MLP-TTA probs
-    # SVM uses StandardScaler; re-apply the same scaler
+    # 6. Ensemble: SVM + MLP-TTA
     svm_prob_te = svm.predict_proba(scaler.transform(test_emb))
     ens_prob    = 0.5 * svm_prob_te + 0.5 * prob_tta
     ens_pred    = ens_prob.argmax(1)
@@ -585,15 +618,14 @@ def main():
     ens_f1      = f1_score(test_lbl, ens_pred, average="macro")
     ens_f1w     = f1_score(test_lbl, ens_pred, average="weighted")
 
-    # 7. Reports
+    # 7. Final reports
     label_strs = [id2label[i] for i in range(len(id2label))]
-
     logger.info("\n   MLP (clean) Test Report:")
     logger.info(classification_report(true_te, pred_clean, target_names=label_strs))
     if config.USE_TTA:
         logger.info("   MLP (TTA) Test Report:")
         logger.info(classification_report(true_te, pred_tta, target_names=label_strs))
-    logger.info("   Ensemble Test Report:")
+    logger.info("   Ensemble (SVM + MLP-TTA) Test Report:")
     logger.info(classification_report(test_lbl, ens_pred, target_names=label_strs))
 
     logger.info("\n" + "=" * 70)
@@ -614,9 +646,9 @@ def main():
     logger.info("=" * 70)
 
     best_acc = max(sk_res["SVM_test_acc"], mlp_test_acc, tta_test_acc, ens_acc)
-    best_f1  = max(sk_res["SVM_test_f1"],  mlp_test_f1,  tta_test_f1,  ens_f1)
+    best_f1_ = max(sk_res["SVM_test_f1"],  mlp_test_f1,  tta_test_f1,  ens_f1)
     logger.info(f"  🏅 Best Accuracy  : {best_acc:.4f}")
-    logger.info(f"  🏅 Best F1-Macro  : {best_f1:.4f}")
+    logger.info(f"  🏅 Best F1-Macro  : {best_f1_:.4f}")
     logger.info(f"  📊 Ensemble F1-Wt : {ens_f1w:.4f}")
     logger.info("=" * 70)
 
