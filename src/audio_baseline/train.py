@@ -229,7 +229,7 @@ def main() -> None:
             eval_strategy="epoch",  
             save_strategy="no",  # Kept exactly as text baseline
             load_best_model_at_end=False,
-            logging_steps=50,
+            logging_steps=5,     # Changed from 50 to 5 so we see progress instantly!
             seed=config.SEED + fold_idx,
             report_to="none",
             dataloader_pin_memory=False,
@@ -247,6 +247,7 @@ def main() -> None:
             scl_weight=config.SCL_WEIGHT,
         )
 
+        print(f"🔥 Kicking off Trainer loop for Fold {fold_idx} (Watch for the progress bar...)")
         trainer.train()
         trainer.save_model(str(best_dir))
         
