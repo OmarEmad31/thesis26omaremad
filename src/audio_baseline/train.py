@@ -303,8 +303,7 @@ def main():
     X_train = scaler.fit_transform(train_emb)
     X_val   = scaler.transform(val_emb)
 
-    lr_clf = LogisticRegression(max_iter=1000, C=1.0, solver="lbfgs",
-                                multi_class="multinomial", random_state=42)
+    lr_clf = LogisticRegression(max_iter=2000, C=1.0, solver="lbfgs", random_state=42)
     lr_clf.fit(X_train, train_lbl)
     val_preds = lr_clf.predict(X_val)
     lr_val_acc = accuracy_score(val_lbl, val_preds)
