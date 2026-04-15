@@ -194,6 +194,10 @@ class AudioSCLTrainer:
                 all_logits.append(logits.cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
         
+        if not all_logits:
+            logger.warning("⚠️ Evaluation skipped: No valid audio files found in validation set.")
+            return {"loss": 0, "accuracy": 0, "f1": 0, "precision": 0, "recall": 0}
+            
         logits = np.concatenate(all_logits, axis=0)
         labels = np.concatenate(all_labels, axis=0)
         preds = np.argmax(logits, axis=1)
@@ -279,6 +283,20 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False, collate_fn=collate_audio_fn, num_workers=2)
     
     # 4. Initialize Model & Training Tools
+    # --- DIAGNOSTIC: Check physical file existence ---
+    logger.info(f"🔍 Diagnostic: Checking first few paths in {config.AUDIO_ROOT}...")
+    sample_paths = train_df['path'].head(3).tolist()
+    for sp in sample_paths:
+        full_p = config.AUDIO_ROOT / sp
+        exists = full_p.exists()
+        logger.info(f"   - {'✅' if exists else '❌'} {sp}")
+        if not exists:
+            # Check for common zip-folder patterns
+            for sub in config.AUDIO_ROOT.iterdir():
+                if sub.is_dir() and (sub / sp).exists():
+                    logger.info(f"     💡 FOUND IN SUBFOLDER: {sub.name}")
+                    break
+
     model = Emotion2VecBaseline(config.MODEL_NAME, num_labels=len(label2id))
     
     # Start with frozen backbone (Initial Warmup)
