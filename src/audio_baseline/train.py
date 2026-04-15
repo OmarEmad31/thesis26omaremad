@@ -338,13 +338,14 @@ def run_sklearn(train_emb, train_lbl, val_emb, val_lbl,
         results[f"LR_{sn}_acc"] = accuracy_score(y, p)
         results[f"LR_{sn}_f1"]  = f1_score(y, p, average="macro")
 
-    # SVM-RBF GridSearch
-    logger.info("   [SVM] grid-searching (C, gamma)...")
-    param_grid = {"C": [0.1, 0.5, 1, 5, 10, 50, 100, 500],
-                  "gamma": ["scale", "auto"]}
+    # SVM-RBF GridSearch — kept small: 4C × 1gamma × 3fold = 12 fits (fast)
+    # gamma='scale' (1/n_features/var) is almost always best; 'auto' dropped
+    logger.info("   [SVM] grid-searching C in {1, 10, 100, 500} (12 fits)...")
+    param_grid = {"C": [1, 10, 100, 500],
+                  "gamma": ["scale"]}
     gs = GridSearchCV(
         SVC(kernel="rbf", probability=True, class_weight="balanced", random_state=42),
-        param_grid, cv=5, scoring="f1_macro", n_jobs=-1, verbose=0,
+        param_grid, cv=3, scoring="f1_macro", n_jobs=-1, verbose=0,
     )
     gs.fit(Xtr, train_lbl)
     best = gs.best_params_
