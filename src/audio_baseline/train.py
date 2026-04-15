@@ -196,7 +196,10 @@ class AudioSCLTrainer:
         
         if not all_logits:
             logger.warning("⚠️ Evaluation skipped: No valid audio files found in validation set.")
-            return {"loss": 0, "accuracy": 0, "f1": 0, "precision": 0, "recall": 0}
+            return {
+                "loss": 0, "accuracy": 0, "f1": 0, "precision": 0, "recall": 0,
+                "f1_macro": 0, "f1_weighted": 0, "precision_macro": 0, "recall_macro": 0
+            }
             
         logits = np.concatenate(all_logits, axis=0)
         labels = np.concatenate(all_labels, axis=0)

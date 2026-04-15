@@ -6,26 +6,34 @@ from pathlib import Path
 IS_COLAB = "COLAB_GPU" in os.environ or os.path.exists("/content")
 
 if IS_COLAB:
-    # Check if we unzipped to the local SSD (/content/)
-    if os.path.exists("/content/Thesis Project"):
-        print("🚀 [POWER MODE] Using LOCAL SSD!")
-        DRIVE_BASE = Path("/content/Thesis Project")
-        # --- AUTO-CORRECT DATA ROOT ---
-        # Try the deep nested path first, fallback to base if not found
-        DATA_ROOT = DRIVE_BASE / "dataset/Final Modalink Dataset MERGED"
-        if not DATA_ROOT.exists():
-            DATA_ROOT = DRIVE_BASE # Fallback to root
-        
-        SPLIT_CSV_DIR = Path("/content/data/processed/splits/audio_eligible")
-        CHECKPOINT_DIR = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_power_mode")
-    else:
-        print("📁 Using Google Drive (Slow mode). Tip: Unzip your dataset to /content/ for 10x speed.")
-        DRIVE_BASE = Path("/content/drive/MyDrive/Thesis Project")
-        DATA_ROOT = DRIVE_BASE / "dataset/Final Modalink Dataset MERGED"
-        if not DATA_ROOT.exists():
-            DATA_ROOT = DRIVE_BASE
-        SPLIT_CSV_DIR = DRIVE_BASE / "data/processed/splits/audio_eligible"
-        CHECKPOINT_DIR = DRIVE_BASE / "checkpoints/audio_power_mode"
+    # --- UNIVERSAL DATA FINDER ---
+    # We look for where the audio is actually hiding on the SSD
+    print("🕵️‍♂️ Hunting for data folders...")
+    search_roots = [Path("/content/Thesis Project"), Path("/content")]
+    DATA_ROOT = None
+    
+    for root in search_roots:
+        if root.exists():
+            # Does this root or its subfolders contain a .wav?
+            wavs = list(root.glob("**/*.wav"))
+            if wavs:
+                # We found audio! The root is the parent of the first wav's folder structure
+                # Actually, the best DATA_ROOT is the folder that contains 'videoplayback' folders
+                for w in wavs:
+                    if "videoplayback" in str(w):
+                        # The parent that contains 'videoplayback (X)' is our root
+                        p = w.parent
+                        while p.name and "videoplayback" not in p.name:
+                            p = p.parent
+                        DATA_ROOT = p.parent
+                        break
+                if DATA_ROOT: break
+
+    if not DATA_ROOT: DATA_ROOT = Path("/content/Thesis Project") # Final Fallback
+    print(f"✅ DATA_ROOT Locked: {DATA_ROOT}")
+    
+    SPLIT_CSV_DIR = Path("/content/data/processed/splits/audio_eligible")
+    CHECKPOINT_DIR = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_power_mode")
 else:
     # Standard Local Paths
     DATA_ROOT = Path("dataset/Final Modalink Dataset MERGED")
