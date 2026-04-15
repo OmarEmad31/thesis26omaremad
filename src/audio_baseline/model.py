@@ -58,21 +58,24 @@ class Emotion2VecBaseline(nn.Module):
             outputs = self.backbone.model(input_values)
         
         # 2. Extract Hidden States
-        # emotion2vec+ (based on Wav2Vec2) usually returns a tuple/dict
-        # where the first element is the hidden states [batch, seq_len, 768]
+        # emotion2vec+ can return a list, a tuple, a dict, or a specialized object.
         if isinstance(outputs, (list, tuple)):
             last_hidden_state = outputs[0]
+        elif isinstance(outputs, dict):
+            # Fairseq/FunASR 'features_only' often returns a dict with 'x'
+            last_hidden_state = outputs.get("x", outputs.get("last_hidden_state", outputs.get("features", next(iter(outputs.values())))))
         elif hasattr(outputs, "last_hidden_state"):
             last_hidden_state = outputs.last_hidden_state
         else:
-            # Fallback for direct tensor output
             last_hidden_state = outputs
             
-        # 3. Global Average Pooling (over the sequence/time dimension)
-        # last_hidden_state is [batch, seq_len, 768] -> we want [batch, 768]
-        # We mean over dim=1 (time) to get a single vector per audio clip
+        # 3. Global Average Pooling 
+        # Ensure it's a tensor before calling mean()
+        if not isinstance(last_hidden_state, torch.Tensor):
+            # Emergency fallback: if it's still not a tensor, try its first attribute
+            last_hidden_state = last_hidden_state[0] if hasattr(last_hidden_state, "__getitem__") else last_hidden_state
+
         embeddings = torch.mean(last_hidden_state, dim=1)
-        
         # 4. BiLSTM + Classification Head
         # Reshape for LSTM: [batch, sequence_len=1, hidden_size=768]
         x = embeddings.unsqueeze(1) 
