@@ -1,8 +1,8 @@
-"""Audio Dataset — raw waveform loading only.
+"""Audio data utilities.
 
-The emotion2vec backbone has its OWN internal feature extractor.
-We must NOT pre-process with Wav2Vec2FeatureExtractor before passing to it.
-We just load, resample, normalize, and return the raw float32 waveform.
+Two datasets:
+1. AudioEmotionDataset  — used during embedding extraction (loads raw audio)
+2. EmbeddingDataset     — used during MLP training (loads pre-computed tensors)
 """
 
 import torch
@@ -13,49 +13,39 @@ import pandas as pd
 from pathlib import Path
 
 
-def collate_audio_fn(batch):
-    """
-    Synchronized Collate: drops None samples and pads the rest.
-    Returns a dict with input_values [B, T], attention_mask [B, T], labels [B].
-    """
-    valid_batch = [b for b in batch if b is not None]
-
-    if len(valid_batch) == 0:
-        return None
-
-    input_values = [b["input_values"] for b in valid_batch]
-    labels = [b["labels"] for b in valid_batch]
-
-    # Pad to the longest waveform in the batch
-    inputs_padded = torch.nn.utils.rnn.pad_sequence(
-        input_values, batch_first=True, padding_value=0.0
-    )
-
-    # Attention mask: 1 for real signal, 0 for padding
-    attention_mask = (inputs_padded != 0).long()
-
-    return {
-        "input_values": inputs_padded,
-        "attention_mask": attention_mask,
-        "labels": torch.stack(labels),
-    }
+# ---------------------------------------------------------------------------
+# Path helper
+# ---------------------------------------------------------------------------
+def resolve_audio_path(data_root: Path, folder: str, rel_path: str) -> Path:
+    """Try direct path, then scan one subfolder level as fallback."""
+    candidate = data_root / folder / rel_path
+    if candidate.exists():
+        return candidate
+    try:
+        for sub in data_root.iterdir():
+            if sub.is_dir():
+                alt = sub / folder / rel_path
+                if alt.exists():
+                    return alt
+    except Exception:
+        pass
+    return candidate  # will fail .exists(), triggers skip
 
 
+# ---------------------------------------------------------------------------
+# 1. Raw-audio dataset (embedding extraction only)
+# ---------------------------------------------------------------------------
 class AudioEmotionDataset(Dataset):
     def __init__(
         self,
-        csv_path,          # Path or None (set .df manually after init)
+        df: pd.DataFrame,
         data_root: Path,
         label2id: dict,
         max_samples: int = 160000,
         sampling_rate: int = 16000,
-        # feature_extractor param kept for backward compat but IGNORED
-        feature_extractor=None,
+        feature_extractor=None,   # kept for backward-compat, NOT used
     ):
-        if csv_path is not None:
-            self.df = pd.read_csv(csv_path)
-        else:
-            self.df = None
+        self.df = df.reset_index(drop=True)
         self.data_root = data_root
         self.label2id = label2id
         self.max_samples = max_samples
@@ -64,58 +54,49 @@ class AudioEmotionDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
-    def _resolve_path(self, folder_name: str, rel_path: str) -> Path:
-        """Try the direct path, then scan one level of subfolders as fallback."""
-        candidate = self.data_root / folder_name / rel_path
-        if candidate.exists():
-            return candidate
-        # Fallback: maybe the zip added an extra wrapper folder
-        try:
-            for sub in self.data_root.iterdir():
-                if sub.is_dir():
-                    alt = sub / folder_name / rel_path
-                    if alt.exists():
-                        return alt
-        except Exception:
-            pass
-        return candidate  # return original (will fail exists() check, triggers None)
-
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        label = self.label2id[row["emotion_final"]]
 
-        # Label
-        label_str = row["emotion_final"]
-        label = self.label2id[label_str]
-
-        # Path
-        folder_name = str(row["folder"]).strip()
+        folder   = str(row["folder"]).strip()
         rel_path = str(row["audio_relpath"]).replace("\\", "/").lstrip("/")
-        audio_path = self._resolve_path(folder_name, rel_path)
+        path     = resolve_audio_path(self.data_root, folder, rel_path)
 
-        # Load
         try:
-            if not audio_path.exists():
+            if not path.exists():
                 return None
-
-            # Load and resample to 16 kHz
-            speech, _ = librosa.load(audio_path, sr=self.sampling_rate, mono=True)
-
-            # Truncate to max length
-            if len(speech) > self.max_samples:
-                speech = speech[: self.max_samples]
-
-            # Normalize to zero mean, unit variance
-            # This is what emotion2vec expects as its raw input
-            if speech.std() > 1e-6:
-                speech = (speech - speech.mean()) / speech.std()
-            else:
-                speech = speech - speech.mean()
-
-            waveform = torch.tensor(speech, dtype=torch.float32)
-
+            audio, _ = librosa.load(path, sr=self.sampling_rate, mono=True)
+            if len(audio) > self.max_samples:
+                audio = audio[: self.max_samples]
             return {
-                "input_values": waveform,
-                "labels": torch.tensor(label, dtype=torch.long),
+                "audio": audio.astype(np.float32),   # raw numpy waveform
+                "label": label,
+                "path": str(path),
             }
         except Exception:
             return None
+
+
+# ---------------------------------------------------------------------------
+# 2. Embedding dataset  (MLP training)
+# ---------------------------------------------------------------------------
+class EmbeddingDataset(Dataset):
+    def __init__(self, embeddings: np.ndarray, labels: np.ndarray):
+        self.embeddings = torch.tensor(embeddings, dtype=torch.float32)
+        self.labels     = torch.tensor(labels,     dtype=torch.long)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return self.embeddings[idx], self.labels[idx]
+
+
+# ---------------------------------------------------------------------------
+# Collate for AudioEmotionDataset (used only during extraction)
+# ---------------------------------------------------------------------------
+def collate_audio_fn(batch):
+    valid = [b for b in batch if b is not None]
+    if not valid:
+        return None
+    return valid   # list of dicts — processed one-by-one in extraction loop
