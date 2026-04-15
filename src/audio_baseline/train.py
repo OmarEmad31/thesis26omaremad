@@ -25,11 +25,11 @@ from tqdm import tqdm
 
 from transformers import set_seed, AutoModel, AutoFeatureExtractor
 from transformers import logging as hf_log
-from sklearn.utils.class_weight import compute_class_weight
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+import time
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
 from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
 from sklearn.model_selection import GridSearchCV, cross_val_predict
 from sklearn.metrics import accuracy_score, f1_score, classification_report
@@ -244,26 +244,33 @@ def run_sklearn(Xtr, ytr, Xva, yva, Xte, yte, id2label):
 
     res, probs, oof = {}, {}, {}
     
-    logger.info("   [SVM] fitting...")
+    logger.info("   [SVM] fitting (this takes ~15 seconds)...")
+    t0 = time.time()
     svm = SVC(kernel="rbf", C=10, gamma="scale", probability=True, class_weight="balanced", random_state=42)
     svm.fit(Xtv, ytv)
     probs["svm"] = svm.predict_proba(Xte)
     oof["svm"]   = cross_val_predict(SVC(C=10, probability=True, class_weight="balanced"), Xtv, ytv, cv=5, method="predict_proba")
     res["SVM_test_f1"] = f1_score(yte, svm.predict(Xte), average="macro")
+    logger.info(f"   ✅ SVM finished in {time.time()-t0:.1f}s")
 
-    logger.info("   [GBM] fitting...")
-    gbm = GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=42)
+    logger.info("   [GBM] fitting with HistGradientBoosting (super fast)...")
+    t0 = time.time()
+    # GradientBoosting is extremely slow on dense 2560-dim vectors. HistGBM is 100x faster.
+    gbm = HistGradientBoostingClassifier(max_iter=100, max_depth=4, random_state=42)
     gbm.fit(Xtv, ytv)
     probs["gbm"] = gbm.predict_proba(Xte)
-    oof["gbm"]   = cross_val_predict(GradientBoostingClassifier(n_estimators=100, max_depth=4), Xtv, ytv, cv=5, method="predict_proba")
+    oof["gbm"]   = cross_val_predict(HistGradientBoostingClassifier(max_iter=100, max_depth=4), Xtv, ytv, cv=5, method="predict_proba")
     res["GBM_test_f1"] = f1_score(yte, gbm.predict(Xte), average="macro")
+    logger.info(f"   ✅ GBM finished in {time.time()-t0:.1f}s")
     
     logger.info("   [RF] fitting...")
+    t0 = time.time()
     rf = RandomForestClassifier(n_estimators=200, class_weight="balanced", n_jobs=-1, random_state=42)
     rf.fit(Xtv, ytv)
     probs["rf"] = rf.predict_proba(Xte)
-    oof["rf"]   = cross_val_predict(RandomForestClassifier(n_estimators=200, class_weight="balanced"), Xtv, ytv, cv=5, method="predict_proba")
+    oof["rf"]   = cross_val_predict(RandomForestClassifier(n_estimators=200, class_weight="balanced", n_jobs=-1), Xtv, ytv, cv=5, method="predict_proba")
     res["RF_test_f1"] = f1_score(yte, rf.predict(Xte), average="macro")
+    logger.info(f"   ✅ RF finished in {time.time()-t0:.1f}s")
 
     return res, probs, oof, scaler
 
