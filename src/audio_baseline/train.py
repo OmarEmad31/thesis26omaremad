@@ -98,23 +98,30 @@ class AudioSCLTrainer:
             return -mean_log_prob_pos.mean()
         return torch.tensor(0.0, device=self.device)
 
-    def train_epoch(self):
+    def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
-        for batch in tqdm(self.train_loader, desc="  Training", leave=False):
+        total_ce = 0
+        total_scl = 0
+        correct = 0
+        total = 0
+        
+        # Deep Fine-Tuning: Unfreeze at scheduled epoch
+        if epoch == config.UNFREEZE_EPOCH:
+            self.model.set_backbone_trainable(True)
+            # Re-build optimizer to include newly unfrozen backbone params
+            params = get_audio_optimizer_params(self.model, config.LEARNING_RATE, 0.95)
+            self.optimizer = torch.optim.AdamW(params)
+            logger.info("🔥 [DEEP FINE-TUNING] Backbone Unfrozen. Optimizer Reset.")
+
+        pbar = tqdm(self.train_loader, desc=f"  Epoch {epoch} [Training]", leave=False)
+        for batch in pbar:
             inputs = batch["input_values"].to(self.device)
             mask = batch["attention_mask"].to(self.device)
             labels = batch["labels"].to(self.device)
             
-            # Forward
-            # Note: We need a model implementation that returns both logits AND embeddings for SCL
-            # I will update model.py to return (logits, pooled_output)
             self.optimizer.zero_grad()
             
-            # Since our model.py currently only returns logits, I will adjust it 
-            # to return embeddings too if needed, or extract them here if we can.
-            # For now, let's assume model() returns logits for the basic Baseline.
-            logits = self.model(inputs, attention_mask=mask)
             # Forward: Get Logits (for CE) and Embeddings (for SCL)
             logits, embeddings = self.model(inputs, attention_mask=mask)
             
