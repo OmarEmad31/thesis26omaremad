@@ -48,9 +48,14 @@ class Emotion2VecBaseline(nn.Module):
         Returns: logits, embeddings
         """
         # 1. Native Batch Pass
-        # We call .model directly to stay in the original torch graph
-        # and support proper batch processing (8 items at once).
-        outputs = self.backbone.model(input_values)
+        # We call .model directly to stay in the original torch graph.
+        # 🛡️ BYPASS: We pass mask=False and features_only=True to specifically 
+        # avoid the broken 'compute_mask_indices' logic in this version of FunASR.
+        try:
+            outputs = self.backbone.model(input_values, mask=False, features_only=True)
+        except TypeError:
+            # Fallback for versions that don't accept these specific kwargs
+            outputs = self.backbone.model(input_values)
         
         # 2. Extract Hidden States
         # emotion2vec+ (based on Wav2Vec2) usually returns a tuple/dict
