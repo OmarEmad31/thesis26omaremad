@@ -23,7 +23,8 @@ if IS_COLAB:
 
     SPLIT_CSV_DIR   = Path("/content/data/processed/splits/audio_eligible")
     CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_v6")
-    EMBEDDING_CACHE = Path("/content/audio_emb_v6.npz")   # new name — never loads old cache
+    # Save cache directly to Drive so it survives Colab disconnections!
+    EMBEDDING_CACHE = Path("/content/drive/MyDrive/Thesis Project/audio_emb_v6.npz")
 else:
     DATA_ROOT       = Path("dataset/Final Modalink Dataset MERGED")
     SPLIT_CSV_DIR   = Path("data/processed/splits/audio_eligible")
