@@ -359,6 +359,12 @@ def main():
     test_ds.df = test_df
     test_loader = DataLoader(test_ds, batch_size=config.BATCH_SIZE, shuffle=False, collate_fn=collate_audio_fn)
     
+    # Switch to Best Model for Final Test
+    best_path = config.CHECKPOINT_DIR / "best_power_model.pt"
+    if best_path.exists():
+        logger.info(f"🔄 Loading Best Model (Peak Performance) for Final Report...")
+        model.load_state_dict(torch.load(best_path))
+    
     test_m = trainer.evaluate(test_loader)
     
     final_report = [
