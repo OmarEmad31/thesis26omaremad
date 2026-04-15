@@ -50,18 +50,19 @@ MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 # ---------------------------------------------------------------------------
 # MLP CLASSIFIER TRAINING  (after embeddings are pre-computed)
 # ---------------------------------------------------------------------------
-EMBEDDING_DIM  = 768      # emotion2vec+ transformer hidden size
+EMBEDDING_DIM  = None     # Detected automatically from first extracted sample
 BATCH_SIZE     = 64       # Large batch — tensors are tiny (no audio in memory)
 EPOCHS         = 100      # Fast epochs since backbone is frozen
 LEARNING_RATE  = 5e-4
 WEIGHT_DECAY   = 1e-4
+LOG_EVERY      = 10       # Log every N epochs to keep output clean
 
 # ---------------------------------------------------------------------------
 # LOSS
 # ---------------------------------------------------------------------------
 USE_SCL    = True
-SCL_WEIGHT = 0.5          # Equal emphasis on CE and SCL
-SCL_TEMP   = 0.07         # Tight clusters → sharper discrimination
+SCL_WEIGHT = 0.1          # Low weight — CE dominates, SCL regularises
+SCL_TEMP   = 0.3          # Higher temp = softer/more stable SCL gradients
 
 # ---------------------------------------------------------------------------
 # MISC

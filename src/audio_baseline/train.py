@@ -84,15 +84,17 @@ def compute_scl_loss(embeddings: torch.Tensor, labels: torch.Tensor,
 # Embedding extraction
 # ---------------------------------------------------------------------------
 def extract_embeddings(backbone, df: pd.DataFrame, label2id: dict,
-                       split_name: str) -> tuple[np.ndarray, np.ndarray]:
+                       split_name: str, first_call: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """
     Run emotion2vec generate() on every audio file in df.
-    Returns (embeddings [N, 768], labels [N]).
+    Returns (embeddings [N, D], labels [N]) where D is the actual feature dim.
     """
     import librosa
+    import os
 
     embeddings, labels_out = [], []
     skipped = 0
+    detected_dim = None
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc=f"  Extracting {split_name}"):
         folder   = str(row["folder"]).strip()
@@ -121,9 +123,7 @@ def extract_embeddings(backbone, df: pd.DataFrame, label2id: dict,
             if len(audio) > config.MAX_AUDIO_SAMPLES:
                 audio = audio[: config.MAX_AUDIO_SAMPLES]
 
-            # generate() — uses the FULL emotion2vec pipeline (CNN + Transformer)
-            # Suppress FunASR's per-sample verbose output (rtf, batch_size lines)
-            import os, io
+            # Suppress FunASR verbose per-sample output
             with open(os.devnull, 'w') as devnull:
                 old_stdout, old_stderr = sys.stdout, sys.stderr
                 sys.stdout = sys.stderr = devnull
@@ -141,18 +141,20 @@ def extract_embeddings(backbone, df: pd.DataFrame, label2id: dict,
                 continue
 
             feat = np.array(res[0]["feats"])
-            # Handle both [768] and [T, 768] shapes
             if feat.ndim == 2:
                 feat = feat.mean(axis=0)
             feat = feat.flatten()
 
-            if feat.shape[0] != 768:
-                # Unexpected dim — pad/trim to 768
-                if feat.shape[0] > 768:
-                    feat = feat[:768]
-                else:
-                    feat = np.pad(feat, (0, 768 - feat.shape[0]))
+            # DIAGNOSTIC: log real shape on first sample
+            if first_call and detected_dim is None:
+                detected_dim = feat.shape[0]
+                logger.info(f"    🔬 Embedding diagnostic: shape={feat.shape}, mean={feat.mean():.4f}, std={feat.std():.4f}")
+                if feat.std() < 0.001:
+                    logger.warning("    ⚠️  Near-zero variance — embeddings may be degenerate!")
+            if detected_dim is None:
+                detected_dim = feat.shape[0]
 
+            # Use the REAL dimension — no padding/trimming to 768
             embeddings.append(feat.astype(np.float32))
             labels_out.append(label2id[row["emotion_final"]])
 
@@ -160,7 +162,7 @@ def extract_embeddings(backbone, df: pd.DataFrame, label2id: dict,
             skipped += 1
             continue
 
-    logger.info(f"    {split_name}: {len(embeddings)} extracted, {skipped} skipped")
+    logger.info(f"    {split_name}: {len(embeddings)} extracted, {skipped} skipped, dim={detected_dim}")
     return np.array(embeddings, dtype=np.float32), np.array(labels_out, dtype=np.int64)
 
 
@@ -273,7 +275,7 @@ def main():
             p.requires_grad = False
 
         logger.info("🔬 Extracting utterance embeddings (runs once, then cached)...")
-        train_emb, train_lbl = extract_embeddings(backbone, train_df, label2id, "train")
+        train_emb, train_lbl = extract_embeddings(backbone, train_df, label2id, "train", first_call=True)
         val_emb,   val_lbl   = extract_embeddings(backbone, val_df,   label2id, "val")
         test_emb,  test_lbl  = extract_embeddings(backbone, test_df,  label2id, "test")
 
@@ -299,12 +301,13 @@ def main():
     sample_weights = 1.0 / class_counts[train_lbl]
     sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
 
-    train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, sampler=sampler,   num_workers=2)
-    val_loader   = DataLoader(val_ds,   batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2)
-    test_loader  = DataLoader(test_ds,  batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, sampler=sampler,   num_workers=0)
+    val_loader   = DataLoader(val_ds,   batch_size=config.BATCH_SIZE, shuffle=False, num_workers=0)
+    test_loader  = DataLoader(test_ds,  batch_size=config.BATCH_SIZE, shuffle=False, num_workers=0)
 
-    # 4. Model
-    emb_dim = train_emb.shape[1]   # usually 768
+    # 4. Model — use ACTUAL embedding dim, not hardcoded 768
+    emb_dim = train_emb.shape[1]
+    logger.info(f"🔬 Actual embedding dim from backbone: {emb_dim}")
     model   = EmotionMLP(input_dim=emb_dim, num_labels=len(label2id)).to(device)
     logger.info(f"🏗️  EmotionMLP  input_dim={emb_dim}  num_labels={len(label2id)}")
 
@@ -331,14 +334,15 @@ def main():
         val_m   = evaluate(model, val_loader, criterion, device)
         scheduler.step()
 
-        logger.info(
-            f"Ep {epoch:03d} | "
-            f"Loss {train_m['loss']:.4f} (CE {train_m['ce_loss']:.4f} SCL {train_m['scl_loss']:.4f}) | "
-            f"Train {train_m['accuracy']:.4f} | "
-            f"Val {val_m['accuracy']:.4f} | "
-            f"F1-Mac {val_m['f1_macro']:.4f} | "
-            f"F1-Wt {val_m['f1_weighted']:.4f}"
-        )
+        if (epoch + 1) % config.LOG_EVERY == 0 or epoch == 0 or val_m["f1_macro"] > best_f1:
+            logger.info(
+                f"Ep {epoch:03d} | "
+                f"Loss {train_m['loss']:.4f} (CE {train_m['ce_loss']:.4f} SCL {train_m['scl_loss']:.4f}) | "
+                f"Train {train_m['accuracy']:.4f} | "
+                f"Val {val_m['accuracy']:.4f} | "
+                f"F1-Mac {val_m['f1_macro']:.4f} | "
+                f"F1-Wt {val_m['f1_weighted']:.4f}"
+            )
 
         if val_m["f1_macro"] > best_f1:
             best_f1 = val_m["f1_macro"]
