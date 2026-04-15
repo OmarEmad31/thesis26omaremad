@@ -236,11 +236,24 @@ class AudioMLP(nn.Module):
         return self.eval_linear(F.normalize(feat)) * self.arcface.s # Scale appropriately
 
 
+from sklearn.decomposition import PCA
+
 def run_sklearn(Xtr, ytr, Xva, yva, Xte, yte, id2label):
-    scaler = StandardScaler()
-    Xtr, Xva, Xte = scaler.fit_transform(Xtr), scaler.transform(Xva), scaler.transform(Xte)
-    Xtv = scaler.transform(np.concatenate([scaler.inverse_transform(Xtr), scaler.inverse_transform(Xva)]))
+    # Combine Train and Val for SKLearn Pipeline
+    Xtv_raw = np.concatenate([Xtr, Xva])
     ytv = np.concatenate([ytr, yva])
+
+    scaler = StandardScaler()
+    Xtv = scaler.fit_transform(Xtv_raw)
+    Xte = scaler.transform(Xte)
+    
+    # 2560 dimensions is completely crippling for CPU Tree models (GBM/RF). 
+    # Use PCA to retain 95% variance (usually brings dimensions down to ~150-200)
+    logger.info("   [PCA] Reducing 2560 sparse dimensions...")
+    pca = PCA(n_components=0.95, random_state=42)
+    Xtv = pca.fit_transform(Xtv)
+    Xte = pca.transform(Xte)
+    logger.info(f"   ✅ PCA compressed to {Xtv.shape[1]} dimensions! (Supercharged speed)")
 
     res, probs, oof = {}, {}, {}
     
