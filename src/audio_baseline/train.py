@@ -131,7 +131,7 @@ def extract_single_model(model_id, df, label2id, augment_mlp, device):
 
     def process_split(split_df, is_train):
         do_aug = is_train and augment_mlp
-        svm_embs, mlp_embs, labels = [], [], []
+        svm_embs, mlp_embs, svm_labels, mlp_labels = [], [], [], []
         
         for _, row in tqdm(split_df.iterrows(), total=len(split_df), desc=f"    {model_id[-10:]} ({'aug' if do_aug else 'cln'})"):
             fldr = str(row["folder"]).strip()
@@ -157,38 +157,38 @@ def extract_single_model(model_id, df, label2id, augment_mlp, device):
                         if not res: continue
                         feat = np.array(res[0]["feats"], dtype=np.float32)
                         
-                        # SVM gets unaugmented mean. MLP gets all versions concat(stats).
-                        mlp_e = aggregate_frames(feat, "stats") # 3 * 768 = 2304
-                        svm_e = aggregate_frames(feat, "mean")  # 768
+                        mlp_e = aggregate_frames(feat, "stats")
+                        svm_e = aggregate_frames(feat, "mean")
                         
                     elif is_w2v2:
                         inp = processor(wav, sampling_rate=16000, return_tensors="pt").input_values.to(device)
                         with torch.no_grad(): out = model(inp).last_hidden_state[0].cpu().numpy()
-                        mlp_e = aggregate_frames(out, "stats") # 3 * 1024 = 3072
-                        svm_e = aggregate_frames(out, "mean")  # 1024
+                        mlp_e = aggregate_frames(out, "stats")
+                        svm_e = aggregate_frames(out, "mean")
                         
                     elif is_ast:
                         inp = processor(wav, sampling_rate=16000, return_tensors="pt").input_values.to(device)
                         with torch.no_grad(): out = model(inp).last_hidden_state[0].cpu().numpy()
-                        mlp_e = aggregate_frames(out, "cls")   # 768 (AST uses CLS token)
-                        svm_e = aggregate_frames(out, "cls")   # 768
+                        mlp_e = aggregate_frames(out, "cls")
+                        svm_e = aggregate_frames(out, "cls")
 
                     mlp_embs.append(mlp_e)
-                    if name == "orig":  # SVM only gets original clean data!
+                    mlp_labels.append(lbl)
+                    if name == "orig":
                         svm_embs.append(svm_e)
-                        labels.append(lbl)  # Only count labels based on original file iteration
+                        svm_labels.append(lbl)
                         
                 except Exception as e:
                     continue
 
-        return np.array(svm_embs), np.array(mlp_embs), np.array(labels)
+        return np.array(svm_embs), np.array(mlp_embs), np.array(svm_labels), np.array(mlp_labels)
 
-    tr_svm, tr_mlp, tr_lbl = process_split(df["train"], is_train=True)
-    va_svm, va_mlp, va_lbl = process_split(df["val"],   is_train=False)
-    te_svm, te_mlp, te_lbl = process_split(df["test"],  is_train=False)
+    tr_svm, tr_mlp, tr_s_lbl, tr_m_lbl = process_split(df["train"], is_train=True)
+    va_svm, va_mlp, va_s_lbl, va_m_lbl = process_split(df["val"],   is_train=False)
+    te_svm, te_mlp, te_s_lbl, te_m_lbl = process_split(df["test"],  is_train=False)
 
     del model; import gc; gc.collect(); torch.cuda.empty_cache()
-    return (tr_svm, tr_mlp, tr_lbl), (va_svm, va_mlp, va_lbl), (te_svm, te_mlp, te_lbl)
+    return (tr_svm, tr_mlp, tr_s_lbl, tr_m_lbl), (va_svm, va_mlp, va_s_lbl, va_m_lbl), (te_svm, te_mlp, te_s_lbl, te_m_lbl)
 
 
 # ===========================================================================
@@ -339,6 +339,14 @@ def main():
         S_tr, M_tr, L_tr = d["S_tr"], d["M_tr"], d["L_tr"]
         S_va, M_va, L_va = d["S_va"], d["M_va"], d["L_va"]
         S_te, M_te, L_te = d["S_te"], d["M_te"], d["L_te"]
+        
+        # Backwards compatibility: if ML_tr isn't stored, M_tr must be exactly ratio-sized to L_tr
+        if "ML_tr" in d:
+            ML_tr = d["ML_tr"]
+        else:
+            ratio = len(M_tr) // len(L_tr)
+            ML_tr = np.repeat(L_tr, ratio)
+            
     else:
         logger.info("🧠 Commencing Multi-Backbone Sequential Extraction. This takes time but avoids OOM.")
         models = [config.MODEL_NAME, config.W2V2_NAME, config.AST_NAME]
@@ -348,7 +356,7 @@ def main():
         
         for mid in models:
             tr, va, te = extract_single_model(mid, df_dict, label2id, config.AUGMENT_MLP_TRAIN, device)
-            svm_parts_tr.append(tr[0]); mlp_parts_tr.append(tr[1]); L_tr = tr[2]
+            svm_parts_tr.append(tr[0]); mlp_parts_tr.append(tr[1]); L_tr = tr[2]; ML_tr = tr[3]
             svm_parts_va.append(va[0]); mlp_parts_va.append(va[1]); L_va = va[2]
             svm_parts_te.append(te[0]); mlp_parts_te.append(te[1]); L_te = te[2]
             
@@ -357,7 +365,7 @@ def main():
         S_te, M_te = np.concatenate(svm_parts_te, axis=1), np.concatenate(mlp_parts_te, axis=1)
         
         logger.info(f"   💾 Fusion complete! Saving multi-backbone cache ({M_tr.shape[1]}-dim)...")
-        np.savez_compressed(cache_file, S_tr=S_tr, M_tr=M_tr, L_tr=L_tr, 
+        np.savez_compressed(cache_file, S_tr=S_tr, M_tr=M_tr, L_tr=L_tr, ML_tr=ML_tr,
                             S_va=S_va, M_va=M_va, L_va=L_va, S_te=S_te, M_te=M_te, L_te=L_te)
 
     logger.info(f"   SVM Features (3 pooled backbones) : Dim = {S_tr.shape[1]}")
@@ -366,14 +374,12 @@ def main():
     if config.USE_SMOTE:
         tgt = max(collections.Counter(L_tr.tolist()).values())
         logger.info(f"🧬 Phase 5 SMOTE: Target {tgt}/class")
-        M_tr, L_tr_mlp = simple_smote(M_tr, L_tr, target=tgt) # Expand MLP Data Only
-    else:
-        L_tr_mlp = L_tr
+        M_tr, ML_tr = simple_smote(M_tr, ML_tr, target=tgt) # Expand MLP Data Only
         
     sk_res, probs_te, probs_oof, scaler = run_sklearn(S_tr, L_tr, S_va, L_va, S_te, L_te, id2label)
     
     logger.info("   [MLP] training with ARCFACE loss...")
-    final_mlp, _ = train_mlp(M_tr, L_tr_mlp, M_va, L_va, len(id2label), device)
+    final_mlp, _ = train_mlp(M_tr, ML_tr, M_va, L_va, len(id2label), device)
     
     # MLP outputs
     mlp_probs_te = get_mlp_probs(final_mlp, M_te, device)
