@@ -122,12 +122,19 @@ def extract_embeddings(backbone, df: pd.DataFrame, label2id: dict,
                 audio = audio[: config.MAX_AUDIO_SAMPLES]
 
             # generate() — uses the FULL emotion2vec pipeline (CNN + Transformer)
-            # This gives us the proper emotion-aware utterance embeddings
-            res = backbone.generate(
-                input=audio,
-                granularity="utterance",
-                extract_embedding=True,
-            )
+            # Suppress FunASR's per-sample verbose output (rtf, batch_size lines)
+            import os, io
+            with open(os.devnull, 'w') as devnull:
+                old_stdout, old_stderr = sys.stdout, sys.stderr
+                sys.stdout = sys.stderr = devnull
+                try:
+                    res = backbone.generate(
+                        input=audio,
+                        granularity="utterance",
+                        extract_embedding=True,
+                    )
+                finally:
+                    sys.stdout, sys.stderr = old_stdout, old_stderr
 
             if not res or "feats" not in res[0]:
                 skipped += 1
