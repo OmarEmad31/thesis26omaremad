@@ -59,12 +59,12 @@ SAMPLING_RATE     = 16000
 MAX_DURATION_SEC  = 10   # Max seconds of audio per sample
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
-BATCH_SIZE        = 8    # Wav2Vec2 is large, requires small batch size
-GRAD_ACCUM_STEPS  = 4    # 8 * 4 = 32 effective batch size
-NUM_EPOCHS        = 5
-LEARNING_RATE     = 2e-5
-WEIGHT_DECAY      = 0.01
-WARMUP_RATIO      = 0.1
+BATCH_SIZE        = 32    # Since model is frozen, we can use a large batch size!
+GRAD_ACCUM_STEPS  = 1
+NUM_EPOCHS        = 40
+LEARNING_RATE     = 1e-3  # High learning rate because we are only training the classification head
+WEIGHT_DECAY      = 0.05
+WARMUP_RATIO      = 0.05
 
 # SCL Settings
 USE_SCL           = True

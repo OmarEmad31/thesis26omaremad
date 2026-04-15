@@ -214,8 +214,16 @@ def main() -> None:
             ignore_mismatched_sizes=True # Ignore pre-trained heads that have different num classes
         )
         
-        # Freeze the feature extractor backbone, leaving only the Transformer layers and Classifier
-        model.freeze_feature_encoder()
+        # 🧊 FREEZE THE ENTIRE BACKBONE
+        # The audeering model is already brilliantly fine-tuned for emotion. 
+        # If we open up the transformer to 5 or 40 epochs on just 640 Arabic samples, it catastrophically forgets!
+        # We freeze everything so only the classification head learns (exactly like the SVM did, but purely in PyTorch).
+        for param in model.wav2vec2.parameters():
+            param.requires_grad = False
+        
+        # Just to be strictly safe
+        model.classifier.weight.requires_grad = True
+        model.classifier.bias.requires_grad = True
 
         training_args = TrainingArguments(
             output_dir=str(fold_out_dir),
