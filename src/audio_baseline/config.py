@@ -4,7 +4,28 @@ from pathlib import Path
 IS_COLAB = "COLAB_GPU" in os.environ or os.path.exists("/content")
 
 if IS_COLAB:
-    search_roots = [Path("/content/Thesis Project"), Path("/content")]
+    # Search for the splits CSV directory
+    split_search_paths = [
+        Path("/content/Thesis Project/data/processed/splits/audio_eligible"),
+        Path("/content/data/processed/splits/audio_eligible"),
+        Path("/content/drive/MyDrive/Thesis Project/data/processed/splits/audio_eligible")
+    ]
+    SPLIT_CSV_DIR = None
+    for p in split_search_paths:
+        if (p / "train.csv").exists():
+            SPLIT_CSV_DIR = p
+            break
+    if not SPLIT_CSV_DIR:
+        SPLIT_CSV_DIR = Path("/content/drive/MyDrive/Thesis Project/data/processed/splits/audio_eligible")
+    print(f"✅ SPLIT_CSV_DIR: {SPLIT_CSV_DIR}")
+
+    # Search for the audio dataset root
+    search_roots = [
+        Path("/content/drive/MyDrive/Thesis Project/dataset"),
+        Path("/content/drive/MyDrive/Thesis Project"),
+        Path("/content/Thesis Project"),
+        Path("/content")
+    ]
     DATA_ROOT = None
     for root in search_roots:
         if root.exists():
@@ -18,10 +39,9 @@ if IS_COLAB:
                         DATA_ROOT = p.parent; break
                 if DATA_ROOT: break
     if not DATA_ROOT:
-        DATA_ROOT = Path("/content/Thesis Project")
+        DATA_ROOT = Path("/content/drive/MyDrive/Thesis Project")
     print(f"✅ DATA_ROOT: {DATA_ROOT}")
 
-    SPLIT_CSV_DIR   = Path("/content/data/processed/splits/audio_eligible")
     CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_v6")
     # Save cache directly to Drive so it survives Colab disconnections!
     EMBEDDING_CACHE = Path("/content/drive/MyDrive/Thesis Project/audio_emb_v6.npz")
