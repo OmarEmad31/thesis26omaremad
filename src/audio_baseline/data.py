@@ -8,6 +8,34 @@ import pandas as pd
 from pathlib import Path
 from transformers import Wav2Vec2FeatureExtractor
 
+def collate_audio_fn(batch):
+    """
+    Synchronized Collate: Ensures labels and inputs are matched perfectly.
+    If a sample failed to load (is None), it is dropped from both lists.
+    """
+    # Filter out None samples (failed loads) to keep batch size in sync
+    valid_batch = [b for b in batch if b is not None]
+    
+    if len(valid_batch) == 0:
+        return None
+        
+    input_values = [b["input_values"] for b in valid_batch]
+    labels = [b["labels"] for b in valid_batch]
+    
+    # Pad waveforms to the longest in the batch
+    inputs_padded = torch.nn.utils.rnn.pad_sequence(
+        input_values, batch_first=True, padding_value=0.0
+    )
+    
+    # Create attention mask
+    attention_mask = (inputs_padded != 0).long()
+    
+    return {
+        "input_values": inputs_padded,
+        "attention_mask": attention_mask,
+        "labels": torch.stack(labels)
+    }
+
 class AudioEmotionDataset(Dataset):
     def __init__(
         self, 
@@ -21,7 +49,7 @@ class AudioEmotionDataset(Dataset):
         if csv_path is not None:
             self.df = pd.read_csv(csv_path)
         else:
-            self.df = None # To be set by fold logic
+            self.df = None
         self.data_root = data_root
         self.feature_extractor = feature_extractor
         self.label2id = label2id
@@ -39,65 +67,45 @@ class AudioEmotionDataset(Dataset):
         label = self.label2id[label_str]
         
         # 2. Optimized Path Reconstruction
-        # Ensure we are using strings and healthy slashes
         folder_name = str(row["folder"]).strip()
         rel_path = str(row["audio_relpath"]).replace("\\", "/").lstrip("/")
         
         # The true path on SSD
         audio_path = self.data_root / folder_name / rel_path
         
-        # 3. Load audio with librosa
+        # 3. 🛡️ SMART PATH FALLBACK:
+        # Avoids skipping files if unzipping created a subfolder
+        if not audio_path.exists():
+            try:
+                subfolders = [d for d in self.data_root.iterdir() if d.is_dir()]
+                for sub in subfolders:
+                    alt_path = sub / folder_name / rel_path
+                    if alt_path.exists():
+                        audio_path = alt_path
+                        break
+            except Exception:
+                pass
+
+        # 4. Load audio with librosa
         try:
             if not audio_path.exists():
-                # Try a fallback in case there's an extra 'dataset' folder in the way
-                alt_path = self.data_root.parent / folder_name / rel_path
-                if alt_path.exists():
-                    audio_path = alt_path
+                return None # Return None for collate_fn to handle
             
             speech, sr = librosa.load(audio_path, sr=self.sampling_rate)
-        except Exception as e:
-            # Reverted: Show skipping message as per user request
-            print(f"⚠️ Skipping {folder_name}/{rel_path} (File not found)")
-            speech = np.zeros(self.max_samples, dtype=np.float32)
-        # 4. Truncate / Pad
-        if len(speech) > self.max_samples:
-            speech = speech[:self.max_samples]
-        
-        # 5. Extract features
-        # Returns a dict with 'input_values' (and possibly 'attention_mask')
-        inputs = self.feature_extractor(
-            speech, 
-            sampling_rate=self.sampling_rate, 
-            return_tensors="pt",
-            padding=False
-        )
-        
-        # Remove the batch dimension added by the extractor
-        input_values = inputs.input_values.squeeze(0)
-        
-        return {
-            "input_values": input_values,
-            "labels": torch.tensor(label, dtype=torch.long)
-        }
-
-def collate_audio_fn(batch):
-    """Pad a batch of waveforms to the same length."""
-    input_values = [item["input_values"] for item in batch]
-    labels = [item["labels"] for item in batch]
-    
-    # Pad to the longest in the batch
-    # (batch, longest_seq)
-    inputs_padded = torch.nn.utils.rnn.pad_sequence(
-        input_values, batch_first=True, padding_value=0.0
-    )
-    
-    # Create attention mask (1 for real, 0 for padding)
-    # Most Wav2Vec2/WavLM models don't strictly need masks for short clips, 
-    # but it's safer to have.
-    attention_mask = (inputs_padded != 0).long()
-    
-    return {
-        "input_values": inputs_padded,
-        "attention_mask": attention_mask,
-        "labels": torch.stack(labels)
-    }
+            
+            if len(speech) > self.max_samples:
+                speech = speech[:self.max_samples]
+            
+            inputs = self.feature_extractor(
+                speech, 
+                sampling_rate=self.sampling_rate, 
+                return_tensors="pt",
+                padding=False
+            )
+            
+            return {
+                "input_values": inputs.input_values.squeeze(0),
+                "labels": torch.tensor(label, dtype=torch.long)
+            }
+        except Exception:
+            return None

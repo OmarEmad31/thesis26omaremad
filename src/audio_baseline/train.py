@@ -41,11 +41,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from tqdm import tqdm
-from transformers import (
-    Wav2Vec2FeatureExtractor,
-    get_linear_schedule_with_warmup,
-    set_seed
-)
+from transformers import set_seed
+from transformers.optimization import get_linear_schedule_with_warmup
 from transformers import logging as transformers_logging
 transformers_logging.set_verbosity_error()
 
@@ -106,6 +103,10 @@ class AudioSCLTrainer:
         correct = 0
         total = 0
         
+        # 📈 Progress Tracking
+        processed_files = 0
+        skipped_files = 0
+        
         # Deep Fine-Tuning: Unfreeze at scheduled epoch
         if epoch == config.UNFREEZE_EPOCH:
             self.model.set_backbone_trainable(True)
@@ -116,19 +117,28 @@ class AudioSCLTrainer:
 
         pbar = tqdm(self.train_loader, desc=f"  Epoch {epoch} [Training]", leave=False)
         for batch in pbar:
+            if batch is None:
+                skipped_files += config.BATCH_SIZE # Approximation
+                continue
+                
             inputs = batch["input_values"].to(self.device)
             mask = batch["attention_mask"].to(self.device)
             labels = batch["labels"].to(self.device)
             
+            # Count success/skips based on batch items
+            current_batch_size = labels.size(0)
+            processed_files += current_batch_size
+            skipped_files += (config.BATCH_SIZE - current_batch_size)
+            
             self.optimizer.zero_grad()
             
-            # Forward: Get Logits (for CE) and Embeddings (for SCL)
+            # Forward: [batch, num_classes], [batch, 768]
             logits, embeddings = self.model(inputs, attention_mask=mask)
             
             # 1. Cross Entropy Loss
             ce_loss = self.criterion(logits, labels)
             
-            # 2. SCL Loss (The "Clustering" math)
+            # 2. SCL Loss
             if config.USE_SCL:
                 scl_loss = self.compute_scl_loss(embeddings, labels)
                 loss = ce_loss + (config.SCL_WEIGHT * scl_loss)
@@ -148,13 +158,18 @@ class AudioSCLTrainer:
             correct += (preds == labels).sum().item()
             total += labels.size(0)
             
-            pbar.set_postfix({"loss": f"{loss.item():.3f}", "acc": f"{correct/total:.3f}"})
+            pbar.set_postfix({
+                "loss": f"{loss.item():.3f}", 
+                "acc": f"{correct/total:.2f}"
+            })
             
         return {
-            "loss": total_loss / len(self.train_loader),
-            "ce_loss": total_ce / len(self.train_loader),
-            "scl_loss": total_scl / len(self.train_loader),
-            "accuracy": correct / total
+            "loss": total_loss / len(self.train_loader) if total > 0 else 0,
+            "ce_loss": total_ce / len(self.train_loader) if total > 0 else 0,
+            "scl_loss": total_scl / len(self.train_loader) if total > 0 else 0,
+            "accuracy": correct / total if total > 0 else 0,
+            "processed": processed_files,
+            "skipped": skipped_files
         }
 
     def evaluate(self, loader=None):
@@ -283,12 +298,17 @@ def main():
     print(f"\n⚡ STARTING POWER MODE TRAINING ({config.EPOCHS} Epochs)...")
     
     for epoch in range(config.EPOCHS):
-        # TRAIN
+        # Train
         train_m = trainer.train_epoch(epoch)
         
-        # VALIDATE
-        val_m = trainer.evaluate()
+        # Log Summary with File Counters
+        logger.info(f"✨ Epoch {epoch} Training Summary:")
+        logger.info(f"   - Loss: {train_m['loss']:.4f} (CE: {train_m['ce_loss']:.4f}, SCL: {train_m['scl_loss']:.4f})")
+        logger.info(f"   - Accuracy: {train_m['accuracy']:.4f}")
+        logger.info(f"   - 📁 Files: {train_m['processed']} Processed, {train_m['skipped']} Skipped")
         
+        # Valid
+        val_m = trainer.evaluate()
         # LOGGING
         msg = (
             f"Epoch {epoch} | "
