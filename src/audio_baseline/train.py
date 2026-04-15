@@ -293,10 +293,11 @@ def main():
         logger.info(f"   - {'✅' if exists else '❌'} {folder}/{rel_path}")
         if not exists:
             # Check for common zip-folder patterns
-            for sub in config.DATA_ROOT.iterdir():
-                if sub.is_dir() and (sub / folder / rel_path).exists():
-                    logger.info(f"     💡 FOUND IN SUBFOLDER: {sub.name}")
-                    break
+            if config.DATA_ROOT.exists():
+                for sub in config.DATA_ROOT.iterdir():
+                    if sub.is_dir() and (sub / folder / rel_path).exists():
+                        logger.info(f"     💡 FOUND IN SUBFOLDER: {sub.name}")
+                        break
 
     model = Emotion2VecBaseline(config.MODEL_NAME, num_labels=len(label2id))
     

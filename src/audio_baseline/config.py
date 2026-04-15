@@ -7,18 +7,23 @@ IS_COLAB = "COLAB_GPU" in os.environ or os.path.exists("/content")
 
 if IS_COLAB:
     # Check if we unzipped to the local SSD (/content/)
-    if os.path.exists("/content/data") and os.path.exists("/content/Thesis Project"):
-        print("🚀 [POWER MODE] Using LOCAL SSD with FULL DATASET!")
+    if os.path.exists("/content/Thesis Project"):
+        print("🚀 [POWER MODE] Using LOCAL SSD!")
         DRIVE_BASE = Path("/content/Thesis Project")
+        # --- AUTO-CORRECT DATA ROOT ---
+        # Try the deep nested path first, fallback to base if not found
         DATA_ROOT = DRIVE_BASE / "dataset/Final Modalink Dataset MERGED"
-        # SWITCH TO THE FULL ELIGIBLE DATASET (5,700 CLIPS)
+        if not DATA_ROOT.exists():
+            DATA_ROOT = DRIVE_BASE # Fallback to root
+        
         SPLIT_CSV_DIR = Path("/content/data/processed/splits/audio_eligible")
-        # SAVE TO DRIVE FOR SAFETY
         CHECKPOINT_DIR = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_power_mode")
     else:
         print("📁 Using Google Drive (Slow mode). Tip: Unzip your dataset to /content/ for 10x speed.")
         DRIVE_BASE = Path("/content/drive/MyDrive/Thesis Project")
         DATA_ROOT = DRIVE_BASE / "dataset/Final Modalink Dataset MERGED"
+        if not DATA_ROOT.exists():
+            DATA_ROOT = DRIVE_BASE
         SPLIT_CSV_DIR = DRIVE_BASE / "data/processed/splits/audio_eligible"
         CHECKPOINT_DIR = DRIVE_BASE / "checkpoints/audio_power_mode"
 else:
