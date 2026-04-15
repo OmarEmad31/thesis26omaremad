@@ -181,6 +181,8 @@ class AudioSCLTrainer:
         
         with torch.no_grad():
             for batch in loader:
+                if batch is None: continue
+                
                 inputs = batch["input_values"].to(self.device)
                 mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
