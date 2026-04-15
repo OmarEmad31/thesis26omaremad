@@ -239,53 +239,34 @@ class AudioMLP(nn.Module):
 from sklearn.decomposition import PCA
 
 def run_sklearn(Xtr, ytr, Xva, yva, Xte, yte, id2label):
-    # Combine Train and Val for SKLearn Pipeline
-    Xtv_raw = np.concatenate([Xtr, Xva])
-    ytv = np.concatenate([ytr, yva])
-
+    # Scale Data
     scaler = StandardScaler()
-    Xtv = scaler.fit_transform(Xtv_raw)
-    Xte = scaler.transform(Xte)
+    Xtr, Xva, Xte = scaler.fit_transform(Xtr), scaler.transform(Xva), scaler.transform(Xte)
     
-    # 2560 dimensions is completely crippling for CPU Tree models (GBM/RF). 
-    # Use PCA to retain 95% variance (usually brings dimensions down to ~150-200)
-    logger.info("   [PCA] Reducing 2560 sparse dimensions...")
+    # Compress 2560 dims to 95% variance for ultra-fast Tree building
     pca = PCA(n_components=0.95, random_state=42)
-    Xtv = pca.fit_transform(Xtv)
+    Xtr = pca.fit_transform(Xtr)
+    Xva = pca.transform(Xva)
     Xte = pca.transform(Xte)
-    logger.info(f"   ✅ PCA compressed to {Xtv.shape[1]} dimensions! (Supercharged speed)")
 
-    res, probs, oof = {}, {}, {}
+    res, probs_va, probs_te = {}, {}, {}
     
-    logger.info("   [SVM] fitting (this takes ~15 seconds)...")
-    t0 = time.time()
-    svm = SVC(kernel="rbf", C=10, gamma="scale", probability=True, class_weight="balanced", random_state=42)
-    svm.fit(Xtv, ytv)
-    probs["svm"] = svm.predict_proba(Xte)
-    oof["svm"]   = cross_val_predict(SVC(C=10, probability=True, class_weight="balanced"), Xtv, ytv, cv=5, method="predict_proba")
+    logger.info("   [SVM] fitting...")
+    svm = SVC(kernel="rbf", C=10, gamma="scale", probability=True, class_weight="balanced", random_state=42).fit(Xtr, ytr)
+    probs_va["svm"], probs_te["svm"] = svm.predict_proba(Xva), svm.predict_proba(Xte)
     res["SVM_test_f1"] = f1_score(yte, svm.predict(Xte), average="macro")
-    logger.info(f"   ✅ SVM finished in {time.time()-t0:.1f}s")
 
-    logger.info("   [GBM] fitting with HistGradientBoosting (super fast)...")
-    t0 = time.time()
-    # GradientBoosting is extremely slow on dense 2560-dim vectors. HistGBM is 100x faster.
-    gbm = HistGradientBoostingClassifier(max_iter=100, max_depth=4, random_state=42)
-    gbm.fit(Xtv, ytv)
-    probs["gbm"] = gbm.predict_proba(Xte)
-    oof["gbm"]   = cross_val_predict(HistGradientBoostingClassifier(max_iter=100, max_depth=4), Xtv, ytv, cv=5, method="predict_proba")
+    logger.info("   [GBM] fitting...")
+    gbm = HistGradientBoostingClassifier(max_iter=100, max_depth=4, random_state=42).fit(Xtr, ytr)
+    probs_va["gbm"], probs_te["gbm"] = gbm.predict_proba(Xva), gbm.predict_proba(Xte)
     res["GBM_test_f1"] = f1_score(yte, gbm.predict(Xte), average="macro")
-    logger.info(f"   ✅ GBM finished in {time.time()-t0:.1f}s")
     
     logger.info("   [RF] fitting...")
-    t0 = time.time()
-    rf = RandomForestClassifier(n_estimators=200, class_weight="balanced", n_jobs=-1, random_state=42)
-    rf.fit(Xtv, ytv)
-    probs["rf"] = rf.predict_proba(Xte)
-    oof["rf"]   = cross_val_predict(RandomForestClassifier(n_estimators=200, class_weight="balanced", n_jobs=-1), Xtv, ytv, cv=5, method="predict_proba")
+    rf = RandomForestClassifier(n_estimators=200, class_weight="balanced", n_jobs=-1, random_state=42).fit(Xtr, ytr)
+    probs_va["rf"], probs_te["rf"] = rf.predict_proba(Xva), rf.predict_proba(Xte)
     res["RF_test_f1"] = f1_score(yte, rf.predict(Xte), average="macro")
-    logger.info(f"   ✅ RF finished in {time.time()-t0:.1f}s")
 
-    return res, probs, oof, scaler
+    return res, probs_va, probs_te, scaler
 
 
 def train_mlp(Xtr, ytr, Xva, yva, num_lbl, device):
@@ -396,48 +377,39 @@ def main():
         logger.info(f"🧬 Phase 5 SMOTE: Target {tgt}/class")
         M_tr, ML_tr = simple_smote(M_tr, ML_tr, target=tgt) # Expand MLP Data Only
         
-    sk_res, probs_te, probs_oof, scaler = run_sklearn(S_tr, L_tr, S_va, L_va, S_te, L_te, id2label)
+    sk_res, probs_va, probs_te, scaler = run_sklearn(S_tr, L_tr, S_va, L_va, S_te, L_te, id2label)
     
     logger.info("   [MLP] training with ARCFACE loss...")
     final_mlp, _ = train_mlp(M_tr, ML_tr, M_va, L_va, len(id2label), device)
     
     # MLP outputs
-    mlp_probs_te = get_mlp_probs(final_mlp, M_te, device)
-    mlp_probs_va = get_mlp_probs(final_mlp, M_va, device) # Proxy for MLP OOF
-    probs_te["mlp"] = mlp_probs_te
-    probs_oof["mlp"] = mlp_probs_va # Not strict OOF, but usable for meta-learner
-
-    mlp_f1 = f1_score(L_te, mlp_probs_te.argmax(1), average="macro")
+    probs_te["mlp"] = get_mlp_probs(final_mlp, M_te, device)
+    probs_va["mlp"] = get_mlp_probs(final_mlp, M_va, device)
+    mlp_f1 = f1_score(L_te, probs_te["mlp"].argmax(1), average="macro")
 
     # =======================================================================
-    # STEP 4: META-LEARNER STACKING
+    # META-LEARNER STACKING
     # =======================================================================
-    logger.info("\n🧩 Step 4: Stacking Meta-Learner")
-    # Features for meta learner = concat probabilities of all models
-    meta_X_tr = np.concatenate([probs_oof[m] for m in ["svm", "gbm", "rf", "mlp"]], axis=1)
-    meta_X_te = np.concatenate([probs_te[m]  for m in ["svm", "gbm", "rf", "mlp"]], axis=1)
+    # Fit meta learner purely on Validation Set (prevents overfit & aligns dimensions flawlessly)
+    meta_X_va = np.concatenate([probs_va[m] for m in ["svm", "gbm", "rf", "mlp"]], axis=1)
+    meta_X_te = np.concatenate([probs_te[m] for m in ["svm", "gbm", "rf", "mlp"]], axis=1)
 
-    meta_clf = LogisticRegression(C=1.0, class_weight="balanced")
-    # Note: L_va is length of OOF probabilities because OOF is made over train+val. 
-    # For meta_X_tr we need to align the labels. OOF generated over Xtv (train+val).
-    ytv = np.concatenate([L_tr, L_va])
-    meta_clf.fit(meta_X_tr, ytv)
-    
+    meta_clf = LogisticRegression(C=1.0, class_weight="balanced").fit(meta_X_va, L_va)
     meta_pred = meta_clf.predict(meta_X_te)
     meta_acc = accuracy_score(L_te, meta_pred)
     meta_f1  = f1_score(L_te, meta_pred, average="macro")
 
-    logger.info("\n" + "=" * 70)
-    logger.info("🔥 FUSION & ARCFACE STACKING FINAL RESULTS")
-    logger.info("=" * 70)
-    logger.info(f"  GBM (Fusion 2560-dim)        Test F1: {sk_res['GBM_test_f1']:.4f}")
-    logger.info(f"  RF  (Fusion 2560-dim)        Test F1: {sk_res['RF_test_f1']:.4f}")
-    logger.info(f"  SVM (Fusion 2560-dim)        Test F1: {sk_res['SVM_test_f1']:.4f}")
-    logger.info(f"  MLP-ArcFace (Fusion 6144-dim) Test F1: {mlp_f1:.4f}")
+    logger.info("\n======================================================================")
+    logger.info("🏆 FINAL AUDIO RESULTS (FUSION + ARCFACE STACK)")
+    logger.info("======================================================================")
+    logger.info(f"   GBM (Fusion 2560-dim)        Test F1: {sk_res['GBM_test_f1']:.4f}")
+    logger.info(f"   RF  (Fusion 2560-dim)        Test F1: {sk_res['RF_test_f1']:.4f}")
+    logger.info(f"   SVM (Fusion 2560-dim)        Test F1: {sk_res['SVM_test_f1']:.4f}")
+    logger.info(f"   MLP-ArcFace (Fusion 6144-dim) Test F1: {mlp_f1:.4f}")
     logger.info("-" * 70)
-    logger.info(f"  🏆 Meta-Learner Stack (Test Acc): {meta_acc:.4f}")
-    logger.info(f"  🏆 Meta-Learner Stack (Test F1):  {meta_f1:.4f}")
-    logger.info("=" * 70)
+    logger.info(f"   🏅 Meta-Learner Ensemble Test Accuracy : {meta_acc:.4f}")
+    logger.info(f"   🏅 Meta-Learner Ensemble Test F1       : {meta_f1:.4f}")
+    logger.info("======================================================================")
 
 if __name__ == "__main__":
     main()
