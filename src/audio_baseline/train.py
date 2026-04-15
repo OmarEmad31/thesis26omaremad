@@ -291,6 +291,35 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # --- SANITY CHECK: sklearn LogisticRegression baseline (trains in ~2 seconds) ---
+    # If this also gets ~17%, the embeddings themselves are not discriminative.
+    # If this gets 40%+, the problem is in our neural network training.
+    logger.info("\n📊 Running sklearn baseline (sanity check)...")
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import accuracy_score, f1_score
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(train_emb)
+    X_val   = scaler.transform(val_emb)
+
+    lr_clf = LogisticRegression(max_iter=1000, C=1.0, solver="lbfgs",
+                                multi_class="multinomial", random_state=42)
+    lr_clf.fit(X_train, train_lbl)
+    val_preds = lr_clf.predict(X_val)
+    lr_val_acc = accuracy_score(val_lbl, val_preds)
+    lr_val_f1  = f1_score(val_lbl, val_preds, average="macro")
+    logger.info(f"   sklearn LR → Val Acc: {lr_val_acc:.4f}  F1-Mac: {lr_val_f1:.4f}")
+    logger.info(f"   Train samples: {len(train_lbl)}  Val samples: {len(val_lbl)}  Test samples: {len(test_lbl)}")
+
+    # Class distribution
+    import collections
+    train_dist = dict(collections.Counter(train_lbl.tolist()))
+    val_dist   = dict(collections.Counter(val_lbl.tolist()))
+    logger.info(f"   Train class dist: {train_dist}")
+    logger.info(f"   Val   class dist: {val_dist}")
+    logger.info("")
+
     # 3. Datasets
     train_ds = EmbeddingDataset(train_emb, train_lbl)
     val_ds   = EmbeddingDataset(val_emb,   val_lbl)
