@@ -4,7 +4,6 @@ from pathlib import Path
 IS_COLAB = "COLAB_GPU" in os.environ or os.path.exists("/content")
 
 if IS_COLAB:
-    # Search for the splits CSV directory
     split_search_paths = [
         Path("/content/Thesis Project/data/processed/splits/audio_eligible"),
         Path("/content/data/processed/splits/audio_eligible"),
@@ -17,9 +16,7 @@ if IS_COLAB:
             break
     if not SPLIT_CSV_DIR:
         SPLIT_CSV_DIR = Path("/content/drive/MyDrive/Thesis Project/data/processed/splits/audio_eligible")
-    print(f"✅ SPLIT_CSV_DIR: {SPLIT_CSV_DIR}")
 
-    # Search for the audio dataset root
     search_roots = [
         Path("/content/drive/MyDrive/Thesis Project/dataset"),
         Path("/content/drive/MyDrive/Thesis Project"),
@@ -40,89 +37,38 @@ if IS_COLAB:
                 if DATA_ROOT: break
     if not DATA_ROOT:
         DATA_ROOT = Path("/content/drive/MyDrive/Thesis Project")
-    print(f"✅ DATA_ROOT: {DATA_ROOT}")
 
-    CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_fusion")
-    # Save cache directly to Drive so it survives Colab disconnections!
-    EMBEDDING_CACHE = Path("/content/drive/MyDrive/Thesis Project/audio_emb_fusion_v1.npz")
+    CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_hf")
 else:
     DATA_ROOT       = Path("dataset/Final Modalink Dataset MERGED")
     SPLIT_CSV_DIR   = Path("data/processed/splits/audio_eligible")
-    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_fusion")
-    EMBEDDING_CACHE = Path("audio_emb_fusion_v1.npz")
+    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_hf")
 
 # ---------------------------------------------------------------------------
-# BACKBONES (FEATURE FUSION)
+# MODEL CONFIGURATION (PURE HUGGINGFACE)
 # ---------------------------------------------------------------------------
-# 1. emotion2vec (speech emotion semantics)
-# 2. wav2vec2-emotion (fine-tuned representation)
-# 3. AST (spectral / acoustic features)
-MODEL_NAME = "iic/emotion2vec_plus_base"
-W2V2_NAME  = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
-AST_NAME   = "MIT/ast-finetuned-audioset-10-10-0.4593"
+# We use the emotional Wav2Vec2 model because it natively hooks into the Trainer API
+MODEL_NAME = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
 
 # ---------------------------------------------------------------------------
-# AUDIO
+# TRAINING HYPERPARAMETERS (Matched to Text Baseline)
 # ---------------------------------------------------------------------------
-SAMPLING_RATE     = 16_000
-MAX_DURATION_SEC  = 10
+SEED = 42
+
+SAMPLING_RATE     = 16000
+MAX_DURATION_SEC  = 10   # Max seconds of audio per sample
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
-# ---------------------------------------------------------------------------
-# EMBEDDING STRATEGY  ← KEY INSIGHT
-# SVM+RF+GBM+KNN  →  utterance-level 768-dim, CLEAN data (proven ~42%)
-#                     Augmented duplicates + high dim BOTH hurt sklearn models
-# MLP             →  frame-level 2304-dim (mean+std+max), AUGMENTED data
-#                     Richer temporal features + more training samples
-# ---------------------------------------------------------------------------
-SVM_GRANULARITY   = "utterance"   # 768-dim  for all sklearn models
-MLP_GRANULARITY   = "frame"       # 2304-dim for MLP only
+BATCH_SIZE        = 8    # Wav2Vec2 is large, requires small batch size
+GRAD_ACCUM_STEPS  = 4    # 8 * 4 = 32 effective batch size
+NUM_EPOCHS        = 5
+LEARNING_RATE     = 2e-5
+WEIGHT_DECAY      = 0.01
+WARMUP_RATIO      = 0.1
 
-AUGMENT_MLP_TRAIN = True
-AUG_SPEED_RATES   = [0.85, 1.15]
-AUG_NOISE_STD     = 0.003
+# SCL Settings
+USE_SCL           = True
+SCL_TEMP          = 0.1
+SCL_WEIGHT        = 0.1
 
-# ---------------------------------------------------------------------------
-# PHASE 5 — SMOTE  (targets minority classes: Happiness, Surprise, Fear)
-USE_SMOTE       = True
-SMOTE_TARGET    = 80   # synthesise up to this many samples per class (MLP training)
-SMOTE_K         = 5    # KNN neighbours for interpolation
-
-# ---------------------------------------------------------------------------
-# MLP TRAINING
-# ---------------------------------------------------------------------------
-BATCH_SIZE    = 64
-EPOCHS        = 200
-LEARNING_RATE = 3e-4
-WEIGHT_DECAY  = 5e-3
-LOG_EVERY     = 10
-MAX_PATIENCE  = 40
-
-# SWA — stochastic weight averaging, starts at SWA_START_FRAC of training
-USE_SWA         = True
-SWA_START_FRAC  = 0.70   # start averaging at 70% of epochs
-
-# ---------------------------------------------------------------------------
-# LOSS
-# ---------------------------------------------------------------------------
-USE_SCL      = True
-SCL_WEIGHT   = 0.3
-SCL_TEMP     = 0.2
-FOCAL_GAMMA  = 1.5
-
-USE_MIXUP    = True
-MIXUP_ALPHA  = 0.2
-MIXUP_PROB   = 0.35
-
-# ---------------------------------------------------------------------------
-# TEST-TIME AUGMENTATION
-# ---------------------------------------------------------------------------
-USE_TTA    = True
-TTA_PASSES = 8
-TTA_NOISE  = 0.003
-
-# ---------------------------------------------------------------------------
-# MISC
-# ---------------------------------------------------------------------------
-DEVICE = "cuda"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
