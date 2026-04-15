@@ -59,8 +59,8 @@ SAMPLING_RATE     = 16000
 MAX_DURATION_SEC  = 10   # Max seconds of audio per sample
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
-BATCH_SIZE        = 32    # Since model is frozen, we can use a large batch size!
-GRAD_ACCUM_STEPS  = 1
+BATCH_SIZE        = 4    # Lowered drastically to prevent strictly OOM!
+GRAD_ACCUM_STEPS  = 8    # 4 * 8 = 32 effective batch size
 NUM_EPOCHS        = 40
 LEARNING_RATE     = 1e-3  # High learning rate because we are only training the classification head
 WEIGHT_DECAY      = 0.05
