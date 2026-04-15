@@ -30,17 +30,16 @@ if IS_COLAB:
     EMBEDDING_CACHE = Path("/content/audio_embeddings.npz")
 
 else:
-    DATA_ROOT        = Path("dataset/Final Modalink Dataset MERGED")
-    SPLIT_CSV_DIR    = Path("data/processed/splits/audio_eligible")
-    CHECKPOINT_DIR   = Path("D:/thesis_checkpoints/audio_power_mode")
-    EMBEDDING_CACHE  = Path("audio_embeddings.npz")
+    DATA_ROOT       = Path("dataset/Final Modalink Dataset MERGED")
+    SPLIT_CSV_DIR   = Path("data/processed/splits/audio_eligible")
+    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_power_mode")
+    EMBEDDING_CACHE = Path("audio_embeddings.npz")
 
 # ---------------------------------------------------------------------------
-# BACKBONE  (frozen feature extractor — swap to base if VRAM is tight)
-# emotion2vec_plus_large → ~1024-dim embeddings, significantly stronger
-# emotion2vec_plus_base  → ~768-dim, lighter, use if large OOMs
+# BACKBONE — emotion2vec_plus_base proven better than large on this dataset.
+# (large gives 1024-dim embeddings that are HARDER to fit with small N)
 # ---------------------------------------------------------------------------
-MODEL_NAME = "iic/emotion2vec_plus_large"
+MODEL_NAME = "iic/emotion2vec_plus_base"
 
 # ---------------------------------------------------------------------------
 # AUDIO
@@ -50,42 +49,36 @@ MAX_DURATION_SEC  = 10
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
 # ---------------------------------------------------------------------------
-# MLP CLASSIFIER TRAINING
+# TRAINING  (tuned for the actual dataset size after manifest rebuild)
 # ---------------------------------------------------------------------------
-EMBEDDING_DIM  = None      # Auto-detected
-BATCH_SIZE     = 128       # Large batch → more SCL positive pairs
-EPOCHS         = 300       # More epochs; early stopping guards against overfit
-LEARNING_RATE  = 2e-4
-WEIGHT_DECAY   = 1e-2
-LOG_EVERY      = 25
+BATCH_SIZE    = 64
+EPOCHS        = 200
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY  = 5e-3
+LOG_EVERY     = 10
+MAX_PATIENCE  = 40    # absolute patience; restarts reset this
 
 # ---------------------------------------------------------------------------
-# LOSS
+# LOSS / REGULARIZATION
 # ---------------------------------------------------------------------------
-USE_SCL    = True
-SCL_WEIGHT = 0.4           # Real contributor (was 0.1)
-SCL_TEMP   = 0.07          # Standard SupCon paper value — tight cluster separation
-FOCAL_GAMMA = 2.0          # Focal loss γ: down-weights easy/majority-class predictions
+USE_SCL      = True
+SCL_WEIGHT   = 0.3
+SCL_TEMP     = 0.2    # works well for batches of 64 and 7 classes
+FOCAL_GAMMA  = 1.5    # lighter than 2.0; combines with class weights
+
+USE_MIXUP    = True
+MIXUP_ALPHA  = 0.2
+MIXUP_PROB   = 0.35   # apply to ~35% of batches; rest see clean data
 
 # ---------------------------------------------------------------------------
-# AUGMENTATION
+# TEST-TIME AUGMENTATION
 # ---------------------------------------------------------------------------
-USE_MIXUP        = True
-MIXUP_ALPHA      = 0.3
-MIXUP_PROB       = 0.7     # Apply MixUp to 70% of batches
-NOISE_STD        = 0.005   # Gaussian noise injection during training
-USE_OVERSAMPLING = True    # Random oversample minority classes → balanced training
+USE_TTA   = True
+TTA_PASSES = 8
+TTA_NOISE  = 0.003
 
 # ---------------------------------------------------------------------------
-# TEST-TIME AUGMENTATION (TTA)
+# MISC
 # ---------------------------------------------------------------------------
-USE_TTA      = True
-TTA_PASSES   = 8           # Average predictions over N noisy forward passes
-TTA_NOISE    = 0.005       # Noise std during TTA
-
-# ---------------------------------------------------------------------------
-# TRAINING CONTROL
-# ---------------------------------------------------------------------------
-MAX_PATIENCE = 60          # Much more patience than before (was 25)
-DEVICE       = "cuda"
+DEVICE = "cuda"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
