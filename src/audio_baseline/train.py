@@ -416,10 +416,11 @@ def train_mlp(tr_emb, tr_lbl, va_emb, va_lbl, id2label, device):
         steps_per_epoch=len(tr_loader), epochs=config.EPOCHS,
         pct_start=0.10, anneal_strategy="cos", div_factor=10.0, final_div_factor=1e3)
 
-    # SWA setup
-    swa_model = torch.optim.swa_utils.AveragedModel(model) if config.USE_SWA else None
-    swa_start = int(config.EPOCHS * config.SWA_START_FRAC)
-    swa_sched = torch.optim.swa_utils.SWALR(opt, swa_lr=5e-5) if config.USE_SWA else None
+    # SWA setup — only activated if training runs long enough
+    swa_model    = torch.optim.swa_utils.AveragedModel(model) if config.USE_SWA else None
+    swa_start    = int(config.EPOCHS * config.SWA_START_FRAC)
+    swa_sched    = torch.optim.swa_utils.SWALR(opt, swa_lr=5e-5) if config.USE_SWA else None
+    swa_was_used = False   # ← critical: tracks whether SWA actually ran
 
     best_f1, patience, best_state = 0.0, 0, None
 
@@ -459,6 +460,7 @@ def train_mlp(tr_emb, tr_lbl, va_emb, va_lbl, id2label, device):
         if config.USE_SWA and ep >= swa_start:
             swa_model.update_parameters(model)
             swa_sched.step()
+            swa_was_used = True
 
         # Validation with active model
         model.eval(); vp, vt = [], []
@@ -479,17 +481,20 @@ def train_mlp(tr_emb, tr_lbl, va_emb, va_lbl, id2label, device):
         if patience >= config.MAX_PATIENCE:
             logger.info(f"  ⏹ Early stop ep={ep}  best val-F1={best_f1:.4f}"); break
 
-    # Load best checkpoint into base model for SWA update (if SWA active)
+    # Restore best checkpoint
     if best_state:
         model.load_state_dict(best_state)
-
-    # SWA final model
-    if config.USE_SWA and swa_model is not None:
-        logger.info("   📦 Finalising SWA model...")
-        model.eval()
-        return swa_model, model, best_f1
     model.eval()
-    return None, model, best_f1
+
+    # Only use SWA if it actually accumulated parameters
+    # If training stopped before SWA_START, swa_model has random init weights → useless
+    if config.USE_SWA and swa_was_used:
+        logger.info(f"   📦 SWA finalised (accumulated from ep {swa_start})")
+        return swa_model, model, best_f1
+    else:
+        if config.USE_SWA:
+            logger.info(f"   ⚠️  SWA skipped — training stopped at ep<{swa_start}, using best checkpoint")
+        return None, model, best_f1
 
 
 # ===========================================================================
@@ -593,11 +598,14 @@ def main():
     logger.info(f"   MLP train dist: {dict(sorted(collections.Counter(mlp_trl.tolist()).items()))}")
 
     # 3. Phase 5 — SMOTE on MLP training embeddings
+    #    Target = max class count (balances all classes to the majority)
     if config.USE_SMOTE:
-        logger.info(f"\n🧬 Phase 5 SMOTE: target {config.SMOTE_TARGET} samples/class ...")
+        cls_counts   = collections.Counter(mlp_trl.tolist())
+        smote_target = max(cls_counts.values())   # dynamic: match majority class
+        logger.info(f"\n🧬 Phase 5 SMOTE: target={smote_target}/class (= majority count)")
         mlp_tr_before = len(mlp_trl)
         mlp_tr, mlp_trl = simple_smote(mlp_tr, mlp_trl,
-                                        target_per_class=config.SMOTE_TARGET,
+                                        target_per_class=smote_target,
                                         k=config.SMOTE_K)
         logger.info(f"   SMOTE: {mlp_tr_before} → {len(mlp_trl)} samples")
         logger.info(f"   Post-SMOTE dist: {dict(sorted(collections.Counter(mlp_trl.tolist()).items()))}")
@@ -644,6 +652,15 @@ def main():
     ens_f1   = f1_score(svm_tel, ens_pred, average="macro")
     ens_f1w  = f1_score(svm_tel, ens_pred, average="weighted")
 
+    # sklearn-only ensemble (SVM+RF+GBM+KNN) — no MLP (useful comparison)
+    sk_names  = [n for n in names if n != "mlp"]
+    sk_wts    = np.array([sk_val_f1s.get(n, 0) for n in sk_names])
+    sk_wts    = np.exp(sk_wts) / np.exp(sk_wts).sum()
+    sk_ens_p  = sum(w * all_probs[n] for n, w in zip(sk_names, sk_wts))
+    sk_ens_pred = sk_ens_p.argmax(1)
+    sk_ens_acc  = accuracy_score(svm_tel, sk_ens_pred)
+    sk_ens_f1   = f1_score(svm_tel, sk_ens_pred, average="macro")
+
     # Best sklearn alone
     best_sk_acc = max(sk_res[f"{m}_test_acc"] for m in ["LR","SVM","RF","GBM","KNN"])
     best_sk_f1  = max(sk_res[f"{m}_test_f1"]  for m in ["LR","SVM","RF","GBM","KNN"])
@@ -670,15 +687,17 @@ def main():
                 f" {mlp_test_acc:>9.4f} {mlp_test_f1:>9.4f}")
     logger.info(f"  {'MLP + TTA + SWA':<33} {'—':>8}"
                 f" {tta_test_acc:>9.4f} {tta_test_f1:>9.4f}")
-    logger.info(f"  {'Ensemble (val-F1 weighted)':<33} {'—':>8}"
+    logger.info(f"  {'SK Ensemble (no MLP)':<33} {'—':>8}"
+                f" {sk_ens_acc:>9.4f} {sk_ens_f1:>9.4f}")
+    logger.info(f"  {'Full Ensemble (all models)':<33} {'—':>8}"
                 f" {ens_acc:>9.4f} {ens_f1:>9.4f}")
     logger.info("=" * 72)
 
-    best_acc = max(best_sk_acc, mlp_test_acc, tta_test_acc, ens_acc)
-    best_f1_ = max(best_sk_f1,  mlp_test_f1,  tta_test_f1,  ens_f1)
+    best_acc = max(best_sk_acc, mlp_test_acc, tta_test_acc, ens_acc, sk_ens_acc)
+    best_f1_ = max(best_sk_f1,  mlp_test_f1,  tta_test_f1,  ens_f1, sk_ens_f1)
     logger.info(f"  🏅 Best Accuracy  : {best_acc:.4f}")
     logger.info(f"  🏅 Best F1-Macro  : {best_f1_:.4f}")
-    logger.info(f"  📊 Ensemble F1-Wt : {ens_f1w:.4f}")
+    logger.info(f"  📊 Full Ens F1-Wt : {ens_f1w:.4f}")
     logger.info("=" * 72)
 
 
