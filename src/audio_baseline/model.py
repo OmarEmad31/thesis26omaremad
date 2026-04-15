@@ -74,9 +74,9 @@ class Emotion2VecBaseline(nn.Module):
         # We pass the FULL sequence into the BiLSTM so it can hear the timeline
         lstm_out, _ = self.lstm(last_hidden_state)
         
-        # 4. Global Max Pooling (Better for catching emotional peaks)
-        # We take the maximum value over the time dimension (dim=1)
-        pooled = torch.max(lstm_out, dim=1)[0]
+        # 4. Global Mean Pooling (Most stable for general patterns)
+        # We take the average value over the time dimension (dim=1)
+        pooled = torch.mean(lstm_out, dim=1)
         
         # 5. Final Classification
         logits = self.classifier(pooled)

@@ -43,11 +43,18 @@ else:
 # --- POWER MODE CONFIG ---
 USE_SCL = True
 SCL_WEIGHT = 0.5         # How much to focus on clustering emotions
-UNFREEZE_EPOCH = 3       # We start deep fine-tuning earlier to boost accuracy 🚀
+UNFREEZE_EPOCH = 2       # Unfreeze earlier for more training time 🚀
 SCL_TEMP = 0.1           # Temperature for contrastive loss
 
 # --- MODEL CONFIG ---
-MODEL_NAME = "iic/emotion2vec_plus_base"
+class config:
+    # Model Architecture
+    MODEL_NAME = "iic/emotion2vec_plus_base"
+    
+    # Training Loop
+    BATCH_SIZE = 8
+    EPOCHS = 20
+    LEARNING_RATE = 5e-5      # Faster engine for better convergence 🌪️
 
 # --- DATA CONFIG ---
 SAMPLING_RATE = 16000
