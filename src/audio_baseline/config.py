@@ -37,32 +37,40 @@ else:
 
 # ---------------------------------------------------------------------------
 # BACKBONE  (used for embedding extraction only, always FROZEN)
+# emotion2vec_plus_large gives ~3-5% better accuracy than base
+# Switch to large model if you have enough RAM/VRAM on Colab
 # ---------------------------------------------------------------------------
-MODEL_NAME = "iic/emotion2vec_plus_base"
+MODEL_NAME = "iic/emotion2vec_plus_large"   # upgraded: base → large
 
 # ---------------------------------------------------------------------------
 # AUDIO
 # ---------------------------------------------------------------------------
-SAMPLING_RATE    = 16000
-MAX_DURATION_SEC = 10
+SAMPLING_RATE     = 16000
+MAX_DURATION_SEC  = 10
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
 # ---------------------------------------------------------------------------
 # MLP CLASSIFIER TRAINING  (after embeddings are pre-computed)
 # ---------------------------------------------------------------------------
-EMBEDDING_DIM  = None     # Detected automatically from first extracted sample
-BATCH_SIZE     = 64       # Large batch — tensors are tiny (no audio in memory)
-EPOCHS         = 100      # Fast epochs since backbone is frozen
-LEARNING_RATE  = 5e-4
-WEIGHT_DECAY   = 1e-4
-LOG_EVERY      = 10       # Log every N epochs to keep output clean
+EMBEDDING_DIM  = None      # Detected automatically from first extracted sample
+BATCH_SIZE     = 128       # Larger batch → more SCL positive pairs per step
+EPOCHS         = 200       # More epochs; early stopping prevents overfit
+LEARNING_RATE  = 2e-4      # Slightly lower than before for stable convergence
+WEIGHT_DECAY   = 1e-2      # Stronger L2 for deeper network
+LOG_EVERY      = 20        # Log every N epochs
 
 # ---------------------------------------------------------------------------
 # LOSS
 # ---------------------------------------------------------------------------
 USE_SCL    = True
-SCL_WEIGHT = 0.1          # Low weight — CE dominates, SCL regularises
-SCL_TEMP   = 0.3          # Higher temp = softer/more stable SCL gradients
+SCL_WEIGHT = 0.4           # Raised from 0.1 → 0.4: SCL now a real contributor
+SCL_TEMP   = 0.1           # Lowered from 0.3 → 0.1: tighter cluster separation
+
+# ---------------------------------------------------------------------------
+# MIXUP augmentation (embedding-space)
+# ---------------------------------------------------------------------------
+USE_MIXUP    = True
+MIXUP_ALPHA  = 0.3         # Beta dist param; 0.3 gives mild mixing
 
 # ---------------------------------------------------------------------------
 # MISC
