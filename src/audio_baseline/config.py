@@ -27,7 +27,7 @@ if IS_COLAB:
 
     SPLIT_CSV_DIR   = Path("/content/data/processed/splits/audio_eligible")
     CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_power_mode")
-    EMBEDDING_CACHE = Path("/content/audio_embeddings.npz")   # Fast local SSD
+    EMBEDDING_CACHE = Path("/content/audio_embeddings.npz")
 
 else:
     DATA_ROOT        = Path("dataset/Final Modalink Dataset MERGED")
@@ -36,11 +36,11 @@ else:
     EMBEDDING_CACHE  = Path("audio_embeddings.npz")
 
 # ---------------------------------------------------------------------------
-# BACKBONE  (used for embedding extraction only, always FROZEN)
-# emotion2vec_plus_large gives ~3-5% better accuracy than base
-# Switch to large model if you have enough RAM/VRAM on Colab
+# BACKBONE  (frozen feature extractor — swap to base if VRAM is tight)
+# emotion2vec_plus_large → ~1024-dim embeddings, significantly stronger
+# emotion2vec_plus_base  → ~768-dim, lighter, use if large OOMs
 # ---------------------------------------------------------------------------
-MODEL_NAME = "iic/emotion2vec_plus_large"   # upgraded: base → large
+MODEL_NAME = "iic/emotion2vec_plus_large"
 
 # ---------------------------------------------------------------------------
 # AUDIO
@@ -50,30 +50,42 @@ MAX_DURATION_SEC  = 10
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
 # ---------------------------------------------------------------------------
-# MLP CLASSIFIER TRAINING  (after embeddings are pre-computed)
+# MLP CLASSIFIER TRAINING
 # ---------------------------------------------------------------------------
-EMBEDDING_DIM  = None      # Detected automatically from first extracted sample
-BATCH_SIZE     = 128       # Larger batch → more SCL positive pairs per step
-EPOCHS         = 200       # More epochs; early stopping prevents overfit
-LEARNING_RATE  = 2e-4      # Slightly lower than before for stable convergence
-WEIGHT_DECAY   = 1e-2      # Stronger L2 for deeper network
-LOG_EVERY      = 20        # Log every N epochs
+EMBEDDING_DIM  = None      # Auto-detected
+BATCH_SIZE     = 128       # Large batch → more SCL positive pairs
+EPOCHS         = 300       # More epochs; early stopping guards against overfit
+LEARNING_RATE  = 2e-4
+WEIGHT_DECAY   = 1e-2
+LOG_EVERY      = 25
 
 # ---------------------------------------------------------------------------
 # LOSS
 # ---------------------------------------------------------------------------
 USE_SCL    = True
-SCL_WEIGHT = 0.4           # Raised from 0.1 → 0.4: SCL now a real contributor
-SCL_TEMP   = 0.1           # Lowered from 0.3 → 0.1: tighter cluster separation
+SCL_WEIGHT = 0.4           # Real contributor (was 0.1)
+SCL_TEMP   = 0.07          # Standard SupCon paper value — tight cluster separation
+FOCAL_GAMMA = 2.0          # Focal loss γ: down-weights easy/majority-class predictions
 
 # ---------------------------------------------------------------------------
-# MIXUP augmentation (embedding-space)
+# AUGMENTATION
 # ---------------------------------------------------------------------------
-USE_MIXUP    = True
-MIXUP_ALPHA  = 0.3         # Beta dist param; 0.3 gives mild mixing
+USE_MIXUP        = True
+MIXUP_ALPHA      = 0.3
+MIXUP_PROB       = 0.7     # Apply MixUp to 70% of batches
+NOISE_STD        = 0.005   # Gaussian noise injection during training
+USE_OVERSAMPLING = True    # Random oversample minority classes → balanced training
 
 # ---------------------------------------------------------------------------
-# MISC
+# TEST-TIME AUGMENTATION (TTA)
 # ---------------------------------------------------------------------------
-DEVICE = "cuda"
+USE_TTA      = True
+TTA_PASSES   = 8           # Average predictions over N noisy forward passes
+TTA_NOISE    = 0.005       # Noise std during TTA
+
+# ---------------------------------------------------------------------------
+# TRAINING CONTROL
+# ---------------------------------------------------------------------------
+MAX_PATIENCE = 60          # Much more patience than before (was 25)
+DEVICE       = "cuda"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)

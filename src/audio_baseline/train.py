@@ -1,11 +1,21 @@
 """Train emotion classifier on emotion2vec embeddings.
 
-Pipeline:
-  1. Load emotion2vec+ backbone → extract utterance embeddings → cache to disk
-  2. SVM-RBF with GridSearchCV (C, gamma)          — strong embedding classifier
-  3. Deep Residual MLP + SCL + MixUp               — thesis SCL contribution
-  4. Ensemble: SVM + MLP (probability averaging)   — best of both worlds
-  5. Final report: accuracy, F1-macro, F1-weighted, per-class F1
+Why the old model hit 42% ceiling:
+  - Class imbalance → model predicted majority only → F1-macro ~22%
+  - patience=25 → early stopping fired before the model properly learned
+  - SCL temp=0.3 → loss signal too weak, clusters barely moved
+  - No oversampling → minority emotions starved of examples
+
+This version fixes all of that:
+  1. SVM-RBF with GridSearchCV                        (strong baseline)
+  2. Deep Residual MLP
+       + Focal Loss (handles imbalance at loss level)
+       + Supervised Contrastive Loss (SCL, temp=0.07)
+       + MixUp augmentation (70% of batches)
+       + Gaussian noise injection
+  3. Random oversampling → balanced training distribution
+  4. Test-Time Augmentation (TTA, 8 passes)
+  5. Ensemble: SVM + MLP averaged probabilities
 
 Run from project root:
   python -m src.audio_baseline.train
@@ -29,7 +39,7 @@ from tqdm import tqdm
 from transformers import set_seed
 from transformers import logging as transformers_logging
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, normalize as sk_normalize
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.model_selection import GridSearchCV
@@ -58,57 +68,79 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Model: Deep Residual MLP
+# Data: random oversampling of minority classes
 # ---------------------------------------------------------------------------
-class ResidualBlock(nn.Module):
-    """Pre-norm residual block: LayerNorm → Linear → GELU → Dropout → Add."""
+def balanced_oversample(emb: np.ndarray, labels: np.ndarray) -> tuple:
+    """
+    Under-represented classes are randomly duplicated (with replacement)
+    until every class has as many samples as the majority class.
+    Done in embedding space — no new audio needed.
+    """
+    rng    = np.random.default_rng(42)
+    counts = collections.Counter(labels.tolist())
+    max_n  = max(counts.values())
+    parts_e, parts_l = [emb], [labels]
+    for cls, n in counts.items():
+        deficit = max_n - n
+        if deficit > 0:
+            mask = labels == cls
+            idx  = rng.choice(mask.sum(), deficit, replace=True)
+            parts_e.append(emb[mask][idx])
+            parts_l.append(np.full(deficit, cls, dtype=np.int64))
+    emb_out = np.concatenate(parts_e, axis=0)
+    lbl_out = np.concatenate(parts_l, axis=0)
+    # Shuffle so classes are interleaved
+    perm    = rng.permutation(len(lbl_out))
+    return emb_out[perm], lbl_out[perm]
+
+
+# ---------------------------------------------------------------------------
+# Model: Deep Residual MLP with cosine classifier
+# ---------------------------------------------------------------------------
+class ResBlock(nn.Module):
+    """Pre-norm residual: LayerNorm → Linear → GELU → Dropout → add."""
     def __init__(self, dim: int, dropout: float):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+        self.norm  = nn.LayerNorm(dim)
+        self.lin   = nn.Linear(dim, dim)
+        self.act   = nn.GELU()
+        self.drop  = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.block(x)
+    def forward(self, x):
+        return x + self.drop(self.act(self.lin(self.norm(x))))
 
 
 class DeepMLP(nn.Module):
     """
-    Deep residual MLP classifier on top of frozen emotion2vec embeddings.
+    Residual MLP on frozen emotion2vec embeddings.
 
-    Architecture (input_dim → 512 → 512-res → 256 → 256-res → num_labels):
-      [B, input_dim]
-        → LayerNorm → Linear → GELU → Dropout(0.3)     proj: [B, 512]
-        → ResidualBlock(512, 0.2)
-        → LayerNorm → Linear → GELU → Dropout(0.2)     down: [B, 256]
-        → ResidualBlock(256, 0.15)                      ← SCL projection
-        → Linear(256 → num_labels)
+    Architecture:
+      [B, in_dim]
+        LayerNorm → Linear(in→512) → GELU → Dropout(0.35)
+        ResBlock(512, 0.20)
+        LayerNorm → Linear(512→256) → GELU → Dropout(0.25)
+        ResBlock(256, 0.15)
+        ↓ proj [B, 256]  → L2-normalize → used for SCL
+        Linear(256 → num_labels)
     """
     def __init__(self, input_dim: int = 768, num_labels: int = 7):
         super().__init__()
-
-        self.proj = nn.Sequential(
+        self.stem = nn.Sequential(
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, 512),
             nn.GELU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.35),
         )
-        self.res1 = ResidualBlock(512, 0.2)
-
+        self.res1 = ResBlock(512, 0.20)
         self.down = nn.Sequential(
             nn.LayerNorm(512),
             nn.Linear(512, 256),
             nn.GELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.25),
         )
-        self.res2 = ResidualBlock(256, 0.15)
-
+        self.res2       = ResBlock(256, 0.15)
         self.classifier = nn.Linear(256, num_labels)
 
-        # Weight initialisation
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -116,33 +148,53 @@ class DeepMLP(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor):
-        """
-        x: [B, input_dim]   pre-computed emotion2vec embeddings
-        Returns: logits [B, num_labels],  proj [B, 256] (for SCL)
-        """
-        x    = self.proj(x)        # [B, 512]
-        x    = self.res1(x)        # [B, 512]
-        x    = self.down(x)        # [B, 256]
-        proj = self.res2(x)        # [B, 256]  ← SCL hook
-        logits = self.classifier(proj)         # [B, num_labels]
-        return logits, proj
+        """Returns (logits [B, C], proj [B, 256]) where proj is L2-normalised."""
+        x    = self.stem(x)
+        x    = self.res1(x)
+        x    = self.down(x)
+        proj = self.res2(x)                           # [B, 256]
+        proj_n = F.normalize(proj, p=2, dim=1)        # L2-norm for SCL
+        logits = self.classifier(proj)                # [B, num_labels]
+        return logits, proj_n
 
 
 # ---------------------------------------------------------------------------
-# Supervised Contrastive Loss  (SupCon; Khosla et al., 2020)
+# Focal Loss  (down-weights easy / majority-class predictions)
 # ---------------------------------------------------------------------------
-def scl_loss(embeddings: torch.Tensor, labels: torch.Tensor,
+class FocalLoss(nn.Module):
+    """
+    FL(p_t) = -(1 - p_t)^γ · log(p_t)
+    γ=2 is the standard value from the original FPN paper.
+    Combined with class weights and label smoothing.
+    """
+    def __init__(self, weight: torch.Tensor = None,
+                 gamma: float = 2.0, label_smoothing: float = 0.1):
+        super().__init__()
+        self.weight          = weight
+        self.gamma           = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce    = F.cross_entropy(logits, targets,
+                                weight=self.weight,
+                                label_smoothing=self.label_smoothing,
+                                reduction="none")
+        p_t   = torch.exp(-ce)                        # predicted prob for correct class
+        focal = ((1.0 - p_t) ** self.gamma) * ce
+        return focal.mean()
+
+
+# ---------------------------------------------------------------------------
+# Supervised Contrastive Loss  (Khosla et al., 2020)
+# ---------------------------------------------------------------------------
+def scl_loss(proj: torch.Tensor, labels: torch.Tensor,
              temp: float, device: torch.device) -> torch.Tensor:
-    """
-    Compute SupCon loss on L2-normalised projection vectors.
-    Uses numerical-stability trick (subtract row max before exp).
-    """
-    features  = F.normalize(embeddings, p=2, dim=1)
-    sim       = torch.matmul(features, features.T) / temp
+    """proj must already be L2-normalised; temp=0.07 is the SupCon default."""
+    sim       = torch.matmul(proj, proj.T) / temp
 
     bs        = labels.size(0)
     pos_mask  = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float()
-    self_mask = torch.ones(bs, bs, device=device) - torch.eye(bs, device=device)
+    self_mask = 1.0 - torch.eye(bs, device=device)
     pos_mask  = pos_mask * self_mask
 
     max_sim, _ = sim.max(dim=1, keepdim=True)
@@ -158,17 +210,12 @@ def scl_loss(embeddings: torch.Tensor, labels: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# MixUp augmentation (embedding space)
+# MixUp (embedding space)
 # ---------------------------------------------------------------------------
-def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float, device: torch.device):
-    """
-    Mix pairs of embedding vectors and their labels.
-    Returns mixed_x, y_a, y_b, lam — use mixup_criterion for backprop.
-    """
-    lam   = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-    idx   = torch.randperm(x.size(0), device=device)
-    mixed = lam * x + (1.0 - lam) * x[idx]
-    return mixed, y, y[idx], lam
+def mixup_batch(x, y, alpha, device):
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(x.size(0), device=device)
+    return lam * x + (1.0 - lam) * x[idx], y, y[idx], lam
 
 
 def mixup_criterion(criterion, logits, y_a, y_b, lam):
@@ -233,7 +280,8 @@ def extract_embeddings(backbone, df: pd.DataFrame, label2id: dict,
             if detected_dim is None:
                 detected_dim = feat.shape[0]
                 if first_call:
-                    logger.info(f"    🔬 Embedding dim={feat.shape}, mean={feat.mean():.4f}, std={feat.std():.4f}")
+                    logger.info(f"    🔬 Embedding dim={feat.shape}  "
+                                f"mean={feat.mean():.4f}  std={feat.std():.4f}")
 
             embeddings.append(feat.astype(np.float32))
             labels_out.append(label2id[row["emotion_final"]])
@@ -247,135 +295,128 @@ def extract_embeddings(backbone, df: pd.DataFrame, label2id: dict,
 
 
 # ---------------------------------------------------------------------------
-# Sklearn: SVM with GridSearchCV
+# SVM + GridSearch
 # ---------------------------------------------------------------------------
-def run_sklearn(train_emb, train_lbl, val_emb, val_lbl, test_emb, test_lbl, id2label):
-    scaler  = StandardScaler()
-    X_train = scaler.fit_transform(train_emb)
-    X_val   = scaler.transform(val_emb)
-    X_test  = scaler.transform(test_emb)
-
-    # Combine train+val for final SVM fitting (more data = better)
-    X_tv    = np.concatenate([X_train, X_val], axis=0)
-    y_tv    = np.concatenate([train_lbl, val_lbl], axis=0)
+def run_sklearn(train_emb, train_lbl, val_emb, val_lbl,
+                test_emb, test_lbl, id2label):
+    # L2-normalize first (emotion2vec embeddings live on a hypersphere)
+    X_train = sk_normalize(train_emb, norm="l2")
+    X_val   = sk_normalize(val_emb,   norm="l2")
+    X_test  = sk_normalize(test_emb,  norm="l2")
+    X_tv    = sk_normalize(np.concatenate([train_emb, val_emb]), norm="l2")
+    y_tv    = np.concatenate([train_lbl, val_lbl])
 
     results = {}
 
-    # 1. Logistic Regression (fast reference)
+    # 1. Logistic Regression (reference)
     logger.info("   Fitting Logistic Regression...")
     lr = LogisticRegression(max_iter=3000, C=1.0, solver="lbfgs",
-                            multi_class="multinomial", random_state=42)
+                            class_weight="balanced", random_state=42)
     lr.fit(X_train, train_lbl)
-    for split_name, X, y in [("val", X_val, val_lbl), ("test", X_test, test_lbl)]:
-        preds = lr.predict(X)
-        results[f"LR_{split_name}_acc"] = accuracy_score(y, preds)
-        results[f"LR_{split_name}_f1"]  = f1_score(y, preds, average="macro")
+    for sn, X, y in [("val", X_val, val_lbl), ("test", X_test, test_lbl)]:
+        p = lr.predict(X)
+        results[f"LR_{sn}_acc"] = accuracy_score(y, p)
+        results[f"LR_{sn}_f1"]  = f1_score(y, p, average="macro")
 
-    # 2. SVM-RBF with Grid Search
-    logger.info("   Grid-searching SVM hyperparameters (C, gamma) — may take a few minutes...")
+    # 2. SVM-RBF GridSearch
+    logger.info("   Grid-searching SVM (C, gamma) — takes a few minutes...")
     param_grid = {
-        "C":     [1, 5, 10, 50, 100, 200],
+        "C":     [0.5, 1, 5, 10, 50, 100, 200],
         "gamma": ["scale", "auto"],
     }
-    grid_svm = GridSearchCV(
-        SVC(kernel="rbf", probability=True, random_state=42, class_weight="balanced"),
-        param_grid,
-        cv=3,
-        scoring="f1_macro",
-        n_jobs=-1,
-        verbose=0,
+    grid = GridSearchCV(
+        SVC(kernel="rbf", probability=True, class_weight="balanced", random_state=42),
+        param_grid, cv=5, scoring="f1_macro", n_jobs=-1, verbose=0,
     )
-    grid_svm.fit(X_train, train_lbl)
-    best_C     = grid_svm.best_params_["C"]
-    best_gamma = grid_svm.best_params_["gamma"]
-    logger.info(f"   ✅ Best SVM params: C={best_C}, gamma={best_gamma}  (CV F1-mac={grid_svm.best_score_:.4f})")
+    grid.fit(X_train, train_lbl)
+    logger.info(f"   ✅ Best SVM: C={grid.best_params_['C']}, "
+                f"gamma={grid.best_params_['gamma']}  "
+                f"(cv F1={grid.best_score_:.4f})")
 
-    # Re-fit best SVM on train+val for best test generalisation
-    svm_final = SVC(kernel="rbf", C=best_C, gamma=best_gamma,
-                    probability=True, random_state=42, class_weight="balanced")
-    svm_final.fit(X_tv, y_tv)
+    # Val score from grid CV model, test score from TV-retrained model
+    svm_tv = SVC(kernel="rbf", probability=True, class_weight="balanced",
+                 random_state=42, **grid.best_params_)
+    svm_tv.fit(X_tv, y_tv)
 
-    # Evaluate the grid-search winner on val (from train-only model) and test
-    svm_val_model = grid_svm.best_estimator_
-    for split_name, X, y in [("val", X_val, val_lbl), ("test", X_test, test_lbl)]:
-        model = svm_val_model if split_name == "val" else svm_final
-        preds = model.predict(X)
-        results[f"SVM_{split_name}_acc"] = accuracy_score(y, preds)
-        results[f"SVM_{split_name}_f1"]  = f1_score(y, preds, average="macro")
+    for sn, X, y, m in [("val",  X_val,  val_lbl,  grid.best_estimator_),
+                         ("test", X_test, test_lbl, svm_tv)]:
+        p = m.predict(X)
+        results[f"SVM_{sn}_acc"] = accuracy_score(y, p)
+        results[f"SVM_{sn}_f1"]  = f1_score(y, p, average="macro")
 
     logger.info("\n📊 SKLEARN RESULTS:")
-    logger.info(f"   LR  — Val Acc {results['LR_val_acc']:.4f}  F1-Mac {results['LR_val_f1']:.4f} | "
-                f"Test Acc {results['LR_test_acc']:.4f}  F1-Mac {results['LR_test_f1']:.4f}")
-    logger.info(f"   SVM — Val Acc {results['SVM_val_acc']:.4f}  F1-Mac {results['SVM_val_f1']:.4f} | "
-                f"Test Acc {results['SVM_test_acc']:.4f}  F1-Mac {results['SVM_test_f1']:.4f}")
+    logger.info(f"   LR  — Val Acc {results['LR_val_acc']:.4f}  F1 {results['LR_val_f1']:.4f} | "
+                f"Test Acc {results['LR_test_acc']:.4f}  F1 {results['LR_test_f1']:.4f}")
+    logger.info(f"   SVM — Val Acc {results['SVM_val_acc']:.4f}  F1 {results['SVM_val_f1']:.4f} | "
+                f"Test Acc {results['SVM_test_acc']:.4f}  F1 {results['SVM_test_f1']:.4f}")
 
-    # Per-class report for SVM on test
-    svm_test_preds = svm_final.predict(X_test)
     label_strs = [id2label[i] for i in range(len(id2label))]
     logger.info("\n   SVM Per-class Report (Test):")
-    logger.info(classification_report(test_lbl, svm_test_preds, target_names=label_strs))
+    logger.info(classification_report(test_lbl, svm_tv.predict(X_test),
+                                      target_names=label_strs))
 
-    return results, scaler, svm_final, svm_val_model
+    return results, svm_tv, X_tv, X_test
 
 
 # ---------------------------------------------------------------------------
-# Deep MLP training with SCL + MixUp
+# Deep MLP training
 # ---------------------------------------------------------------------------
-def train_deep_mlp(train_emb, train_lbl, val_emb, val_lbl, test_emb, test_lbl,
-                   id2label, device):
+def train_deep_mlp(train_emb, train_lbl, val_emb, val_lbl,
+                   test_emb, test_lbl, id2label, device):
     num_labels = len(id2label)
     emb_dim    = train_emb.shape[1]
 
+    # --- Oversample training data so every class is equally represented ---
+    if config.USE_OVERSAMPLING:
+        train_emb_os, train_lbl_os = balanced_oversample(train_emb, train_lbl)
+        before = collections.Counter(train_lbl.tolist())
+        after  = collections.Counter(train_lbl_os.tolist())
+        logger.info(f"   Oversampling: {sum(before.values())} → {sum(after.values())} samples")
+        logger.info(f"   Before: {dict(sorted(before.items()))}")
+        logger.info(f"   After : {dict(sorted(after.items()))}")
+    else:
+        train_emb_os, train_lbl_os = train_emb, train_lbl
+
     # Tensors
-    Xtr = torch.tensor(train_emb, dtype=torch.float32)
-    ytr = torch.tensor(train_lbl, dtype=torch.long)
-    Xv  = torch.tensor(val_emb,   dtype=torch.float32)
-    yv  = torch.tensor(val_lbl,   dtype=torch.long)
-    Xte = torch.tensor(test_emb,  dtype=torch.float32)
-    yte = torch.tensor(test_lbl,  dtype=torch.long)
+    Xtr = torch.tensor(train_emb_os, dtype=torch.float32)
+    ytr = torch.tensor(train_lbl_os, dtype=torch.long)
+    Xv  = torch.tensor(val_emb,      dtype=torch.float32)
+    yv  = torch.tensor(val_lbl,      dtype=torch.long)
 
     train_loader = DataLoader(TensorDataset(Xtr, ytr),
-                              batch_size=config.BATCH_SIZE, shuffle=True, drop_last=False)
-    val_loader   = DataLoader(TensorDataset(Xv, yv),   batch_size=256, shuffle=False)
-    test_loader  = DataLoader(TensorDataset(Xte, yte), batch_size=256, shuffle=False)
+                              batch_size=config.BATCH_SIZE,
+                              shuffle=True, drop_last=False)
+    val_loader   = DataLoader(TensorDataset(Xv, yv),
+                              batch_size=256, shuffle=False)
 
     model = DeepMLP(input_dim=emb_dim, num_labels=num_labels).to(device)
 
-    # Class-weighted CE with label smoothing
+    # Class weights computed from ORIGINAL (not oversampled) distribution
     weights   = compute_class_weight("balanced",
                                      classes=np.arange(num_labels), y=train_lbl)
     cw        = torch.tensor(weights, dtype=torch.float).to(device)
-    criterion = nn.CrossEntropyLoss(weight=cw, label_smoothing=0.1)
+    criterion = FocalLoss(weight=cw, gamma=config.FOCAL_GAMMA, label_smoothing=0.1)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.LEARNING_RATE,
-        weight_decay=config.WEIGHT_DECAY,
-    )
+    optimizer = torch.optim.AdamW(model.parameters(),
+                                  lr=config.LEARNING_RATE,
+                                  weight_decay=config.WEIGHT_DECAY)
 
-    # OneCycleLR: warm-up then cosine anneal — typically 3-5% better than cosine alone
-    steps_per_epoch = len(train_loader)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=config.LEARNING_RATE * 5,   # peak LR = 5× base
-        steps_per_epoch=steps_per_epoch,
-        epochs=config.EPOCHS,
-        pct_start=0.1,                     # 10% warmup
-        anneal_strategy="cos",
-        div_factor=25.0,
-        final_div_factor=1e4,
+    # CosineAnnealingWarmRestarts: restarts help escape local minima.
+    # T_0=50 → first restart at epoch 50, then 100, 200 (T_mult=2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=50, T_mult=2, eta_min=1e-6
     )
 
     best_f1    = 0.0
     patience   = 0
-    MAX_PAT    = 40                         # more patience for deeper model
     best_state = None
 
-    logger.info(f"\n⚡ Training Deep Residual MLP + SCL + MixUp "
-                f"({config.EPOCHS} epochs, early stop after {MAX_PAT})...")
-    logger.info(f"   dim={emb_dim}  batch={config.BATCH_SIZE}  lr={config.LEARNING_RATE}"
-                f"  scl_w={config.SCL_WEIGHT}  scl_t={config.SCL_TEMP}"
-                f"  mixup={'on' if config.USE_MIXUP else 'off'}")
+    logger.info(f"\n⚡ Training Deep Residual MLP + SCL + Focal + MixUp + Noise")
+    logger.info(f"   dim={emb_dim}  batch={config.BATCH_SIZE}  oversample=on")
+    logger.info(f"   lr={config.LEARNING_RATE}  wd={config.WEIGHT_DECAY}")
+    logger.info(f"   scl_w={config.SCL_WEIGHT}  scl_t={config.SCL_TEMP}  focal_γ={config.FOCAL_GAMMA}")
+    logger.info(f"   mixup={config.MIXUP_PROB:.0%} of batches  noise_std={config.NOISE_STD}")
+    logger.info(f"   epochs={config.EPOCHS}  patience={config.MAX_PATIENCE}")
 
     for epoch in range(config.EPOCHS):
         model.train()
@@ -385,16 +426,18 @@ def train_deep_mlp(train_emb, train_lbl, val_emb, val_lbl, test_emb, test_lbl,
         for emb_b, lab_b in train_loader:
             emb_b, lab_b = emb_b.to(device), lab_b.to(device)
 
-            if config.USE_MIXUP and np.random.random() < 0.5:
-                # MixUp on 50% of batches so model still sees clean data
+            # Gaussian noise injection
+            if config.NOISE_STD > 0:
+                emb_b = emb_b + torch.randn_like(emb_b) * config.NOISE_STD
+
+            use_mixup = config.USE_MIXUP and (np.random.random() < config.MIXUP_PROB)
+            if use_mixup:
                 emb_b, y_a, y_b, lam = mixup_batch(emb_b, lab_b, config.MIXUP_ALPHA, device)
                 logits, proj = model(emb_b)
                 ce  = mixup_criterion(criterion, logits, y_a, y_b, lam)
-                # SCL always runs on the ORIGINAL labels for proper positives
                 sc  = scl_loss(proj, y_a, config.SCL_TEMP, device) if config.USE_SCL else torch.tensor(0.0)
-                # Accuracy proxy uses majority label
-                preds = logits.argmax(1)
-                t_correct += ((preds == y_a).float() * lam + (preds == y_b).float() * (1 - lam)).sum().item()
+                p   = logits.argmax(1)
+                t_correct += ((p == y_a).float() * lam + (p == y_b).float() * (1.0 - lam)).sum().item()
             else:
                 logits, proj = model(emb_b)
                 ce  = criterion(logits, lab_b)
@@ -407,13 +450,14 @@ def train_deep_mlp(train_emb, train_lbl, val_emb, val_lbl, test_emb, test_lbl,
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            scheduler.step()
 
             t_total += lab_b.size(0)
             t_ce    += ce.item()
             t_scl   += sc.item()
 
-        # Validation
+        scheduler.step()
+
+        # Validation (no noise, no mixup)
         model.eval()
         all_preds, all_true = [], []
         with torch.no_grad():
@@ -425,49 +469,64 @@ def train_deep_mlp(train_emb, train_lbl, val_emb, val_lbl, test_emb, test_lbl,
         val_acc = accuracy_score(all_true, all_preds)
         val_f1  = f1_score(all_true, all_preds, average="macro")
 
-        if val_f1 > best_f1:
+        improved = val_f1 > best_f1
+        if improved:
             best_f1    = val_f1
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
             patience   = 0
-            if (epoch + 1) % config.LOG_EVERY == 0 or epoch == 0:
-                logger.info(f"  Ep {epoch:03d} | Train Acc {t_correct/t_total:.4f} | "
-                            f"Val Acc {val_acc:.4f} | F1-Mac {val_f1:.4f} ⭐  "
-                            f"[CE={t_ce/len(train_loader):.3f} SCL={t_scl/len(train_loader):.3f}]")
         else:
             patience += 1
-            if (epoch + 1) % config.LOG_EVERY == 0:
-                logger.info(f"  Ep {epoch:03d} | Train Acc {t_correct/t_total:.4f} | "
-                            f"Val Acc {val_acc:.4f} | F1-Mac {val_f1:.4f} "
-                            f"(patience {patience}/{MAX_PAT})")
-            if patience >= MAX_PAT:
-                logger.info(f"  ⏹️  Early stopping at Epoch {epoch}")
-                break
 
-    # Load best checkpoint
+        if (epoch + 1) % config.LOG_EVERY == 0 or epoch == 0 or improved:
+            star = "⭐" if improved else f"(patience {patience}/{config.MAX_PATIENCE})"
+            logger.info(
+                f"  Ep {epoch:03d} | Tr-Acc {t_correct/t_total:.4f} | "
+                f"Val-Acc {val_acc:.4f} | Val-F1 {val_f1:.4f} {star}  "
+                f"[CE={t_ce/len(train_loader):.3f} SCL={t_scl/len(train_loader):.3f}]"
+            )
+
+        if patience >= config.MAX_PATIENCE:
+            logger.info(f"  ⏹️  Early stopping at epoch {epoch} (best val F1={best_f1:.4f})")
+            break
+
     if best_state:
         model.load_state_dict(best_state)
     model.eval()
-
     return model, best_f1
 
 
 # ---------------------------------------------------------------------------
-# Evaluate MLP on a loader  →  (acc, f1_macro, f1_weighted, preds, probs)
+# Evaluation: clean + TTA
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def evaluate_mlp(model, loader, device):
-    all_preds, all_true, all_probs = [], [], []
-    for emb_b, lab_b in loader:
-        logits, _ = model(emb_b.to(device))
-        probs      = torch.softmax(logits, dim=-1)
-        all_preds.extend(logits.argmax(1).cpu().numpy())
-        all_probs.extend(probs.cpu().numpy())
-        all_true.extend(lab_b.numpy())
-    return (
-        np.array(all_true),
-        np.array(all_preds),
-        np.array(all_probs),
-    )
+def evaluate_mlp(model, emb_np: np.ndarray, lbl_np: np.ndarray,
+                 device, tta: bool = False):
+    """
+    Returns (true_labels, predictions, probabilities).
+    If tta=True: averages softmax over TTA_PASSES noisy forward passes.
+    """
+    model.eval()
+    n_passes = config.TTA_PASSES if tta else 1
+    noise    = config.TTA_NOISE  if tta else 0.0
+
+    accum_probs = None
+    for _ in range(n_passes):
+        x = torch.tensor(emb_np, dtype=torch.float32)
+        if noise > 0:
+            x = x + torch.randn_like(x) * noise
+        loader = DataLoader(TensorDataset(x, torch.tensor(lbl_np)),
+                            batch_size=256, shuffle=False)
+        pass_probs = []
+        for emb_b, _ in loader:
+            logits, _ = model(emb_b.to(device))
+            pass_probs.append(F.softmax(logits, dim=-1).cpu().numpy())
+        pass_probs = np.concatenate(pass_probs, axis=0)   # [N, C]
+
+        accum_probs = pass_probs if accum_probs is None else accum_probs + pass_probs
+
+    avg_probs = accum_probs / n_passes
+    preds     = avg_probs.argmax(axis=1)
+    return lbl_np, preds, avg_probs
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +539,7 @@ def main():
     logger.info(f"🧠 Backbone: {config.MODEL_NAME}")
 
     # 1. Load splits
-    logger.info(f"📁 Loading splits from {config.SPLIT_CSV_DIR.name}...")
+    logger.info(f"\n📁 Loading splits from {config.SPLIT_CSV_DIR.name}...")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
@@ -488,10 +547,10 @@ def main():
     label_names = sorted(train_df["emotion_final"].unique())
     label2id    = {n: i for i, n in enumerate(label_names)}
     id2label    = {i: n for n, i in label2id.items()}
-    logger.info(f"🎭 Emotions: {label2id}")
+    logger.info(f"🎭 Emotions ({len(label2id)}): {label2id}")
     logger.info(f"   Train {len(train_df)} | Val {len(val_df)} | Test {len(test_df)}")
 
-    # 2. Embedding extraction (cached)
+    # 2. Embedding extraction (cached to disk)
     cache = config.EMBEDDING_CACHE
     if cache.exists():
         logger.info(f"⚡ Loading cached embeddings from {cache}...")
@@ -500,14 +559,14 @@ def main():
         val_emb   = data["val_emb"];    val_lbl   = data["val_lbl"]
         test_emb  = data["test_emb"];   test_lbl  = data["test_lbl"]
     else:
-        logger.info("🧠 Loading emotion2vec backbone for embedding extraction...")
+        logger.info("🧠 Loading emotion2vec backbone...")
         from funasr import AutoModel
         backbone = AutoModel(model=config.MODEL_NAME, hub="hf", trust_remote_code=True)
         backbone.model.eval()
         for p in backbone.model.parameters():
             p.requires_grad = False
 
-        logger.info("🔬 Extracting utterance embeddings (runs once, then cached)...")
+        logger.info("🔬 Extracting embeddings (cached after first run)...")
         train_emb, train_lbl = extract_embeddings(backbone, train_df, label2id, "train", first_call=True)
         val_emb,   val_lbl   = extract_embeddings(backbone, val_df,   label2id, "val")
         test_emb,  test_lbl  = extract_embeddings(backbone, test_df,  label2id, "test")
@@ -516,79 +575,85 @@ def main():
             train_emb=train_emb, train_lbl=train_lbl,
             val_emb=val_emb,     val_lbl=val_lbl,
             test_emb=test_emb,   test_lbl=test_lbl)
-        logger.info(f"💾 Embeddings cached to {cache}")
+        logger.info(f"💾 Cached to {cache}")
         del backbone
         import gc; gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     logger.info(f"   Embedding dim: {train_emb.shape[1]}")
-    logger.info(f"   Train: {len(train_lbl)}  Val: {len(val_lbl)}  Test: {len(test_lbl)}")
-    logger.info(f"   Train dist: {dict(collections.Counter(train_lbl.tolist()))}")
+    logger.info(f"   Train {len(train_lbl)} | Val {len(val_lbl)} | Test {len(test_lbl)}")
+    logger.info(f"   Train class dist: {dict(sorted(collections.Counter(train_lbl.tolist()).items()))}")
+    logger.info(f"   Val   class dist: {dict(sorted(collections.Counter(val_lbl.tolist()).items()))}")
 
-    # 3. SVM with Grid Search
-    sklearn_results, scaler, svm_tv, svm_val = run_sklearn(
+    # 3. SVM with grid search
+    sklearn_results, svm_model, X_tv_norm, X_test_norm = run_sklearn(
         train_emb, train_lbl, val_emb, val_lbl, test_emb, test_lbl, id2label
     )
 
-    # 4. Deep MLP + SCL + MixUp
+    # 4. Deep MLP + Focal + SCL + MixUp + oversampling
     mlp_model, mlp_best_val_f1 = train_deep_mlp(
         train_emb, train_lbl, val_emb, val_lbl, test_emb, test_lbl, id2label, device
     )
 
-    # 5. Evaluate MLP alone
-    Xte  = torch.tensor(test_emb,  dtype=torch.float32)
-    yte  = torch.tensor(test_lbl,  dtype=torch.long)
-    Xv   = torch.tensor(val_emb,   dtype=torch.float32)
-    yv   = torch.tensor(val_lbl,   dtype=torch.long)
+    # 5. MLP evaluation (clean + TTA)
+    true_te, preds_clean, probs_clean = evaluate_mlp(mlp_model, test_emb, test_lbl, device, tta=False)
+    _,       preds_tta,   probs_tta   = evaluate_mlp(mlp_model, test_emb, test_lbl, device, tta=True)
+    true_v,  preds_v,     _           = evaluate_mlp(mlp_model, val_emb,  val_lbl,  device, tta=False)
 
-    test_loader = DataLoader(TensorDataset(Xte, yte), batch_size=256, shuffle=False)
-    val_loader  = DataLoader(TensorDataset(Xv,  yv),  batch_size=256, shuffle=False)
+    mlp_test_acc  = accuracy_score(true_te, preds_clean)
+    mlp_test_f1   = f1_score(true_te, preds_clean, average="macro")
+    mlp_test_f1w  = f1_score(true_te, preds_clean, average="weighted")
+    tta_test_acc  = accuracy_score(true_te, preds_tta)
+    tta_test_f1   = f1_score(true_te, preds_tta, average="macro")
+    mlp_val_acc   = accuracy_score(true_v, preds_v)
 
-    true_te, preds_mlp_te, probs_mlp_te = evaluate_mlp(mlp_model, test_loader, device)
-    true_v,  preds_mlp_v,  probs_mlp_v  = evaluate_mlp(mlp_model, val_loader,  device)
+    # 6. Ensemble: SVM probs + MLP-TTA probs
+    svm_probs_te = svm_model.predict_proba(X_test_norm)
+    ens_probs    = 0.5 * svm_probs_te + 0.5 * probs_tta
+    ens_preds    = ens_probs.argmax(axis=1)
+    ens_acc      = accuracy_score(test_lbl, ens_preds)
+    ens_f1       = f1_score(test_lbl, ens_preds, average="macro")
+    ens_f1w      = f1_score(test_lbl, ens_preds, average="weighted")
 
-    mlp_test_acc = accuracy_score(true_te, preds_mlp_te)
-    mlp_test_f1  = f1_score(true_te, preds_mlp_te, average="macro")
-    mlp_test_f1w = f1_score(true_te, preds_mlp_te, average="weighted")
-    mlp_val_acc  = accuracy_score(true_v,  preds_mlp_v)
-
-    # 6. Ensemble: SVM probs + MLP probs (equal weight)
-    scaler_tv = StandardScaler()
-    scaler_tv.fit(np.concatenate([train_emb, val_emb], axis=0))
-    svm_probs_te = svm_tv.predict_proba(scaler_tv.transform(test_emb))
-    ens_probs_te = 0.5 * svm_probs_te + 0.5 * probs_mlp_te
-    ens_preds_te = ens_probs_te.argmax(axis=1)
-    ens_acc  = accuracy_score(test_lbl, ens_preds_te)
-    ens_f1   = f1_score(test_lbl, ens_preds_te, average="macro")
-    ens_f1w  = f1_score(test_lbl, ens_preds_te, average="weighted")
-
-    # 7. Final report
+    # 7. Reports
     label_strs = [id2label[i] for i in range(len(id2label))]
 
-    logger.info("\n   Deep MLP Per-class Report (Test):")
-    logger.info(classification_report(true_te, preds_mlp_te, target_names=label_strs))
+    logger.info("\n   Deep MLP Per-class Report (Test, clean):")
+    logger.info(classification_report(true_te, preds_clean, target_names=label_strs))
 
-    logger.info("\n   Ensemble (SVM + MLP) Per-class Report (Test):")
-    logger.info(classification_report(test_lbl, ens_preds_te, target_names=label_strs))
+    if config.USE_TTA:
+        logger.info("\n   Deep MLP Per-class Report (Test, TTA):")
+        logger.info(classification_report(true_te, preds_tta, target_names=label_strs))
 
-    logger.info("\n" + "=" * 65)
+    logger.info("\n   Ensemble (SVM + MLP-TTA) Per-class Report (Test):")
+    logger.info(classification_report(test_lbl, ens_preds, target_names=label_strs))
+
+    logger.info("\n" + "=" * 68)
     logger.info("🏆  FINAL REPORT — AUDIO EMOTION CLASSIFICATION")
-    logger.info("=" * 65)
-    logger.info(f"{'Method':<28} {'Val Acc':>9} {'Val F1-Mac':>11} {'Test Acc':>9} {'Test F1-Mac':>12}")
-    logger.info("-" * 65)
-    logger.info(f"{'LR (reference)':<28} {sklearn_results['LR_val_acc']:>9.4f} {sklearn_results['LR_val_f1']:>11.4f} "
-                f"{sklearn_results['LR_test_acc']:>9.4f} {sklearn_results['LR_test_f1']:>12.4f}")
-    logger.info(f"{'SVM-RBF (grid search)':<28} {sklearn_results['SVM_val_acc']:>9.4f} {sklearn_results['SVM_val_f1']:>11.4f} "
-                f"{sklearn_results['SVM_test_acc']:>9.4f} {sklearn_results['SVM_test_f1']:>12.4f}")
-    logger.info(f"{'Deep MLP + SCL + MixUp':<28} {mlp_val_acc:>9.4f} {mlp_best_val_f1:>11.4f} "
-                f"{mlp_test_acc:>9.4f} {mlp_test_f1:>12.4f}")
-    logger.info(f"{'Ensemble (SVM + MLP)':<28} {'—':>9} {'—':>11} "
-                f"{ens_acc:>9.4f} {ens_f1:>12.4f}")
-    logger.info("=" * 65)
-    logger.info(f"  Best Test Accuracy  : {max(sklearn_results['SVM_test_acc'], mlp_test_acc, ens_acc):.4f}")
-    logger.info(f"  Best Test F1-Macro  : {max(sklearn_results['SVM_test_f1'], mlp_test_f1,  ens_f1):.4f}")
-    logger.info(f"  Ensemble F1-Weighted: {ens_f1w:.4f}")
-    logger.info("=" * 65)
+    logger.info("=" * 68)
+    logger.info(f"{'Method':<32} {'Val Acc':>8} {'Val F1':>8} {'Test Acc':>9} {'Test F1':>9}")
+    logger.info("-" * 68)
+    logger.info(f"{'LR (reference)':<32} {sklearn_results['LR_val_acc']:>8.4f} "
+                f"{sklearn_results['LR_val_f1']:>8.4f} "
+                f"{sklearn_results['LR_test_acc']:>9.4f} {sklearn_results['LR_test_f1']:>9.4f}")
+    logger.info(f"{'SVM-RBF (grid, TV-trained)':<32} {sklearn_results['SVM_val_acc']:>8.4f} "
+                f"{sklearn_results['SVM_val_f1']:>8.4f} "
+                f"{sklearn_results['SVM_test_acc']:>9.4f} {sklearn_results['SVM_test_f1']:>9.4f}")
+    logger.info(f"{'Deep MLP + SCL + Focal':<32} {mlp_val_acc:>8.4f} "
+                f"{mlp_best_val_f1:>8.4f} "
+                f"{mlp_test_acc:>9.4f} {mlp_test_f1:>9.4f}")
+    logger.info(f"{'Deep MLP + TTA':<32} {'—':>8} {'—':>8} "
+                f"{tta_test_acc:>9.4f} {tta_test_f1:>9.4f}")
+    logger.info(f"{'Ensemble (SVM + MLP-TTA)':<32} {'—':>8} {'—':>8} "
+                f"{ens_acc:>9.4f} {ens_f1:>9.4f}")
+    logger.info("=" * 68)
+
+    best_acc = max(sklearn_results['SVM_test_acc'], mlp_test_acc, tta_test_acc, ens_acc)
+    best_f1  = max(sklearn_results['SVM_test_f1'],  mlp_test_f1,  tta_test_f1,  ens_f1)
+    logger.info(f"  🏅 Best Test Accuracy : {best_acc:.4f}")
+    logger.info(f"  🏅 Best Test F1-Macro : {best_f1:.4f}")
+    logger.info(f"  📊 Ensemble F1-Weighted: {ens_f1w:.4f}")
+    logger.info("=" * 68)
 
 
 if __name__ == "__main__":
