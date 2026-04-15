@@ -42,19 +42,24 @@ if IS_COLAB:
         DATA_ROOT = Path("/content/drive/MyDrive/Thesis Project")
     print(f"✅ DATA_ROOT: {DATA_ROOT}")
 
-    CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_v6")
+    CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_fusion")
     # Save cache directly to Drive so it survives Colab disconnections!
-    EMBEDDING_CACHE = Path("/content/drive/MyDrive/Thesis Project/audio_emb_v6.npz")
+    EMBEDDING_CACHE = Path("/content/drive/MyDrive/Thesis Project/audio_emb_fusion_v1.npz")
 else:
     DATA_ROOT       = Path("dataset/Final Modalink Dataset MERGED")
     SPLIT_CSV_DIR   = Path("data/processed/splits/audio_eligible")
-    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_v6")
-    EMBEDDING_CACHE = Path("audio_emb_v6.npz")
+    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_fusion")
+    EMBEDDING_CACHE = Path("audio_emb_fusion_v1.npz")
 
 # ---------------------------------------------------------------------------
-# BACKBONE
+# BACKBONES (FEATURE FUSION)
 # ---------------------------------------------------------------------------
-MODEL_NAME = "iic/emotion2vec_plus_base"   # proven better than large on this data
+# 1. emotion2vec (speech emotion semantics)
+# 2. wav2vec2-emotion (fine-tuned representation)
+# 3. AST (spectral / acoustic features)
+MODEL_NAME = "iic/emotion2vec_plus_base"
+W2V2_NAME  = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
+AST_NAME   = "MIT/ast-finetuned-audioset-10-10-0.4593"
 
 # ---------------------------------------------------------------------------
 # AUDIO
