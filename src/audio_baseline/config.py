@@ -43,7 +43,7 @@ else:
 # --- POWER MODE CONFIG ---
 USE_SCL = True
 SCL_WEIGHT = 0.5         # How much to focus on clustering emotions
-UNFREEZE_EPOCH = 5       # We start deep fine-tuning at this epoch
+UNFREEZE_EPOCH = 3       # We start deep fine-tuning earlier to boost accuracy 🚀
 SCL_TEMP = 0.1           # Temperature for contrastive loss
 
 # --- MODEL CONFIG ---

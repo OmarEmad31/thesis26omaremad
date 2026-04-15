@@ -69,20 +69,14 @@ class Emotion2VecBaseline(nn.Module):
         else:
             last_hidden_state = outputs
             
-        # 3. Global Average Pooling 
-        # Ensure it's a tensor before calling mean()
-        if not isinstance(last_hidden_state, torch.Tensor):
-            # Emergency fallback: if it's still not a tensor, try its first attribute
-            last_hidden_state = last_hidden_state[0] if hasattr(last_hidden_state, "__getitem__") else last_hidden_state
-
-        embeddings = torch.mean(last_hidden_state, dim=1)
-        # 4. BiLSTM + Classification Head
-        # Reshape for LSTM: [batch, sequence_len=1, hidden_size=768]
-        x = embeddings.unsqueeze(1) 
-        lstm_out, _ = self.lstm(x)
+        # 3. Temporal Processing (BiLSTM)
+        # last_hidden_state is [batch, seq_len, 768]
+        # We pass the FULL sequence into the BiLSTM so it can hear the timeline
+        lstm_out, _ = self.lstm(last_hidden_state)
         
-        # Pooled output from LSTM [batch, 512]
-        pooled = lstm_out.squeeze(1)
+        # 4. Global Max Pooling (Better for catching emotional peaks)
+        # We take the maximum value over the time dimension (dim=1)
+        pooled = torch.max(lstm_out, dim=1)[0]
         
         # 5. Final Classification
         logits = self.classifier(pooled)
