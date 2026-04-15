@@ -285,15 +285,16 @@ def main():
     # 4. Initialize Model & Training Tools
     # --- DIAGNOSTIC: Check physical file existence ---
     logger.info(f"🔍 Diagnostic: Checking first few paths in {config.DATA_ROOT}...")
-    sample_paths = train_df['path'].head(3).tolist()
-    for sp in sample_paths:
-        full_p = config.DATA_ROOT / sp
+    for idx, row in train_df.head(3).iterrows():
+        folder = str(row["folder"]).strip()
+        rel_path = str(row["audio_relpath"]).replace("\\", "/").lstrip("/")
+        full_p = config.DATA_ROOT / folder / rel_path
         exists = full_p.exists()
-        logger.info(f"   - {'✅' if exists else '❌'} {sp}")
+        logger.info(f"   - {'✅' if exists else '❌'} {folder}/{rel_path}")
         if not exists:
             # Check for common zip-folder patterns
             for sub in config.DATA_ROOT.iterdir():
-                if sub.is_dir() and (sub / sp).exists():
+                if sub.is_dir() and (sub / folder / rel_path).exists():
                     logger.info(f"     💡 FOUND IN SUBFOLDER: {sub.name}")
                     break
 
