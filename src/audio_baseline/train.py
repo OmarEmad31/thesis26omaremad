@@ -25,13 +25,12 @@ from tqdm import tqdm
 
 from transformers import (
     AutoModelForAudioClassification,
-    Wav2Vec2FeatureExtractor,
+    AutoFeatureExtractor,
     Trainer,
     TrainingArguments,
     EarlyStoppingCallback,
     set_seed,
 )
-from peft import LoraConfig, get_peft_model
 from transformers import logging as hf_log
 
 # Silence HF / Librosa warnings for a clean minimalist terminal
@@ -141,16 +140,22 @@ def load_audio_features(df, label2id, feature_extractor):
         except Exception:
             continue
             
-    # Process instantly in memory
+    # Process instantly in memory (Whisper requires 30s padding natively, AutoFeatureExtractor handles this!)
     inputs = feature_extractor(features, sampling_rate=config.SAMPLING_RATE, padding=True, 
                                max_length=config.MAX_AUDIO_SAMPLES, truncation=True, return_tensors="pt")
     
     # Store directly into HF dataset
-    return Dataset.from_dict({
-        "input_values": inputs.input_values,
-        "attention_mask": inputs.attention_mask,
-        "labels": labels
-    })
+    # Whisper explicitly generates and expects `input_features`, while w2v2 used `input_values`.
+    ds_dict = {"labels": labels}
+    if "input_features" in inputs:
+        ds_dict["input_features"] = inputs.input_features
+    elif "input_values" in inputs:
+        ds_dict["input_values"] = inputs.input_values
+        
+    if "attention_mask" in inputs:
+        ds_dict["attention_mask"] = inputs.attention_mask
+        
+    return Dataset.from_dict(ds_dict)
 
 # ==============================================================================
 # MAIN RUNNER
@@ -177,7 +182,7 @@ def main() -> None:
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=config.SEED)
     
     # 3. Load feature extractor
-    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.MODEL_NAME)
+    feature_extractor = AutoFeatureExtractor.from_pretrained(config.MODEL_NAME)
 
     print(f"\n🚀 Minimalist End-to-End Audio Training")
     print(f"Model: {config.MODEL_NAME} | Epochs: {config.NUM_EPOCHS}")
@@ -215,26 +220,20 @@ def main() -> None:
             ignore_mismatched_sizes=True 
         )
         
-        # 🧊 METHOD A: LORA (LOW-RANK ADAPTATION)
-        # We physically freeze all 300 Million pristine English Emotion parameters so we don't 
-        # blow up Colab or cause Catastrophic Forgetting. We explicitly target the attention matrices (`q_proj`, `v_proj`)
-        # injecting a tiny ~2-3 Million parameter matrix strictly designed to warp the English 
-        # rhythmic mappings into the nuances of Egyptian Arabic cadences.
-        peft_config = LoraConfig(
-            task_type="SEQ_CLS", 
-            r=config.LORA_R, 
-            lora_alpha=config.LORA_ALPHA, 
-            lora_dropout=config.LORA_DROPOUT,
-            # Target the standard Wav2Vec2 self-attention projections
-            target_modules=["q_proj", "v_proj"]
-        )
-        
-        # Wrap it! This automatically freezes the base model and unlocks just the LoRA adapters + new PyTorch head.
-        model = get_peft_model(model, peft_config)
-        
+        # 🧊 WHISPER ENCODER ISOLATION (EGYPTIAN ARABIC STRATEGY)
+        # Instead of generic model loading, we load the powerful Whisper sequence classifier,
+        # but completely freeze its multi-dialectal encoder. We allow the small classification head
+        # to freely rapidly learn the mapping of Egyptian prosody to the given emotion classes.
+        for name, param in model.named_parameters():
+            if "classifier" not in name and "projector" not in name:
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+
         if fold_idx == 0:
-            print("\n🔍 Parameter Efficiency Check (Method A: LoRA):")
-            model.print_trainable_parameters()
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in model.parameters())
+            print(f"\n🔍 Whisper Acoustic Encoder Ready: Training {trainable_params:,} / {total_params:,} params.")
             print()
 
         training_args = TrainingArguments(
