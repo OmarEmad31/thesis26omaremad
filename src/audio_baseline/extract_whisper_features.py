@@ -55,10 +55,18 @@ def main():
         for idx, row in tqdm(all_df.iterrows(), total=len(all_df)):
             fldr = str(row["folder"]).strip()
             rel = str(row["audio_relpath"]).replace("\\", "/").lstrip("/")
-            audio_path = config.DATA_ROOT / fldr / rel
             
+            # Bulletproof path resolving for varying Colab extraction structures
+            audio_path = config.DATA_ROOT / fldr / rel
             if not audio_path.exists():
-                print(f"[Warning] Missing file: {audio_path}")
+                audio_path = Path("/content/Thesis Project") / fldr / rel
+            if not audio_path.exists():
+                audio_path = config.DATA_ROOT / rel
+            if not audio_path.exists():
+                audio_path = Path("/content/drive/MyDrive/Thesis Project") / fldr / rel
+                
+            if not audio_path.exists():
+                print(f"[Warning] Missing file: {rel}")
                 continue
                 
             try:
