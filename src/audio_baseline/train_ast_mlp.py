@@ -9,7 +9,6 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.utils.class_weight import compute_class_weight
 from pathlib import Path
 import random
-from tqdm import tqdm
 
 import sys
 project_root = str(Path(__file__).parent.parent.parent.absolute())
@@ -49,31 +48,45 @@ class SupervisedContrastiveLoss(nn.Module):
         return torch.tensor(0.0, device=features.device, requires_grad=True)
 
 # ==============================================================================
-# MLP ARCHITECTURE
+# MULTI-SAMPLE DROPOUT (Upgraded Neural Stabilization)
 # ==============================================================================
+class MultiSampleDropout(nn.Module):
+    def __init__(self, in_features, out_features, num_samples=5, p=0.4):
+        super().__init__()
+        self.dropouts = nn.ModuleList([nn.Dropout(p) for _ in range(num_samples)])
+        self.classifier = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        # Passes the identical features through 5 parallel mutated dropouts and averages them
+        # mathematically guaranteeing regularization.
+        out = None
+        for dropout in self.dropouts:
+            if out is None:
+                out = self.classifier(dropout(x))
+            else:
+                out += self.classifier(dropout(x))
+        return out / len(self.dropouts)
+
 class AST_MLP(nn.Module):
     def __init__(self, input_dim=768, hidden_dim=256, num_labels=7):
         super().__init__()
-        # AST Embeddings natively map to 768 dimensions representing vision chunks
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.dropout1 = nn.Dropout(0.4)
+        self.dropout1 = nn.Dropout(0.3)
         
         self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.bn2 = nn.BatchNorm1d(hidden_dim // 2)
-        self.dropout2 = nn.Dropout(0.4)
         
-        self.classifier = nn.Linear(hidden_dim // 2, num_labels)
+        # Improvement 1: Multi-Sample Dropout Injection
+        self.msd = MultiSampleDropout(hidden_dim // 2, num_labels, num_samples=5, p=0.4)
 
     def forward(self, x):
         features = F.gelu(self.bn1(self.fc1(x)))
         features = self.dropout1(features)
         
-        # We extract this embedded feature vector precisely for SCL tracking!
         pooled_output = F.gelu(self.bn2(self.fc2(features)))
-        pooled_output = self.dropout2(pooled_output)
+        logits = self.msd(pooled_output)
         
-        logits = self.classifier(pooled_output)
         return logits, pooled_output
 
 # ==============================================================================
@@ -86,58 +99,83 @@ def set_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
+def evaluate_metrics(model, dataloader, device):
+    all_preds, all_truth = [], []
+    model.eval()
+    with torch.no_grad():
+        for batch_x, batch_y in dataloader:
+            batch_x = batch_x.to(device)
+            logits, _ = model(batch_x)
+            all_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+            all_truth.extend(batch_y.numpy())
+    acc = accuracy_score(all_truth, all_preds)
+    f1 = f1_score(all_truth, all_preds, average="macro")
+    return acc, f1
+
 def main():
     set_seed(config.SEED)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    print("🚀 Initiating Fast-Track Local AST MLP Architecture...")
+    print("🚀 Initiating Methodologically-Upgraded AST MLP (With Multi-Sample Dropout & LR Scaling)...")
     
-    # 1. Load the Offline Cached Database instantly
     data_path = config.OFFLINE_FEATURES_DIR / "ast_dataset.pkl"
     if not data_path.exists():
         print(f"[FATAL ERROR] AST Offline Vision features not found at {data_path}")
-        print("You must run 'python -m src.audio_baseline.extract_ast_features' first!")
         return
         
     df = pd.read_pickle(data_path)
-    print(f"Loaded {len(df)} pre-computed AST arrays seamlessly.")
+    
+    # ISOLATE TEST SET
+    test_df = df[df['split'] == 'test']
+    train_val_df = df[df['split'] != 'test'].reset_index(drop=True)
+    
+    print(f"Loaded {len(train_val_df)} K-Fold Training arrays | Loaded {len(test_df)} Blind Test arrays.")
 
     label2id = {lbl: i for i, lbl in enumerate(sorted(df["emotion_final"].unique()))}
-    id2label = {i: lbl for lbl, i in label2id.items()}
     num_labels = len(label2id)
 
-    X = np.stack(df["ast_features"].values)
-    y = np.array([label2id[lbl] for lbl in df["emotion_final"]])
+    X_trainval = np.stack(train_val_df["ast_features"].values)
+    y_trainval = np.array([label2id[lbl] for lbl in train_val_df["emotion_final"]])
+    
+    X_test = np.stack(test_df["ast_features"].values)
+    y_test = np.array([label2id[lbl] for lbl in test_df["emotion_final"]])
+    
+    test_loader = DataLoader(TensorDataset(
+        torch.tensor(X_test, dtype=torch.float32), 
+        torch.tensor(y_test, dtype=torch.long)
+    ), batch_size=config.BATCH_SIZE, shuffle=False)
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=config.SEED)
-    all_fold_f1 = []
+    
+    metrics_log = []
 
-    for fold_idx, (train_index, val_index) in enumerate(skf.split(X, y)):
+    for fold_idx, (train_index, val_index) in enumerate(skf.split(X_trainval, y_trainval)):
         print(f"\n========================================")
         print(f"🔥 AST FOLD {fold_idx + 1} / 5")
         print(f"========================================")
         
-        X_train, X_val = torch.tensor(X[train_index], dtype=torch.float32), torch.tensor(X[val_index], dtype=torch.float32)
-        y_train, y_val = torch.tensor(y[train_index], dtype=torch.long), torch.tensor(y[val_index], dtype=torch.long)
+        X_tr, X_va = torch.tensor(X_trainval[train_index], dtype=torch.float32), torch.tensor(X_trainval[val_index], dtype=torch.float32)
+        y_tr, y_va = torch.tensor(y_trainval[train_index], dtype=torch.long), torch.tensor(y_trainval[val_index], dtype=torch.long)
         
-        train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=config.BATCH_SIZE, shuffle=True)
-        val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=config.BATCH_SIZE, shuffle=False)
+        train_loader = DataLoader(TensorDataset(X_tr, y_tr), batch_size=config.BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(TensorDataset(X_va, y_va), batch_size=config.BATCH_SIZE, shuffle=False)
 
-        # Handle class imbalance explicitly natively inside CE Loss
-        class_w = compute_class_weight("balanced", classes=np.unique(y_train.numpy()), y=y_train.numpy())
+        class_w = compute_class_weight("balanced", classes=np.unique(y_trainval[train_index]), y=y_trainval[train_index])
         ce_loss_fn = nn.CrossEntropyLoss(weight=torch.tensor(class_w, dtype=torch.float32).to(device))
         scl_loss_fn = SupervisedContrastiveLoss(temperature=config.SCL_TEMP)
 
-        model = AST_MLP(input_dim=X.shape[1], num_labels=num_labels).to(device)
+        model = AST_MLP(input_dim=X_trainval.shape[1], num_labels=num_labels).to(device)
+        
+        # Improvement 2: Aggressive LR Kinetics with Cosine Annealing to pierce Local Minima
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
 
         best_f1 = 0
+        best_model_weights = None
         patience = 0
 
-        # Sub-10 Second Training Loop
         for epoch in range(1, config.NUM_EPOCHS + 1):
             model.train()
-            epoch_loss = 0
             
             for batch_x, batch_y in train_loader:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
@@ -145,47 +183,54 @@ def main():
                 
                 logits, pooled_out = model(batch_x)
                 
-                # Hybrid Loss
                 loss_ce = ce_loss_fn(logits, batch_y)
                 loss_scl = scl_loss_fn(pooled_out, batch_y)
                 loss = (1 - config.SCL_WEIGHT) * loss_ce + config.SCL_WEIGHT * loss_scl
                 
                 loss.backward()
                 optimizer.step()
-                epoch_loss += loss.item()
                 
-            model.eval()
-            val_preds, val_truth = [], []
-            with torch.no_grad():
-                for batch_x, batch_y in val_loader:
-                    batch_x = batch_x.to(device)
-                    logits, _ = model(batch_x)
-                    val_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
-                    val_truth.extend(batch_y.numpy())
-                    
-            val_acc = accuracy_score(val_truth, val_preds)
-            val_f1 = f1_score(val_truth, val_preds, average="macro")
+            scheduler.step()
             
-            # Print every 5 epochs since it executes almost instantly
+            # Improvement 3: Explicit Metric Matrix evaluation per requested constraint
+            train_acc, train_f1 = evaluate_metrics(model, train_loader, device)
+            val_acc, val_f1 = evaluate_metrics(model, val_loader, device)
+            
             if epoch % 5 == 0 or epoch == 1:
-                print(f"Epoch {epoch:2d}/{config.NUM_EPOCHS} | Train Loss: {epoch_loss/len(train_loader):.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}")
+                print(f"Epoch {epoch:2d}/{config.NUM_EPOCHS} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f}")
             
             if val_f1 > best_f1:
                 best_f1 = val_f1
+                best_model_weights = model.state_dict().copy()
                 patience = 0
             else:
                 patience += 1
                 
             if patience >= config.EARLY_STOP_PATIENCE:
-                print(f"🛑 Overfitting Prevention (Early Stopping) triggered. Best F1: {best_f1:.4f}")
+                print(f"🛑 Plateau Avoidance (Early Stopping). Best Val F1 fixed at: {best_f1:.4f}")
                 break
                 
-        all_fold_f1.append(best_f1)
-        print(f"✅ AST Fold {fold_idx + 1} Best Marco F1: {best_f1 * 100:.2f}%")
+        # Load best weights to test blindly against the locked test set
+        model.load_state_dict(best_model_weights)
+        test_acc, test_f1 = evaluate_metrics(model, test_loader, device)
+        
+        print(f"✅ FOLD {fold_idx + 1} EXPLICIT TRUTH: Val Acc: {val_acc*100:.1f}% | Test Acc: {test_acc*100:.1f}% | Test F1 Macro: {test_f1*100:.1f}%")
+        
+        metrics_log.append({
+            "val_acc": val_acc, "val_f1": best_f1,
+            "test_acc": test_acc, "test_f1": test_f1
+        })
 
-    mean_f1 = np.mean(all_fold_f1)
+    # Massive Summary
+    mean_val_f1 = np.mean([m['val_f1'] for m in metrics_log])
+    mean_test_acc = np.mean([m['test_acc'] for m in metrics_log])
+    mean_test_f1 = np.mean([m['test_f1'] for m in metrics_log])
+    
     print(f"\n========================================")
-    print(f"🏆 ALL AST FOLDS COMPLETE. Mean F1 Macro: {mean_f1 * 100:.2f}%")
+    print(f"🏆 AST ARCHITECTURE VALIDATED ON TEST DATASET 🏆")
+    print(f"Mean Validation F1: {mean_val_f1 * 100:.2f}%")
+    print(f"Mean Test Accuracy: {mean_test_acc * 100:.2f}%")
+    print(f"Mean Test F1 Macro: {mean_test_f1 * 100:.2f}%")
     print(f"========================================")
 
 if __name__ == "__main__":

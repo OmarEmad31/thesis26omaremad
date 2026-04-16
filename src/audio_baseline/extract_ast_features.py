@@ -27,9 +27,11 @@ def main():
     
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
+    test_df = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
     train_df['split'] = 'train'
     val_df['split'] = 'val'
-    all_df = pd.concat([train_df, val_df], ignore_index=True)
+    test_df['split'] = 'test'
+    all_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
     
     print("Mapping audio files securely natively on disk...")
     audio_map = {}
