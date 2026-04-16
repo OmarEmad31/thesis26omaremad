@@ -49,8 +49,8 @@ else:
 # ---------------------------------------------------------------------------
 # MODEL CONFIGURATION (SOTA TRANSFORMER)
 # ---------------------------------------------------------------------------
-# Tarteel's Whisper setup physically maps Arabic semantics and phonetics organically.
-MODEL_NAME        = "tarteel-ai/whisper-base-ar"
+# We use OpenAI's Whisper Small. Because it was trained broadly on YouTube, it natively clusters Egyptian Arabic cadences organically without needing gated access.
+MODEL_NAME        = "openai/whisper-small"
 N_MELS            = 128
 HOP_LENGTH        = 512
 
