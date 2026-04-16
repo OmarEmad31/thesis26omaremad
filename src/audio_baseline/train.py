@@ -20,10 +20,37 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.audio_baseline import config
-from src.text_baseline.train import SupervisedContrastiveLoss
 
 import warnings
 warnings.filterwarnings("ignore")
+
+# ==============================================================================
+# SUPERVISED CONTRASTIVE LOSS
+# ==============================================================================
+class SupervisedContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, features, labels):
+        features = F.normalize(features, p=2, dim=1)
+        similarity = torch.matmul(features, features.T) / self.temperature
+        mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float()
+        batch_size = labels.size(0)
+        logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=mask.device)
+        mask = mask * logits_mask
+        
+        max_sim, _ = torch.max(similarity, dim=1, keepdim=True)
+        sim_stable = similarity - max_sim.detach()
+        
+        exp_sim = torch.exp(sim_stable) * logits_mask
+        log_prob = sim_stable - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+        
+        valid_anchors = mask.sum(1) > 0  
+        if valid_anchors.any():
+            mean_log_prob_pos = (mask[valid_anchors] * log_prob[valid_anchors]).sum(1) / (mask[valid_anchors].sum(1) + 1e-8)
+            return -mean_log_prob_pos.mean()
+        return torch.tensor(0.0, device=features.device, requires_grad=True)
 
 # ==============================================================================
 # SPECAUGMENT: The Acoustic Generalizer
