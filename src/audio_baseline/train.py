@@ -28,6 +28,7 @@ from transformers import (
     Wav2Vec2FeatureExtractor,
     Trainer,
     TrainingArguments,
+    EarlyStoppingCallback,
     set_seed,
 )
 from transformers import logging as hf_log
@@ -150,6 +151,41 @@ def load_audio_features(df, label2id, feature_extractor):
         "labels": labels
     })
 
+def get_optimizer_grouped_parameters(model, base_lr, layerwise_lr_decay):
+    """Build parameter groups with layer-wise learning rate decay (LLRD) for Wav2Vec2."""
+    encoder_layers = model.wav2vec2.encoder.layers
+    num_layers = len(encoder_layers)
+    params = []
+    
+    # 1. Classifier head + projector gets full LR (no decay)
+    head_params = {
+        "params": [p for n, p in model.named_parameters() if "classifier" in n or "projector" in n],
+        "weight_decay": 0.0,
+        "lr": base_lr,
+    }
+    params.append(head_params)
+    
+    # 2. Base embeddings/convolutions get lowest LR
+    emb_lr = base_lr * (layerwise_lr_decay ** (num_layers + 1))
+    emb_params = {
+        "params": [p for n, p in model.named_parameters() if "feature_extractor" in n or "feature_projection" in n],
+        "weight_decay": 0.01,
+        "lr": emb_lr,
+    }
+    params.append(emb_params)
+    
+    # 3. Intermediate encoder layers get gradually decaying LR
+    # Layer 11 gets `base_lr * decay^1`, Layer 0 gets `base_lr * decay^12`
+    for i in range(num_layers):
+        lr = base_lr * (layerwise_lr_decay ** (num_layers - i))
+        layer_params = {
+            "params": [p for n, p in model.named_parameters() if f"encoder.layers.{i}." in n],
+            "weight_decay": 0.01,
+            "lr": lr,
+        }
+        params.append(layer_params)
+        
+    return params
 
 # ==============================================================================
 # MAIN RUNNER
@@ -211,20 +247,14 @@ def main() -> None:
 
         model = AutoModelForAudioClassification.from_pretrained(
             config.MODEL_NAME, num_labels=num_labels, id2label=id2label, label2id=label2id,
-            ignore_mismatched_sizes=True # Ignore pre-trained heads that have different num classes
+            ignore_mismatched_sizes=True 
         )
         
-        # 🧊 FREEZE THE ENTIRE BACKBONE
-        # The audeering model is already brilliantly fine-tuned for emotion. 
-        # If we open up the transformer to 5 or 40 epochs on just 640 Arabic samples, it catastrophically forgets!
-        # We freeze everything so only the classification head learns (exactly like the SVM did, but purely in PyTorch).
-        for param in model.wav2vec2.parameters():
-            param.requires_grad = False
+        # 🧊 Unfreeze deeply, but protect the basic sound extractors
+        model.freeze_feature_encoder()
+        for param in model.wav2vec2.encoder.layers.parameters():
+            param.requires_grad = True # Fully opened!
         
-        # Just to be strictly safe
-        model.classifier.weight.requires_grad = True
-        model.classifier.bias.requires_grad = True
-
         training_args = TrainingArguments(
             output_dir=str(fold_out_dir),
             learning_rate=config.LEARNING_RATE,
@@ -235,12 +265,30 @@ def main() -> None:
             weight_decay=config.WEIGHT_DECAY,
             warmup_ratio=config.WARMUP_RATIO,
             eval_strategy="epoch",  
-            save_strategy="no",  # Kept exactly as text baseline
-            load_best_model_at_end=False,
-            logging_steps=5,     # Changed from 50 to 5 so we see progress instantly!
+            save_strategy="epoch",  # EarlyStopping requires saving aligned with eval
+            load_best_model_at_end=True, # Protect the peak weights!
+            metric_for_best_model="f1_macro",
+            save_total_limit=1,
+            logging_steps=5,     
             seed=config.SEED + fold_idx,
             report_to="none",
+            disable_tqdm=False, # Explicitly guarantee visual progress bars
             dataloader_pin_memory=False,
+        )
+
+        grouped_params = get_optimizer_grouped_parameters(
+            model, 
+            base_lr=config.LEARNING_RATE, 
+            layerwise_lr_decay=config.LLRD_DECAY
+        )
+        optimizer = torch.optim.AdamW(grouped_params)
+        
+        num_train_steps = (len(train_ds) // config.BATCH_SIZE // config.GRAD_ACCUM_STEPS) * config.NUM_EPOCHS
+        from transformers import get_linear_schedule_with_warmup
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, 
+            num_warmup_steps=int(num_train_steps * config.WARMUP_RATIO), 
+            num_training_steps=num_train_steps
         )
 
         trainer = SCLTrainer(
@@ -253,10 +301,13 @@ def main() -> None:
             class_weights=class_weights_tensor,
             scl_temp=config.SCL_TEMP,
             scl_weight=config.SCL_WEIGHT,
+            optimizers=(optimizer, scheduler),
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=config.EARLY_STOP_PATIENCE)]
         )
 
         print(f"🔥 Kicking off Trainer loop for Fold {fold_idx} (Watch for the progress bar...)")
         trainer.train()
+        # Save explicitly at end ensures the `best_model` is what remains in the directory
         trainer.save_model(str(best_dir))
         
         if fold_idx == 0:

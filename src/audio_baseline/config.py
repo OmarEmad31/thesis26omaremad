@@ -59,12 +59,14 @@ SAMPLING_RATE     = 16000
 MAX_DURATION_SEC  = 10   # Max seconds of audio per sample
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
-BATCH_SIZE        = 4    # Lowered drastically to prevent strictly OOM!
+BATCH_SIZE        = 4    
 GRAD_ACCUM_STEPS  = 8    # 4 * 8 = 32 effective batch size
 NUM_EPOCHS        = 40
-LEARNING_RATE     = 1e-3  # High learning rate because we are only training the classification head
+LEARNING_RATE     = 1e-4  # Base LR for classification head (much lower now because we aren't frozen)
+LLRD_DECAY        = 0.9   # Layer-wise Learning Rate Decay for the transformer layers
+EARLY_STOP_PATIENCE = 4   # Stop if F1 doesn't improve for 4 epochs
 WEIGHT_DECAY      = 0.05
-WARMUP_RATIO      = 0.05
+WARMUP_RATIO      = 0.1
 
 # SCL Settings
 USE_SCL           = True
