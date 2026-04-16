@@ -38,16 +38,20 @@ if IS_COLAB:
     if not DATA_ROOT:
         DATA_ROOT = Path("/content/drive/MyDrive/Thesis Project")
 
-    CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_acoustic")
+    CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_ast")
+    OFFLINE_FEATURES_DIR = Path("/content/drive/MyDrive/Thesis Project/data/processed/ast_offline")
 else:
     DATA_ROOT       = Path("dataset/Final Modalink Dataset MERGED")
     SPLIT_CSV_DIR   = Path("data/processed/splits/audio_eligible")
-    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_acoustic")
+    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_ast")
+    OFFLINE_FEATURES_DIR = Path("data/processed/ast_offline")
 
 # ---------------------------------------------------------------------------
-# MODEL CONFIGURATION (PURE PYTORCH ACOUSTICS)
+# MODEL CONFIGURATION (SOTA TRANSFORMER)
 # ---------------------------------------------------------------------------
-# Completely abandoned heavy Sequence Transformers. We use pure librosa Mel-Spectrograms.
+# MIT's Audio Spectrogram Transformer (AST). 
+# Chosen to bypass Arabic linguistic bias by utilizing Vision Transformer logic over frequencies.
+MODEL_NAME        = "MIT/ast-finetuned-audioset-10-10-0.4593"
 N_MELS            = 128
 HOP_LENGTH        = 512
 
@@ -60,11 +64,11 @@ SAMPLING_RATE     = 16000
 MAX_DURATION_SEC  = 10   
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
-BATCH_SIZE        = 32    # Acoustic batches are extremely light, allowing large arrays
-NUM_EPOCHS        = 100   # Fast Custom CNN-LSTM trains rapidly, allowing deep exploration
-LEARNING_RATE     = 1e-3  
-EARLY_STOP_PATIENCE = 15  # More patience since acoustic patterns take a bit to generalize
-WEIGHT_DECAY      = 0.01  
+BATCH_SIZE        = 32    
+NUM_EPOCHS        = 50    
+LEARNING_RATE     = 1e-4  
+EARLY_STOP_PATIENCE = 10  
+WEIGHT_DECAY      = 0.05  
 WARMUP_RATIO      = 0.1
 
 # SCL Settings
@@ -73,3 +77,4 @@ SCL_TEMP          = 0.1
 SCL_WEIGHT        = 0.1
 
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+OFFLINE_FEATURES_DIR.mkdir(parents=True, exist_ok=True)
