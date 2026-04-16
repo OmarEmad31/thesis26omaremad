@@ -42,9 +42,9 @@ BATCH_SIZE     = 8            # safe on A100 with 4-sec sequences + LoRA
 LORA_R         = 8
 LORA_ALPHA     = 16
 LORA_DROPOUT   = 0.1
-LEARNING_RATE  = 1e-4
+LEARNING_RATE  = 5e-4         # 5x higher — LoRA adapters need aggressive initial kick
 NUM_EPOCHS     = 20
-PATIENCE       = 5
+PATIENCE       = 6
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SUPERVISED CONTRASTIVE LOSS
@@ -139,7 +139,7 @@ def build_lora_model(num_labels, device):
 # ──────────────────────────────────────────────────────────────────────────────
 # TRAIN / EVAL HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
-def train_epoch(model, loader, optimizer, ce_fn, scl_fn, device):
+def train_epoch(model, loader, optimizer, ce_fn, scl_fn, device, scheduler=None):
     model.train()
     total_loss = 0.0
     for batch in tqdm(loader, desc="  Training", leave=False):
@@ -159,6 +159,8 @@ def train_epoch(model, loader, optimizer, ce_fn, scl_fn, device):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if scheduler is not None:   # OneCycleLR steps per-batch
+            scheduler.step()
         total_loss += loss.item()
 
     return total_loss / len(loader)
@@ -248,15 +250,22 @@ def main():
 
         model     = build_lora_model(num_labels, device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+        # OneCycleLR: ramps up fast then anneals — far more aggressive than CosineAnnealing
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=LEARNING_RATE,
+            steps_per_epoch=len(train_loader),
+            epochs=NUM_EPOCHS,
+            pct_start=0.1,       # spend 10% of total steps warming up
+            anneal_strategy='cos'
+        )
 
         best_val_f1 = 0.0
         no_improve  = 0
         ckpt_path   = lora_ckpt_dir / f"fold_{fold_idx}_best.pt"
 
         for epoch in range(1, NUM_EPOCHS + 1):
-            loss = train_epoch(model, train_loader, optimizer, ce_fn, scl_fn, device)
-            scheduler.step()
+            loss = train_epoch(model, train_loader, optimizer, ce_fn, scl_fn, device, scheduler)
             train_acc, train_f1 = evaluate(model, train_loader, device)
             val_acc,   val_f1   = evaluate(model, val_loader,   device)
 
