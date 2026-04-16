@@ -47,8 +47,9 @@ else:
 # ---------------------------------------------------------------------------
 # MODEL CONFIGURATION (PURE HUGGINGFACE)
 # ---------------------------------------------------------------------------
-# We use the Arabic-specific XLSR model to inherently understand phonetic cadence
-MODEL_NAME = "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
+# We revert back to the pristine Emotion backbone. It intrinsically understands emotion clusters,
+# and we will use LoRA to specifically translate those boundary mappings into Egyptian Arabic rhythm.
+MODEL_NAME = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
 
 # ---------------------------------------------------------------------------
 # TRAINING HYPERPARAMETERS (Matched to Text Baseline)
@@ -59,13 +60,18 @@ SAMPLING_RATE     = 16000
 MAX_DURATION_SEC  = 10   # Max seconds of audio per sample
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
-BATCH_SIZE        = 16    # We can handle larger batches since the 300M parameter backbone is entirely frozen again!
-GRAD_ACCUM_STEPS  = 2     # 16 * 2 = 32 effective batch size
+BATCH_SIZE        = 8     # Safe for LoRA computation
+GRAD_ACCUM_STEPS  = 4     # 8 * 4 = 32 effective batch size
 NUM_EPOCHS        = 40
-LEARNING_RATE     = 1e-3  # Fast learning rate because we are strictly training the new PyTorch classification head
+LEARNING_RATE     = 3e-4  # Optimal PEFT adapter learning rate
 EARLY_STOP_PATIENCE = 5   # Stop if F1 doesn't improve for 5 epochs
 WEIGHT_DECAY      = 0.05
 WARMUP_RATIO      = 0.1
+
+# LoRA / PEFT Settings for Egyptian Arabic Dialectal Shift
+LORA_R            = 16    # Rank of the adapter injected into the attention layers
+LORA_ALPHA        = 32    # Scaling factor
+LORA_DROPOUT      = 0.1
 
 # SCL Settings
 USE_SCL           = True

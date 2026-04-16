@@ -31,6 +31,7 @@ from transformers import (
     EarlyStoppingCallback,
     set_seed,
 )
+from peft import LoraConfig, get_peft_model
 from transformers import logging as hf_log
 
 # Silence HF / Librosa warnings for a clean minimalist terminal
@@ -214,18 +215,27 @@ def main() -> None:
             ignore_mismatched_sizes=True 
         )
         
-        # 🧊 METHOD B: ARABIC XLSR (FROZEN BACKBONE)
-        # Because we swapped out the generic English model for the Arabic XLSR, it natively understands 
-        # the phonetics and rhythmic cadence of the Arabic audio. Thus, we can safely and drastically
-        # speed up training by fully freezing the 300 Million parameters and only training the new Head.
-        model.freeze_feature_encoder()
-        for param in model.wav2vec2.parameters():
-            param.requires_grad = False
-            
-        # Ensure only the new PyTorch classification head layers update
-        model.projector.weight.requires_grad = True
-        model.classifier.weight.requires_grad = True
-        model.classifier.bias.requires_grad = True
+        # 🧊 METHOD A: LORA (LOW-RANK ADAPTATION)
+        # We physically freeze all 300 Million pristine English Emotion parameters so we don't 
+        # blow up Colab or cause Catastrophic Forgetting. We explicitly target the attention matrices (`q_proj`, `v_proj`)
+        # injecting a tiny ~2-3 Million parameter matrix strictly designed to warp the English 
+        # rhythmic mappings into the nuances of Egyptian Arabic cadences.
+        peft_config = LoraConfig(
+            task_type="SEQ_CLS", 
+            r=config.LORA_R, 
+            lora_alpha=config.LORA_ALPHA, 
+            lora_dropout=config.LORA_DROPOUT,
+            # Target the standard Wav2Vec2 self-attention projections
+            target_modules=["q_proj", "v_proj"]
+        )
+        
+        # Wrap it! This automatically freezes the base model and unlocks just the LoRA adapters + new PyTorch head.
+        model = get_peft_model(model, peft_config)
+        
+        if fold_idx == 0:
+            print("\n🔍 Parameter Efficiency Check (Method A: LoRA):")
+            model.print_trainable_parameters()
+            print()
 
         training_args = TrainingArguments(
             output_dir=str(fold_out_dir),
