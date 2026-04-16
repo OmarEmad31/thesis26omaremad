@@ -152,6 +152,7 @@ def train_epoch(model, loader, optimizer, ce_fn, scl_fn, device):
 
         # 🛠️ Fix Padding Dilution: Use Interpolation for Perfect Mask Alignment
         # last_hidden: [B, T_hidden, D], mk: [B, T_input]
+        last_hidden = out.hidden_states[-1]
         mask_float = mk.unsqueeze(1).float() # [B, 1, T_input]
         mask_resized = F.interpolate(mask_float, size=last_hidden.size(1), mode='nearest').squeeze(1) # [B, T_hidden]
         mask_expanded = mask_resized.unsqueeze(-1).expand_as(last_hidden) # [B, T_hidden, D]
