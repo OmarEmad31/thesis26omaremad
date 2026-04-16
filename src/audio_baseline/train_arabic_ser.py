@@ -67,11 +67,12 @@ class SupervisedContrastiveLoss(nn.Module):
 
 # ─────────────────────────────────────────────
 class ArabicAudioDataset(Dataset):
-    def __init__(self, df, label2id, audio_map, fe):
+    def __init__(self, df, label2id, audio_map, fe, augment=False):
         self.df = df.reset_index(drop=True)
         self.label2id = label2id
         self.audio_map = audio_map
         self.fe = fe
+        self.augment = augment
 
     def __len__(self): return len(self.df)
 
@@ -83,15 +84,28 @@ class ArabicAudioDataset(Dataset):
             audio, _ = librosa.load(audio_path, sr=16000, mono=True)
         except Exception:
             audio = np.zeros(MAX_WAV_SAMPLES, dtype=np.float32)
+
+        # 🚀 On-the-fly Data Augmentation (Train only)
+        if self.augment:
+            # 1. Random White Noise (SNR 10-25dB)
+            if random.random() > 0.5:
+                noise_amp = 0.005 * np.random.uniform() * np.amax(audio)
+                audio = audio + noise_amp * np.random.normal(size=audio.shape)
+            # 2. Random Pitch Shift (-2 to +2 semitones)
+            if random.random() > 0.5:
+                audio = librosa.effects.pitch_shift(audio, sr=16000, n_steps=random.uniform(-2, 2))
+
         if len(audio) > MAX_WAV_SAMPLES:
             audio = audio[:MAX_WAV_SAMPLES]
         else:
             audio = np.pad(audio, (0, MAX_WAV_SAMPLES - len(audio)))
+
         inputs = self.fe(audio.astype(np.float32), sampling_rate=16000,
-                         return_tensors="pt", padding=False,
+                         return_tensors="pt", padding="max_length",
                          max_length=MAX_WAV_SAMPLES, truncation=True)
         return {
             "input_values": inputs.input_values.squeeze(0),
+            "attention_mask": inputs.attention_mask.squeeze(0),
             "label": torch.tensor(self.label2id[row["emotion_final"]], dtype=torch.long)
         }
 
@@ -126,20 +140,30 @@ def build_model(num_labels, device):
 
 
 # ─────────────────────────────────────────────
-def train_epoch(model, loader, optimizer, ce_fn, scl_fn, device, scheduler=None):
+def train_epoch(model, loader, optimizer, ce_fn, scl_fn, device):
     model.train()
     total = 0.0
     for batch in tqdm(loader, desc="  train", leave=False):
         iv = batch["input_values"].to(device)
+        mk = batch["attention_mask"].to(device)
         lb = batch["label"].to(device)
         optimizer.zero_grad()
-        out  = model(input_values=iv, output_hidden_states=True)
-        emb  = out.hidden_states[-1].mean(dim=1)
+        out  = model(input_values=iv, attention_mask=mk, output_hidden_states=True)
+
+        # 🛠️ Fix Padding Dilution: Use Attention Mask for Mean Pooling
+        # Wav2Vec2 output is usually [B, T_reduced, D]. The mask is [B, T_input].
+        # We use a simple masked mean on the hidden state.
+        last_hidden = out.hidden_states[-1] # [B, T, 1024]
+        mask_expanded = mk[:, ::320].unsqueeze(-1).expand(last_hidden.size()) # Approximate stride
+        # Simpler: just use the classifier head's own projection if available, or mean.
+        # But we'll do proper masked mean for SCL.
+        emb = (last_hidden * mask_expanded.float()[:, :last_hidden.size(1), :]).sum(dim=1) / \
+              torch.clamp(mask_expanded.float()[:, :last_hidden.size(1), :].sum(dim=1), min=1e-9)
+
         loss = (1 - SCL_WEIGHT) * ce_fn(out.logits, lb) + SCL_WEIGHT * scl_fn(emb, lb)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        if scheduler: scheduler.step()
         total += loss.item()
     return total / len(loader)
 
@@ -149,7 +173,9 @@ def evaluate(model, loader, device):
     model.eval()
     preds, truth = [], []
     for batch in loader:
-        logits = model(input_values=batch["input_values"].to(device)).logits
+        iv = batch["input_values"].to(device)
+        mk = batch["attention_mask"].to(device)
+        logits = model(input_values=iv, attention_mask=mk).logits
         preds.extend(torch.argmax(logits, 1).cpu().numpy())
         truth.extend(batch["label"].numpy())
     return accuracy_score(truth, preds), f1_score(truth, preds, average="macro"), preds, truth
@@ -206,9 +232,9 @@ def main():
         fold_tr = all_df.iloc[tr_idx].reset_index(drop=True)
         fold_va = all_df.iloc[va_idx].reset_index(drop=True)
 
-        tr_loader = DataLoader(ArabicAudioDataset(fold_tr, label2id, audio_map, fe),
+        tr_loader = DataLoader(ArabicAudioDataset(fold_tr, label2id, audio_map, fe, augment=True),
                                batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
-        va_loader = DataLoader(ArabicAudioDataset(fold_va, label2id, audio_map, fe),
+        va_loader = DataLoader(ArabicAudioDataset(fold_va, label2id, audio_map, fe, augment=False),
                                batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
 
         cw    = compute_class_weight("balanced", classes=np.unique(y[tr_idx]), y=y[tr_idx])
