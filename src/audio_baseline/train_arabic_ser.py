@@ -150,15 +150,13 @@ def train_epoch(model, loader, optimizer, ce_fn, scl_fn, device):
         optimizer.zero_grad()
         out  = model(input_values=iv, attention_mask=mk, output_hidden_states=True)
 
-        # 🛠️ Fix Padding Dilution: Use Attention Mask for Mean Pooling
-        # Wav2Vec2 output is usually [B, T_reduced, D]. The mask is [B, T_input].
-        # We use a simple masked mean on the hidden state.
-        last_hidden = out.hidden_states[-1] # [B, T, 1024]
-        mask_expanded = mk[:, ::320].unsqueeze(-1).expand(last_hidden.size()) # Approximate stride
-        # Simpler: just use the classifier head's own projection if available, or mean.
-        # But we'll do proper masked mean for SCL.
-        emb = (last_hidden * mask_expanded.float()[:, :last_hidden.size(1), :]).sum(dim=1) / \
-              torch.clamp(mask_expanded.float()[:, :last_hidden.size(1), :].sum(dim=1), min=1e-9)
+        # 🛠️ Fix Padding Dilution: Use Interpolation for Perfect Mask Alignment
+        # last_hidden: [B, T_hidden, D], mk: [B, T_input]
+        mask_float = mk.unsqueeze(1).float() # [B, 1, T_input]
+        mask_resized = F.interpolate(mask_float, size=last_hidden.size(1), mode='nearest').squeeze(1) # [B, T_hidden]
+        mask_expanded = mask_resized.unsqueeze(-1).expand_as(last_hidden) # [B, T_hidden, D]
+
+        emb = (last_hidden * mask_expanded).sum(dim=1) / torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
 
         loss = (1 - SCL_WEIGHT) * ce_fn(out.logits, lb) + SCL_WEIGHT * scl_fn(emb, lb)
         loss.backward()
