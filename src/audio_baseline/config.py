@@ -39,10 +39,12 @@ if IS_COLAB:
         DATA_ROOT = Path("/content/drive/MyDrive/Thesis Project")
 
     CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_hf")
+    OFFLINE_FEATURES_DIR = Path("/content/drive/MyDrive/Thesis Project/data/processed/whisper_offline")
 else:
     DATA_ROOT       = Path("dataset/Final Modalink Dataset MERGED")
     SPLIT_CSV_DIR   = Path("data/processed/splits/audio_eligible")
     CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_hf")
+    OFFLINE_FEATURES_DIR = Path("data/processed/whisper_offline")
 
 # ---------------------------------------------------------------------------
 # MODEL CONFIGURATION (PURE HUGGINGFACE)
@@ -53,19 +55,18 @@ else:
 MODEL_NAME = "openai/whisper-small"
 
 # ---------------------------------------------------------------------------
-# TRAINING HYPERPARAMETERS (Matched to Text Baseline)
+# TRAINING HYPERPARAMETERS (Fast PyTorch MLP)
 # ---------------------------------------------------------------------------
 SEED = 42
 
 SAMPLING_RATE     = 16000
-MAX_DURATION_SEC  = 10   # Max seconds of audio per sample (Whisper handles padding intrinsically)
+MAX_DURATION_SEC  = 10   
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
-BATCH_SIZE        = 8     # Small memory footprint since base is frozen
-GRAD_ACCUM_STEPS  = 4     # 8 * 4 = 32 effective batch size
-NUM_EPOCHS        = 40
-LEARNING_RATE     = 1e-3  # High learning rate to rapidly train the fresh classification head
-EARLY_STOP_PATIENCE = 5   # Stop if F1 doesn't improve for 5 epochs
+BATCH_SIZE        = 32    # Can be large because the inputs are just 768-D vectors now 
+NUM_EPOCHS        = 50    # Local offline models train in 0.1s/epoch, so 50 is perfect
+LEARNING_RATE     = 5e-4  
+EARLY_STOP_PATIENCE = 10  # More patience since epochs run instantly
 WEIGHT_DECAY      = 0.05
 WARMUP_RATIO      = 0.1
 
@@ -75,3 +76,4 @@ SCL_TEMP          = 0.1
 SCL_WEIGHT        = 0.1
 
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+OFFLINE_FEATURES_DIR.mkdir(parents=True, exist_ok=True)
