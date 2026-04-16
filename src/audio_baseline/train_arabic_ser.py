@@ -35,7 +35,8 @@ MODEL_ID        = "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
 MAX_WAV_SAMPLES = 5 * 16000   # 5 seconds
 BATCH_SIZE      = 8
 UNFREEZE_LAYERS = 4            # unfreeze last N transformer blocks
-LR              = 2e-5         # lower than WavLM — model is already Arabic-specialized
+LR_ENCODER      = 2e-5         # conservative for pretrained Arabic layers
+LR_HEAD         = 5e-4         # 25x higher for randomly initialized head
 NUM_EPOCHS      = 25
 PATIENCE        = 6
 SCL_WEIGHT      = 0.1
@@ -215,21 +216,28 @@ def main():
         scl_fn = SupervisedContrastiveLoss(SCL_TEMP)
 
         model = build_model(num_labels, device)
-        optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=0.01
-        )
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=LR, steps_per_epoch=len(tr_loader),
-            epochs=NUM_EPOCHS, pct_start=0.1, anneal_strategy="cos"
+        # Differential learning rates: head needs aggressive kick to escape random init
+        optimizer = torch.optim.AdamW([
+            {"params": list(model.wav2vec2.encoder.layers[-UNFREEZE_LAYERS:].parameters()),
+             "lr": LR_ENCODER, "weight_decay": 0.01},
+            {"params": list(model.projector.parameters()),
+             "lr": LR_HEAD, "weight_decay": 0.01},
+            {"params": list(model.classifier.parameters()),
+             "lr": LR_HEAD, "weight_decay": 0.01},
+        ])
+        # ReduceLROnPlateau: halve LR when val F1 stops improving
+        scheduler_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=3, verbose=True
         )
 
         best_f1, no_improve = 0.0, 0
         ckpt = ckpt_dir / f"fold_{fold_idx}.pt"
 
         for epoch in range(1, NUM_EPOCHS + 1):
-            loss = train_epoch(model, tr_loader, optimizer, ce_fn, scl_fn, device, scheduler)
+            loss = train_epoch(model, tr_loader, optimizer, ce_fn, scl_fn, device)
             tr_acc, tr_f1, _, _ = evaluate(model, tr_loader, device)
             va_acc, va_f1, _, _ = evaluate(model, va_loader, device)
+            scheduler_plateau.step(va_f1)
             print(f"  Ep {epoch:2d}/{NUM_EPOCHS} | Loss {loss:.4f} | "
                   f"Train {tr_acc:.3f}/{tr_f1:.3f} | Val {va_acc:.3f}/{va_f1:.3f}")
             if va_f1 > best_f1:
