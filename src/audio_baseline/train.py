@@ -141,8 +141,7 @@ def load_audio_features(df, label2id, feature_extractor):
             continue
             
     # Process instantly in memory (Whisper requires 30s padding natively, AutoFeatureExtractor handles this!)
-    inputs = feature_extractor(features, sampling_rate=config.SAMPLING_RATE, padding=True, 
-                               max_length=config.MAX_AUDIO_SAMPLES, truncation=True, return_tensors="pt")
+    inputs = feature_extractor(features, sampling_rate=config.SAMPLING_RATE, return_tensors="pt")
     
     # Store directly into HF dataset
     # Whisper explicitly generates and expects `input_features`, while w2v2 used `input_values`.
