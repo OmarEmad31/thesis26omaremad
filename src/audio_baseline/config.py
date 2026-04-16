@@ -38,21 +38,18 @@ if IS_COLAB:
     if not DATA_ROOT:
         DATA_ROOT = Path("/content/drive/MyDrive/Thesis Project")
 
-    CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_hf")
-    OFFLINE_FEATURES_DIR = Path("/content/drive/MyDrive/Thesis Project/data/processed/whisper_offline")
+    CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_acoustic")
 else:
     DATA_ROOT       = Path("dataset/Final Modalink Dataset MERGED")
     SPLIT_CSV_DIR   = Path("data/processed/splits/audio_eligible")
-    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_hf")
-    OFFLINE_FEATURES_DIR = Path("data/processed/whisper_offline")
+    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_acoustic")
 
 # ---------------------------------------------------------------------------
-# MODEL CONFIGURATION (PURE HUGGINGFACE)
+# MODEL CONFIGURATION (PURE PYTORCH ACOUSTICS)
 # ---------------------------------------------------------------------------
-# We are using OpenAI's Whisper model. Specifically, we will extract just its Acoustic Encoder.
-# Since it was trained on millions of hours of dialectal Arabic content, it inherently
-# clusters Egyptian colloquial tones and cadences perfectly mapped to underlying semantics.
-MODEL_NAME = "openai/whisper-small"
+# Completely abandoned heavy Sequence Transformers. We use pure librosa Mel-Spectrograms.
+N_MELS            = 128
+HOP_LENGTH        = 512
 
 # ---------------------------------------------------------------------------
 # TRAINING HYPERPARAMETERS (Fast PyTorch MLP)
@@ -63,11 +60,11 @@ SAMPLING_RATE     = 16000
 MAX_DURATION_SEC  = 10   
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
-BATCH_SIZE        = 32    # Can be large because the inputs are just 768-D vectors now 
-NUM_EPOCHS        = 50    # Local offline models train in 0.1s/epoch, so 50 is perfect
-LEARNING_RATE     = 5e-4  
-EARLY_STOP_PATIENCE = 10  # More patience since epochs run instantly
-WEIGHT_DECAY      = 0.05
+BATCH_SIZE        = 32    # Acoustic batches are extremely light, allowing large arrays
+NUM_EPOCHS        = 100   # Fast Custom CNN-LSTM trains rapidly, allowing deep exploration
+LEARNING_RATE     = 1e-3  
+EARLY_STOP_PATIENCE = 15  # More patience since acoustic patterns take a bit to generalize
+WEIGHT_DECAY      = 0.01  
 WARMUP_RATIO      = 0.1
 
 # SCL Settings
@@ -76,4 +73,3 @@ SCL_TEMP          = 0.1
 SCL_WEIGHT        = 0.1
 
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-OFFLINE_FEATURES_DIR.mkdir(parents=True, exist_ok=True)

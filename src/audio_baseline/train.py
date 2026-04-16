@@ -1,291 +1,306 @@
-"""
-Pure HuggingFace Trainer Pipeline for Audio Emotion Classification.
-Exactly mimics the architecture and flow of the text baseline.
-"""
-
-from __future__ import annotations
-
-import json
-import random
-import sys
 import os
-import shutil
-from pathlib import Path
-
+import random
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import Dataset
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import accuracy_score, f1_score
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.model_selection import StratifiedKFold
 import librosa
 from tqdm import tqdm
+from pathlib import Path
 
-from transformers import (
-    AutoModelForAudioClassification,
-    AutoFeatureExtractor,
-    Trainer,
-    TrainingArguments,
-    EarlyStoppingCallback,
-    set_seed,
-)
-from transformers import logging as hf_log
+# Fix relative imports
+import sys
+project_root = str(Path(__file__).parent.parent.parent.absolute())
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-# Silence HF / Librosa warnings for a clean minimalist terminal
-hf_log.set_verbosity_error()
+from src.audio_baseline import config
+from src.text_baseline.train import SupervisedContrastiveLoss
+
 import warnings
 warnings.filterwarnings("ignore")
 
-from src.audio_baseline import config
-
-
 # ==============================================================================
-# LOSS / SCL LOGIC (Borrowed exactly from Text Baseline)
+# SPECAUGMENT: The Acoustic Generalizer
 # ==============================================================================
-class SCLTrainer(Trainer):
-    """Trainer with Supervised Contrastive Learning (SCL) and CrossEntropy."""
-
-    def __init__(self, *args, class_weights: torch.Tensor, scl_temp: float = 0.1, scl_weight: float = 0.1, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.class_weights = class_weights
-        self.scl_temp = scl_temp
-        self.scl_weight = scl_weight
-
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels = inputs.get("labels")
+def apply_spec_augment(mel_spectrogram, freq_mask_param=15, time_mask_param=30, num_masks=2):
+    """
+    Applies SpecAugment: Randomly masks blocks of frequency and time.
+    Forces the model to learn underlying emotional texture instead of specific pitches.
+    mel_spectrogram shape expected: (N_MELS, Time_Frames)
+    """
+    n_mels, n_steps = mel_spectrogram.shape
+    augmented = mel_spectrogram.copy()
+    
+    for _ in range(num_masks):
+        # Frequency Masking
+        f_mask = random.randint(0, freq_mask_param)
+        f0 = random.randint(0, n_mels - f_mask)
+        augmented[f0:f0 + f_mask, :] = 0
         
-        # Ensure model doesn't see labels so it doesn't calculate its own standard loss inside.
-        model_inputs = {k: v for k, v in inputs.items() if k != "labels"}
-        model_inputs["output_hidden_states"] = True
-        outputs = model(**model_inputs)
-        
-        logits = outputs.logits
-        
-        # 1. Standard Weighted Cross-Entropy Loss
-        loss_fn = nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device))
-        ce_loss = loss_fn(logits, labels)
-        
-        # 2. Supervised Contrastive Loss (SCL)
-        # Wav2Vec doesn't use a CLS token; we mean-pool the sequence instead
-        hidden_seq = outputs.hidden_states[-1] 
-        hidden = hidden_seq.mean(dim=1)
-        
-        # L2 Normalize embeddings
-        features = F.normalize(hidden, p=2, dim=1)
-        
-        # Compute Cosine Similarity Matrix
-        similarity = torch.matmul(features, features.T) / self.scl_temp
-        
-        # Create mask for matching labels
-        mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float()
-        
-        # Zero out the diagonal (a sample shouldn't contrast with itself)
-        batch_size = labels.size(0)
-        logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=mask.device)
-        mask = mask * logits_mask
-        
-        # Numerical stability for logsumexp
-        max_sim, _ = torch.max(similarity, dim=1, keepdim=True)
-        sim_stable = similarity - max_sim.detach()
-        
-        # Denominator only looks at other elements
-        exp_sim = torch.exp(sim_stable) * logits_mask
-        log_prob = sim_stable - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
-        
-        # Compute mean log-likelihood over positive samples
-        valid_anchors = mask.sum(1) > 0  
-        
-        if valid_anchors.any():
-            mean_log_prob_pos = (mask[valid_anchors] * log_prob[valid_anchors]).sum(1) / (mask[valid_anchors].sum(1) + 1e-8)
-            scl_loss = -mean_log_prob_pos.mean()
-        else:
-            scl_loss = torch.tensor(0.0, device=ce_loss.device)
+        # Time Masking
+        if n_steps > time_mask_param:
+            t_mask = random.randint(0, time_mask_param)
+            t0 = random.randint(0, n_steps - t_mask)
+            augmented[:, t0:t0 + t_mask] = 0
             
-        # 3. Hybrid Loss
-        loss = ce_loss + (self.scl_weight * scl_loss)
+    return augmented
+
+# ==============================================================================
+# PYTORCH DATASET: Raw Audio to Native Spectrogram
+# ==============================================================================
+class AcousticEmotionDataset(Dataset):
+    def __init__(self, df, label2id, audio_map, is_train=True):
+        self.df = df
+        self.label2id = label2id
+        self.is_train = is_train
+        self.audio_map = audio_map
         
-        clean_outputs = type(outputs)(loss=loss, logits=logits)
-        return (loss, clean_outputs) if return_outputs else loss
+        # Fixed temporal dimension based on max duration
+        self.max_time_frames = config.MAX_AUDIO_SAMPLES // config.HOP_LENGTH + 1
 
+    def __len__(self):
+        return len(self.df)
 
-def compute_metrics(eval_pred):
-    from sklearn.metrics import accuracy_score, f1_score
-    logits, labels = eval_pred
-    preds = np.argmax(logits, axis=-1)
-    acc = accuracy_score(labels, preds)
-    f1 = f1_score(labels, preds, average="macro")
-    return {"accuracy": acc, "f1_macro": f1}
-
-
-# ==============================================================================
-# DATASET BUILDER
-# ==============================================================================
-def load_audio_features(df, label2id, feature_extractor):
-    print(f"Loading {len(df)} audio files into memory...")
-    features, labels = [], []
-    for _, row in tqdm(df.iterrows(), total=len(df)):
-        fldr = str(row["folder"]).strip()
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
         rel = str(row["audio_relpath"]).replace("\\", "/").lstrip("/")
-        audio_path = config.DATA_ROOT / fldr / rel
+        basename = Path(rel).name
         
-        if not audio_path.exists(): continue
+        # Secure Pathing Bypass
+        if basename in self.audio_map:
+            audio_path = self.audio_map[basename]
+        else:
+            # Fallback for silent testing
+            audio_path = config.DATA_ROOT / str(row["folder"]).strip() / rel
+
+        # 1. Load Audio
         try:
             audio, _ = librosa.load(audio_path, sr=config.SAMPLING_RATE, mono=True)
-            audio = audio[:config.MAX_AUDIO_SAMPLES].astype(np.float32)
-            lbl = label2id[row["emotion_final"]]
-            features.append(audio)
-            labels.append(lbl)
         except Exception:
-            continue
+            # If completely corrupted, return empty safe tensor to avoid crashing loop
+            audio = np.zeros(config.MAX_AUDIO_SAMPLES, dtype=np.float32)
             
-    # Process instantly in memory (Whisper requires 30s padding natively, AutoFeatureExtractor handles this!)
-    inputs = feature_extractor(features, sampling_rate=config.SAMPLING_RATE, return_tensors="pt")
+        # 2. Pad or Truncate sequentially
+        if len(audio) > config.MAX_AUDIO_SAMPLES:
+            audio = audio[:config.MAX_AUDIO_SAMPLES]
+        else:
+            # Pad with zeros
+            audio = np.pad(audio, (0, config.MAX_AUDIO_SAMPLES - len(audio)))
+            
+        # 3. Extract Acoustic Mathematical Features
+        melspec = librosa.feature.melspectrogram(
+            y=audio, 
+            sr=config.SAMPLING_RATE, 
+            n_mels=config.N_MELS,
+            hop_length=config.HOP_LENGTH
+        )
+        
+        # 4. Convert power to Decibels (Log scaling mimics logarithmic human hearing)
+        log_melspec = librosa.power_to_db(melspec, ref=np.max)
+        
+        # 5. Improvement 1: Dynamic Data Augmentation (Only during Training)
+        if self.is_train:
+            log_melspec = apply_spec_augment(log_melspec)
+            
+        # 6. Normalize Feature Scales (Mean 0, Std 1)
+        mean = np.mean(log_melspec)
+        std = np.std(log_melspec) + 1e-6
+        log_melspec = (log_melspec - mean) / std
+
+        label = self.label2id[row["emotion_final"]]
+        
+        # Expected shape: [128, Time_Frames]
+        return torch.tensor(log_melspec, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+
+# ==============================================================================
+# MODEL: Hybrid Conv1D + Bi-LSTM (768 Dim Output for Multimodal Parity)
+# ==============================================================================
+class AcousticHybridNet(nn.Module):
+    def __init__(self, num_classes=7):
+        super().__init__()
+        
+        # BLOCK 1: Spatial Frequency Extractor (Ears)
+        # Input shape: [Batch, 128 (Channels=Mels), Time]
+        self.conv1 = nn.Conv1d(in_channels=128, out_channels=256, kernel_size=5, padding=2)
+        self.bn1 = nn.BatchNorm1d(256)
+        self.conv2 = nn.Conv1d(in_channels=256, out_channels=256, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.pool = nn.MaxPool1d(kernel_size=2)
+        self.dropout = nn.Dropout(0.3)
+        
+        # BLOCK 2: Temporal Sequence Engine (Brain)
+        # Setting hidden_size = 384. Bidirectional makes output 384 * 2 = 768.
+        # This GUARANTEES parity with BERT/VideoMAE outputs for late fusion!
+        self.lstm = nn.LSTM(
+            input_size=256, 
+            hidden_size=384, 
+            num_layers=2, 
+            batch_first=True, 
+            bidirectional=True,
+            dropout=0.3
+        )
+        
+        # BLOCK 3: Classification Head
+        self.fc_classifier = nn.Linear(768, num_classes)
+
+    def forward(self, x):
+        # x is [B, 128, Time]
+        
+        # Convolutional Block
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.pool(out)
+        out = self.dropout(out)
+        
+        out = F.relu(self.bn2(self.conv2(out)))
+        out = self.pool(out)
+        out = self.dropout(out)
+        
+        # Prepare for LSTM -> Needs [Batch, Time, Features]
+        # We swap dimensions: from [B, Features, Time] -> [B, Time, Features]
+        out = out.permute(0, 2, 1)
+        
+        # LSTM Block
+        lstm_out, _ = self.lstm(out)  # lstm_out shape: [Batch, Time, 768]
+        
+        # Global Average Pooling across time to crush into a 1D Vector per audio
+        # Shape: [Batch, 768]
+        embeddings = lstm_out.mean(dim=1)
+        
+        # Classification
+        logits = self.fc_classifier(embeddings)
+        
+        # We return the 768-D embeddings specifically for the SCL Loss calculation!
+        return logits, embeddings
+
+# ==============================================================================
+# TRAINING PIPELINE
+# ==============================================================================
+def main():
+    print("🚀 Initializing Acoustic CNN-LSTM Pipeline...")
     
-    # Store directly into HF dataset
-    # Whisper explicitly generates and expects `input_features`, while w2v2 used `input_values`.
-    ds_dict = {"labels": labels}
-    if "input_features" in inputs:
-        ds_dict["input_features"] = inputs.input_features
-    elif "input_values" in inputs:
-        ds_dict["input_values"] = inputs.input_values
-        
-    if "attention_mask" in inputs:
-        ds_dict["attention_mask"] = inputs.attention_mask
-        
-    return Dataset.from_dict(ds_dict)
+    # 0. Global Fallback Drive Mapper (Fix for Missing Colab zip files)
+    print("Mapping physical .wav files across Google Drive securely...")
+    audio_map = {}
+    search_dir = Path("/content") if Path("/content").exists() else Path(config.DATA_ROOT).parent
+    for p in search_dir.rglob("*.wav"):
+        audio_map[p.name] = p
+    print(f"Mapped {len(audio_map)} absolute .wav file tracks.")
 
-# ==============================================================================
-# MAIN RUNNER
-# ==============================================================================
-def main() -> None:
-    set_seed(config.SEED)
-    random.seed(config.SEED)
-    np.random.seed(config.SEED)
-    torch.manual_seed(config.SEED)
-
-    # 1. Load CSV Splits
+    # 1. Data Prep
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
-    val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
-    test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
-
-    label2id = {n: i for i, n in enumerate(sorted(train_df["emotion_final"].unique()))}
-    id2label = {i: n for n, i in label2id.items()}
-    num_labels = len(label2id)
-
-    # 2. Combine exactly like text_baseline for Stratified K-Fold
+    val_df = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     all_df = pd.concat([train_df, val_df], ignore_index=True)
-    all_labels = np.array([label2id[lbl] for lbl in all_df["emotion_final"]])
+    
+    label2id = {lbl: i for i, lbl in enumerate(sorted(all_df["emotion_final"].unique()))}
+    num_labels = len(label2id)
+    
+    X_indices = np.arange(len(all_df))
+    y_labels = np.array([label2id[lbl] for lbl in all_df["emotion_final"]])
     
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=config.SEED)
     
-    # 3. Load feature extractor
-    feature_extractor = AutoFeatureExtractor.from_pretrained(config.MODEL_NAME)
-
-    print(f"\n🚀 Minimalist End-to-End Audio Training")
-    print(f"Model: {config.MODEL_NAME} | Epochs: {config.NUM_EPOCHS}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\n======================================================================")
+    print(f"🔥 ARCHITECTURE B: Conv1D-BiLSTM | Features: Mel-Spectrogram ({device.upper()})")
     print(f"======================================================================")
 
-    for fold_idx, (train_index, val_index) in enumerate(skf.split(all_df, all_labels)):
-        fold_out_dir = config.CHECKPOINT_DIR / f"fold_{fold_idx}"
-        best_dir = fold_out_dir / "best_model"
+    all_fold_f1 = []
+
+    for fold_idx, (train_index, val_index) in enumerate(skf.split(X_indices, y_labels)):
+        print(f"\n[FOLD {fold_idx + 1} / 5]")
         
-        if (best_dir / "model.safetensors").exists() or (best_dir / "pytorch_model.bin").exists():
-            print(f"[RESUME] Skipping Fold {fold_idx} as it is already complete.")
-            continue
-
-        print(f"\n{'='*20} TRAINING FOLD {fold_idx} {'='*20}")
+        train_fold_df = all_df.iloc[train_index].reset_index(drop=True)
+        val_fold_df = all_df.iloc[val_index].reset_index(drop=True)
         
-        fold_train_df = all_df.iloc[train_index]
-        fold_val_df   = all_df.iloc[val_index]
-
-        # Calculate balanced weights
-        raw_weights = compute_class_weight(
-            class_weight="balanced", classes=np.arange(num_labels),
-            y=np.array([label2id[lbl] for lbl in fold_train_df["emotion_final"]])
-        )
-        class_weights_tensor = torch.tensor(raw_weights, dtype=torch.float)
-
-        print(f"Building Dataset for Fold {fold_idx}...")
-        train_ds = load_audio_features(fold_train_df, label2id, feature_extractor)
-        val_ds   = load_audio_features(fold_val_df, label2id, feature_extractor)
-
-        fold_out_dir.mkdir(parents=True, exist_ok=True)
-        best_dir.mkdir(parents=True, exist_ok=True)
-
-        model = AutoModelForAudioClassification.from_pretrained(
-            config.MODEL_NAME, num_labels=num_labels, id2label=id2label, label2id=label2id,
-            ignore_mismatched_sizes=True 
-        )
+        train_dataset = AcousticEmotionDataset(train_fold_df, label2id, audio_map, is_train=True)
+        val_dataset = AcousticEmotionDataset(val_fold_df, label2id, audio_map, is_train=False)
         
-        # 🧊 WHISPER ENCODER ISOLATION (EGYPTIAN ARABIC STRATEGY)
-        # Instead of generic model loading, we load the powerful Whisper sequence classifier,
-        # but completely freeze its multi-dialectal encoder. We allow the small classification head
-        # to freely rapidly learn the mapping of Egyptian prosody to the given emotion classes.
-        for name, param in model.named_parameters():
-            if "classifier" not in name and "projector" not in name:
-                param.requires_grad = False
+        train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=2)
+        val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2)
+        
+        # Improvement 3: Stratified Class Weights natively injected into CrossEntropy
+        class_w = compute_class_weight("balanced", classes=np.unique(y_labels[train_index]), y=y_labels[train_index])
+        class_w_tensor = torch.tensor(class_w, dtype=torch.float32).to(device)
+        
+        criterion_ce = nn.CrossEntropyLoss(weight=class_w_tensor)
+        criterion_scl = SupervisedContrastiveLoss(temperature=config.SCL_TEMP)
+        
+        model = AcousticHybridNet(num_classes=num_labels).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.NUM_EPOCHS)
+        
+        best_f1 = 0
+        patience = 0
+        
+        for epoch in range(1, config.NUM_EPOCHS + 1):
+            model.train()
+            total_loss = 0
+            
+            for batch_idx, (inputs, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)):
+                inputs, labels = inputs.to(device), labels.to(device)
+                
+                optimizer.zero_grad()
+                logits, embeddings = model(inputs)
+                
+                loss_ce = criterion_ce(logits, labels)
+                # Improvement 2: Supervised Contrastive Loss active on the 768-D embeddings
+                loss_scl = criterion_scl(embeddings, labels)
+                
+                loss = (1 - config.SCL_WEIGHT) * loss_ce + config.SCL_WEIGHT * loss_scl
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+                
+            scheduler.step()
+            
+            # Validation
+            model.eval()
+            all_preds, all_labels_val = [], []
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    inputs = inputs.to(device)
+                    logits, _ = model(inputs)
+                    preds = torch.argmax(logits, dim=1).cpu().numpy()
+                    all_preds.extend(preds)
+                    all_labels_val.extend(labels.numpy())
+                    
+            val_acc = accuracy_score(all_labels_val, all_preds)
+            val_f1 = f1_score(all_labels_val, all_preds, average="macro")
+            
+            print(f"Epoch {epoch:2d}/{config.NUM_EPOCHS} | Train Loss: {total_loss/len(train_loader):.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}")
+            
+            if val_f1 > best_f1:
+                best_f1 = val_f1
+                patience = 0
+                
+                best_model_path = config.CHECKPOINT_DIR / f"fold_{fold_idx}"
+                best_model_path.mkdir(parents=True, exist_ok=True)
+                torch.save(model.state_dict(), best_model_path / "best_acoustic_model.pt")
             else:
-                param.requires_grad = True
+                patience += 1
+                
+            if patience >= config.EARLY_STOP_PATIENCE:
+                print(f"🛑 Early stopping triggered. Best Macro F1: {best_f1:.4f}")
+                break
+                
+        all_fold_f1.append(best_f1)
+        print(f"✅ Fold {fold_idx + 1} Best Marco F1: {best_f1 * 100:.2f}%")
 
-        if fold_idx == 0:
-            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in model.parameters())
-            print(f"\n🔍 Whisper Acoustic Encoder Ready: Training {trainable_params:,} / {total_params:,} params.")
-            print()
-
-        training_args = TrainingArguments(
-            output_dir=str(fold_out_dir),
-            learning_rate=config.LEARNING_RATE,
-            per_device_train_batch_size=config.BATCH_SIZE,
-            per_device_eval_batch_size=config.BATCH_SIZE,
-            gradient_accumulation_steps=config.GRAD_ACCUM_STEPS,
-            num_train_epochs=config.NUM_EPOCHS,
-            weight_decay=config.WEIGHT_DECAY,
-            warmup_ratio=config.WARMUP_RATIO,
-            eval_strategy="epoch",  
-            save_strategy="epoch",  # EarlyStopping requires saving aligned with eval
-            load_best_model_at_end=True, # Protect the peak weights!
-            metric_for_best_model="f1_macro",
-            save_total_limit=1,
-            logging_steps=5,     
-            seed=config.SEED + fold_idx,
-            report_to="none",
-            disable_tqdm=False, # Explicitly guarantee visual progress bars
-            dataloader_pin_memory=False,
-        )
-
-        trainer = SCLTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_ds,
-            eval_dataset=val_ds,
-            processing_class=feature_extractor,
-            compute_metrics=compute_metrics,
-            class_weights=class_weights_tensor,
-            scl_temp=config.SCL_TEMP,
-            scl_weight=config.SCL_WEIGHT,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=config.EARLY_STOP_PATIENCE)]
-        )
-
-        print(f"🔥 Kicking off Trainer loop for Fold {fold_idx} (Watch for the progress bar...)")
-        trainer.train()
-        # Save explicitly at end ensures the `best_model` is what remains in the directory
-        trainer.save_model(str(best_dir))
-        
-        if fold_idx == 0:
-            with (config.CHECKPOINT_DIR / "label2id.json").open("w", encoding="utf-8") as f:
-                json.dump(label2id, f, ensure_ascii=False, indent=2)
-
-        print(f"[SUCCESS] Fold {fold_idx} complete. Best model saved to {best_dir}")
-        
-        import gc
-        del model, trainer, train_ds, val_ds
-        gc.collect()
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-    print(f"\n5-Fold Audio Training Complete! All models saved in {config.CHECKPOINT_DIR}")
+    print(f"\n🏆 ALL FOLDS COMPLETE. Mean F1 Macro: {np.mean(all_fold_f1) * 100:.2f}%")
 
 if __name__ == "__main__":
+    
+    # Initialize deterministic behavior
+    seed = config.SEED
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    
     main()
