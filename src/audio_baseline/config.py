@@ -47,8 +47,8 @@ else:
 # ---------------------------------------------------------------------------
 # MODEL CONFIGURATION (PURE HUGGINGFACE)
 # ---------------------------------------------------------------------------
-# We use the emotional Wav2Vec2 model because it natively hooks into the Trainer API
-MODEL_NAME = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
+# We use the Arabic-specific XLSR model to inherently understand phonetic cadence
+MODEL_NAME = "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
 
 # ---------------------------------------------------------------------------
 # TRAINING HYPERPARAMETERS (Matched to Text Baseline)
@@ -59,12 +59,11 @@ SAMPLING_RATE     = 16000
 MAX_DURATION_SEC  = 10   # Max seconds of audio per sample
 MAX_AUDIO_SAMPLES = SAMPLING_RATE * MAX_DURATION_SEC
 
-BATCH_SIZE        = 4    
-GRAD_ACCUM_STEPS  = 8    # 4 * 8 = 32 effective batch size
+BATCH_SIZE        = 16    # We can handle larger batches since the 300M parameter backbone is entirely frozen again!
+GRAD_ACCUM_STEPS  = 2     # 16 * 2 = 32 effective batch size
 NUM_EPOCHS        = 40
-LEARNING_RATE     = 1e-4  # Base LR for classification head (much lower now because we aren't frozen)
-LLRD_DECAY        = 0.9   # Layer-wise Learning Rate Decay for the transformer layers
-EARLY_STOP_PATIENCE = 4   # Stop if F1 doesn't improve for 4 epochs
+LEARNING_RATE     = 1e-3  # Fast learning rate because we are strictly training the new PyTorch classification head
+EARLY_STOP_PATIENCE = 5   # Stop if F1 doesn't improve for 5 epochs
 WEIGHT_DECAY      = 0.05
 WARMUP_RATIO      = 0.1
 

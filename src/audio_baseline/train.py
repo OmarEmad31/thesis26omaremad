@@ -151,42 +151,6 @@ def load_audio_features(df, label2id, feature_extractor):
         "labels": labels
     })
 
-def get_optimizer_grouped_parameters(model, base_lr, layerwise_lr_decay):
-    """Build parameter groups with layer-wise learning rate decay (LLRD) for Wav2Vec2."""
-    encoder_layers = model.wav2vec2.encoder.layers
-    num_layers = len(encoder_layers)
-    params = []
-    
-    # 1. Classifier head + projector gets full LR (no decay)
-    head_params = {
-        "params": [p for n, p in model.named_parameters() if "classifier" in n or "projector" in n],
-        "weight_decay": 0.0,
-        "lr": base_lr,
-    }
-    params.append(head_params)
-    
-    # 2. Base embeddings/convolutions get lowest LR
-    emb_lr = base_lr * (layerwise_lr_decay ** (num_layers + 1))
-    emb_params = {
-        "params": [p for n, p in model.named_parameters() if "feature_extractor" in n or "feature_projection" in n],
-        "weight_decay": 0.01,
-        "lr": emb_lr,
-    }
-    params.append(emb_params)
-    
-    # 3. Intermediate encoder layers get gradually decaying LR
-    # Layer 11 gets `base_lr * decay^1`, Layer 0 gets `base_lr * decay^12`
-    for i in range(num_layers):
-        lr = base_lr * (layerwise_lr_decay ** (num_layers - i))
-        layer_params = {
-            "params": [p for n, p in model.named_parameters() if f"encoder.layers.{i}." in n],
-            "weight_decay": 0.01,
-            "lr": lr,
-        }
-        params.append(layer_params)
-        
-    return params
-
 # ==============================================================================
 # MAIN RUNNER
 # ==============================================================================
@@ -250,11 +214,19 @@ def main() -> None:
             ignore_mismatched_sizes=True 
         )
         
-        # 🧊 Unfreeze deeply, but protect the basic sound extractors
+        # 🧊 METHOD B: ARABIC XLSR (FROZEN BACKBONE)
+        # Because we swapped out the generic English model for the Arabic XLSR, it natively understands 
+        # the phonetics and rhythmic cadence of the Arabic audio. Thus, we can safely and drastically
+        # speed up training by fully freezing the 300 Million parameters and only training the new Head.
         model.freeze_feature_encoder()
-        for param in model.wav2vec2.encoder.layers.parameters():
-            param.requires_grad = True # Fully opened!
-        
+        for param in model.wav2vec2.parameters():
+            param.requires_grad = False
+            
+        # Ensure only the new PyTorch classification head layers update
+        model.projector.weight.requires_grad = True
+        model.classifier.weight.requires_grad = True
+        model.classifier.bias.requires_grad = True
+
         training_args = TrainingArguments(
             output_dir=str(fold_out_dir),
             learning_rate=config.LEARNING_RATE,
@@ -276,21 +248,6 @@ def main() -> None:
             dataloader_pin_memory=False,
         )
 
-        grouped_params = get_optimizer_grouped_parameters(
-            model, 
-            base_lr=config.LEARNING_RATE, 
-            layerwise_lr_decay=config.LLRD_DECAY
-        )
-        optimizer = torch.optim.AdamW(grouped_params)
-        
-        num_train_steps = (len(train_ds) // config.BATCH_SIZE // config.GRAD_ACCUM_STEPS) * config.NUM_EPOCHS
-        from transformers import get_linear_schedule_with_warmup
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, 
-            num_warmup_steps=int(num_train_steps * config.WARMUP_RATIO), 
-            num_training_steps=num_train_steps
-        )
-
         trainer = SCLTrainer(
             model=model,
             args=training_args,
@@ -301,7 +258,6 @@ def main() -> None:
             class_weights=class_weights_tensor,
             scl_temp=config.SCL_TEMP,
             scl_weight=config.SCL_WEIGHT,
-            optimizers=(optimizer, scheduler),
             callbacks=[EarlyStoppingCallback(early_stopping_patience=config.EARLY_STOP_PATIENCE)]
         )
 
