@@ -227,7 +227,7 @@ def main():
         ])
         # ReduceLROnPlateau: halve LR when val F1 stops improving
         scheduler_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.5, patience=3, verbose=True
+            optimizer, mode="max", factor=0.5, patience=3
         )
 
         best_f1, no_improve = 0.0, 0
