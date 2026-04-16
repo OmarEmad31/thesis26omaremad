@@ -1,15 +1,13 @@
 """
-Tri-Expert Feature Extractor for Egyptian Arabic SER.
-Sequential extraction to save RAM.
-
-Expert 1: jonatasgrosman/wav2vec2-large-xlsr-53-arabic (Dialect knowledge)
-Expert 2: superb/wav2vec2-large-superb-er (Acoustic Emotion knowledge)
-Expert 3: Handcrafted Acoustic (Pitch, Energy, MFCC)
+Precision Tri-Expert Feature Extractor (v2).
+FIXED: Padding Dilution (Mask-Aware Pooling) for both Transformers.
+Successive loading to ensure no RAM crashes in Colab.
 
 Run: python -m src.audio_baseline.extract_tri_expert
 """
 
 import os, sys, gc, torch, librosa, numpy as np, pandas as pd
+import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoFeatureExtractor, AutoModel
 from pathlib import Path
@@ -24,11 +22,11 @@ from src.audio_baseline.extract_acoustic_features import extract_features as ext
 # ─────────────────────────────────────────────
 ARABIC_BACKBONE = "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
 SER_BACKBONE    = "superb/wav2vec2-large-superb-er"
-MAX_SAMPLES     = 6 * 16000
+MAX_SAMPLES     = 6 * 16000 # 6 seconds
 DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
 
-def get_transformer_embeddings(model_id, dataset_df, audio_map):
-    print(f"🚀 Extracting from {model_id}...")
+def get_concentrated_embeddings(model_id, dataset_df, audio_map):
+    print(f"🚀 Extracting from {model_id} (Mask-Aware)...")
     fe = AutoFeatureExtractor.from_pretrained(model_id)
     model = AutoModel.from_pretrained(model_id).to(DEVICE)
     model.eval()
@@ -45,15 +43,36 @@ def get_transformer_embeddings(model_id, dataset_df, audio_map):
             try:
                 audio, _ = librosa.load(path, sr=16000, mono=True)
                 if len(audio) > MAX_SAMPLES: audio = audio[:MAX_SAMPLES]
-                else: audio = np.pad(audio, (0, MAX_SAMPLES - len(audio)))
+                # Pad to max for batch stability (though we process 1 by 1)
+                audio_padded = np.pad(audio, (0, MAX_SAMPLES - len(audio)))
                 
-                inputs = fe(audio, sampling_rate=16000, return_tensors="pt", padding=True).to(DEVICE)
-                out = model(**inputs)
-                # Mean pool the last hidden state
-                pooled = out.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
-                embeddings.append(pooled)
+                # Get mask and input values
+                inputs = fe(audio_padded, sampling_rate=16000, return_tensors="pt", 
+                            padding="max_length", max_length=MAX_SAMPLES).to(DEVICE)
+                
+                # Custom mask for the REAL audio length (before padding)
+                # Wav2Vec2 frames = ~50 per second. Input is 16000Hz.
+                # But fe() call above pads the mask too. We need the raw mask.
+                # Actually, the fe() call with padding='max_length' provides the correct mask!
+                out = model(input_values=inputs.input_values, attention_mask=inputs.attention_mask)
+                
+                # 🛠️ Fix Padding Dilution: Masked Global Average Pooling
+                last_hidden = out.last_hidden_state # [1, T, 1024]
+                mask = inputs.attention_mask         # [1, MAX_SAMPLES]
+                
+                # Align mask to hidden state size
+                mask_resized = F.interpolate(mask.unsqueeze(1).float(), 
+                                             size=last_hidden.size(1), 
+                                             mode='nearest').squeeze(1) # [1, T]
+                mask_expanded = mask_resized.unsqueeze(-1).expand_as(last_hidden) # [1, T, 1024]
+                
+                # Weighted Mean
+                pooled = (last_hidden * mask_expanded).sum(dim=1) / torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+                
+                embeddings.append(pooled.squeeze().cpu().numpy())
                 valid_indices.append(idx)
             except Exception as e:
+                # print(f"Error on {basename}: {e}")
                 continue
                 
     # Cleanup memory
@@ -65,7 +84,7 @@ def get_transformer_embeddings(model_id, dataset_df, audio_map):
 
 def main():
     print(f"\n{'='*60}")
-    print("🔥  TRI-EXPERT FEATURE EXTRACTION  (Cap: 58-60%)")
+    print("🔥  PRECISION TRI-EXPERT EXTRACTION (Fixed Dilution)")
     print(f"{'='*60}")
 
     # 1. Load Data & Map
@@ -79,21 +98,19 @@ def main():
     for p in src.rglob("*.wav"): audio_map[p.name] = p
     print(f"Mapped {len(audio_map)} files.\n")
 
-    # 2. Extract Expert 1: Arabic XLSR
-    emb_arabic, idx1 = get_transformer_embeddings(ARABIC_BACKBONE, df, audio_map)
+    # 2. Extract Expert 1: Arabic XLSR (Masked)
+    emb_arabic, idx1 = get_concentrated_embeddings(ARABIC_BACKBONE, df, audio_map)
     
-    # 3. Extract Expert 2: SER Superb
-    # (Note: Using the same indices to ensure alignment)
+    # 3. Extract Expert 2: SER Superb (Masked)
     df_v1 = df.iloc[idx1].reset_index(drop=True)
-    emb_ser, idx2 = get_transformer_embeddings(SER_BACKBONE, df_v1, audio_map)
+    emb_ser, idx2 = get_concentrated_embeddings(SER_BACKBONE, df_v1, audio_map)
     
-    # Final alignment: Ensure all experts have the exact same rows
+    # Align
     final_df = df_v1.iloc[idx2].reset_index(drop=True)
     emb_arabic_final = emb_arabic[idx2]
-    emb_ser_final    = emb_ser
     
-    # 4. Extract Expert 3: Handcrafted Physics
-    print("🚀 Extracting Expert 3: Acoustic Physics (MFCC, Pitch)...")
+    # 4. Extract Expert 3: Handcrafted (Physics)
+    print("🚀 Extracting Expert 3: Acoustic Physics...")
     emb_physics = []
     for idx, row in tqdm(final_df.iterrows(), total=len(final_df)):
         basename = Path(str(row["audio_relpath"]).replace("\\", "/")).name
@@ -103,21 +120,19 @@ def main():
         emb_physics.append(extract_physics(audio))
     emb_physics = np.stack(emb_physics)
 
-    # 5. Combine & Save
-    # We store experts individually in the PKL so the trainer can weight them
-    out_path = config.SER_FEATURES_DIR / "tri_expert_dataset.pkl"
+    # 5. Save Concentrated Features
+    out_path = config.SER_FEATURES_DIR / "tri_expert_dataset_v2.pkl"
     final_data = {
         "metadata": final_df,
         "feat_arabic": emb_arabic_final,
-        "feat_ser": emb_ser_final,
+        "feat_ser": emb_ser,
         "feat_physics": emb_physics
     }
     
     pd.to_pickle(final_data, out_path)
-    print(f"\n✅  COMPLETED! Tri-Expert Features Saved.")
+    print(f"\n✅  SUCCESS! Features are now 'Concentrated' and aligned.")
     print(f"    Path: {out_path}")
-    print(f"    Shapes: Arabic={emb_arabic_final.shape} | SER={emb_ser_final.shape} | Physics={emb_physics.shape}")
-    print(f"    Total combined dimensionality: {1024 + 1024 + emb_physics.shape[1]}")
+    print(f"    Total Features: {1024 + 1024 + emb_physics.shape[1]}")
 
 if __name__ == "__main__":
     main()

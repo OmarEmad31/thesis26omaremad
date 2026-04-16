@@ -1,6 +1,7 @@
 """
-Tri-Expert Ensemble Trainer.
-Uses PCA + XGBoost with GridSearchCV to target 58%+ on individual Audio.
+Precision Tri-Expert Trainer (v2).
+Implements: Feature Selection, SMOTE, and Voting Ensemble.
+Goal: 58-60% individual audio performance.
 
 Run: python -m src.audio_baseline.train_tri_ensemble
 """
@@ -8,10 +9,13 @@ Run: python -m src.audio_baseline.train_tri_ensemble
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.model_selection import StratifiedKFold, GridSearchCV
 from sklearn.metrics import accuracy_score, f1_score, classification_report
+from imblearn.over_sampling import SMOTE
 from pathlib import Path
 import random, warnings
 warnings.filterwarnings("ignore")
@@ -27,26 +31,20 @@ def main():
     random.seed(config.SEED)
     np.random.seed(config.SEED)
 
-    print(f"\n{'='*60}")
-    print("🏆  TRI-EXPERT ENSEMBLE TRAINER  (Target: 58-60%)")
-    print("    Arabic-Native + SER-Expert + Acoustic Physics")
-    print(f"{'='*60}")
+    print(f"\n{'='*70}")
+    print("🏆  PRECISION TRI-EXPERT ENSEMBLE (v2)  —  TARGET: 58%+")
+    print("    Mask-Aware 2k Features + SMOTE + Voting Ensemble")
+    print(f"{'='*70}")
 
-    data_path = config.SER_FEATURES_DIR / "tri_expert_dataset.pkl"
+    data_path = config.SER_FEATURES_DIR / "tri_expert_dataset_v2.pkl"
     if not data_path.exists():
-        print(f"[FATAL] Features not found at {data_path}")
+        print(f"[FATAL] Features v2 not found at {data_path}")
         print("Run: python -m src.audio_baseline.extract_tri_expert  first!")
         return
 
     data = pd.read_pickle(data_path)
     df = data["metadata"]
-    
-    # Concatenate all features
-    X_all = np.concatenate([
-        data["feat_arabic"], 
-        data["feat_ser"], 
-        data["feat_physics"]
-    ], axis=1)
+    X_all = np.concatenate([data["feat_arabic"], data["feat_ser"], data["feat_physics"]], axis=1)
     
     label2id = {l: i for i, l in enumerate(sorted(df["emotion_final"].unique()))}
     id2label = {i: l for l, i in label2id.items()}
@@ -54,78 +52,72 @@ def main():
     
     train_mask = (df["split"] != "test").values
     test_mask  = (df["split"] == "test").values
-    
     X_tv, y_tv = X_all[train_mask], y[train_mask]
     X_te, y_te = X_all[test_mask],  y[test_mask]
-    
-    print(f"   Train/Val: {len(X_tv)}  |  Test: {len(X_te)}")
-    print(f"   Original Dimensionality: {X_all.shape[1]}")
+
+    print(f"   Original Features: {X_all.shape[1]}")
+    print(f"   Train samples: {len(X_tv)} | Test samples: {len(X_te)}")
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=config.SEED)
     fold_results = []
 
     for fold_idx, (tr_idx, va_idx) in enumerate(skf.split(X_tv, y_tv)):
-        print(f"\n--- FOLD {fold_idx+1} / 5 ---")
+        print(f"\n🌀 FOLD {fold_idx+1} / 5")
         
         X_tr, y_tr = X_tv[tr_idx], y_tv[tr_idx]
         X_va, y_va = X_tv[va_idx], y_tv[va_idx]
 
-        # 1. Scaling
+        # 1. Scale
         scaler = StandardScaler()
         X_tr_s = scaler.fit_transform(X_tr)
         X_va_s = scaler.transform(X_va)
         X_te_s = scaler.transform(X_te)
 
-        # 2. PCA (Crucial to prevent overfitting on 2300+ features)
-        # We find components to keep 99% variance
-        pca = PCA(n_components=0.99, random_state=config.SEED)
-        X_tr_p = pca.fit_transform(X_tr_s)
-        X_va_p = pca.transform(X_va_s)
-        X_te_p = pca.transform(X_te_s)
-        print(f"   PCA: {X_tr_s.shape[1]}-D -> {X_tr_p.shape[1]}-D (99% variance)")
+        # 2. Feature Selection: Select top 512 most "emotional" features (Reduce noise by 75%)
+        # K=512 is a sweet spot for 600 samples
+        selector = SelectKBest(f_classif, k=512)
+        X_tr_k = selector.fit_transform(X_tr_s, y_tr)
+        X_va_k = selector.transform(X_va_s)
+        X_te_k = selector.transform(X_te_s)
+        print(f"   Selected top {X_tr_k.shape[1]} features via f_classif.")
 
-        # 3. XGBoost Hyperparameter Search
-        # Light grid to keep it fast but effective
-        param_grid = {
-            'n_estimators': [100, 200],
-            'max_depth': [3, 5],
-            'learning_rate': [0.05, 0.1],
-            'subsample': [0.8]
-        }
+        # 3. SMOTE Oversampling: Equalize classes in training set
+        smote = SMOTE(random_state=config.SEED)
+        X_tr_sm, y_tr_sm = smote.fit_resample(X_tr_k, y_tr)
+        print(f"   SMOTE: Balanced train set to {len(X_tr_sm)} samples.")
+
+        # 4. Voting Ensemble (Expert Committee)
+        clf_svm = SVC(kernel="rbf", C=10, gamma="auto", probability=True, random_state=config.SEED)
+        clf_rf  = RandomForestClassifier(n_estimators=300, max_depth=10, random_state=config.SEED)
+        clf_xgb = XGBClassifier(n_estimators=200, max_depth=5, learning_rate=0.05, tree_method='hist', random_state=config.SEED)
         
-        xgb = XGBClassifier(
-            use_label_encoder=False, 
-            eval_metric='mlogloss',
-            random_state=config.SEED,
-            tree_method='hist' # Efficient
+        voter = VotingClassifier(
+            estimators=[('svm', clf_svm), ('rf', clf_rf), ('xgb', clf_xgb)],
+            voting='soft'
         )
         
-        grid = GridSearchCV(xgb, param_grid, cv=3, scoring='f1_macro', n_jobs=-1)
-        grid.fit(X_tr_p, y_tr)
+        voter.fit(X_tr_sm, y_tr_sm)
         
-        best_clf = grid.best_estimator_
-        print(f"   Best Params: {grid.best_params_}")
+        va_acc = accuracy_score(y_va, voter.predict(X_va_k))
+        va_f1  = f1_score(y_va,  voter.predict(X_va_k),  average="macro")
+        te_acc = accuracy_score(y_te, voter.predict(X_te_k))
+        te_f1  = f1_score(y_te,  voter.predict(X_te_k),  average="macro")
 
-        va_acc = accuracy_score(y_va, best_clf.predict(X_va_p))
-        va_f1  = f1_score(y_va,  best_clf.predict(X_va_p),  average="macro")
-        te_acc = accuracy_score(y_te, best_clf.predict(X_te_p))
-        te_f1  = f1_score(y_te,  best_clf.predict(X_te_p),  average="macro")
-
-        print(f"   Val Acc: {va_acc:.4f}  Val F1: {va_f1:.4f}")
-        print(f"   Test Acc: {te_acc:.4f}  Test F1: {te_f1:.4f}")
+        print(f"   Val Acc: {va_acc:.4f} | Val F1: {va_f1:.4f}")
+        print(f"   Test Acc: {te_acc:.4f} | Test F1: {te_f1:.4f}")
         
         fold_results.append({"val_f1": va_f1, "test_acc": te_acc, "test_f1": te_f1})
 
-    print(f"\n{'='*60}")
-    print(f"🏆  TRI-EXPERT ENSEMBLE — FINAL RESULTS")
-    print(f"{'='*60}")
+    print(f"\n{'='*70}")
+    print(f"🏆  FINAL PERFORMANCE: PRECISION ENSEMBLE")
+    print(f"{'='*70}")
     print(f"  Mean Val  F1 : {np.mean([r['val_f1']  for r in fold_results])*100:.2f}%")
     print(f"  Mean Test Acc: {np.mean([r['test_acc'] for r in fold_results])*100:.2f}%")
     print(f"  Mean Test F1 : {np.mean([r['test_f1']  for r in fold_results])*100:.2f}%")
-    print(f"{'='*60}")
+    print(f"{'='*70}")
 
-    print("\n📊  Per-Class Analysis (Last Fold):")
-    print(classification_report(y_te, best_clf.predict(X_te_p), target_names=[id2label[i] for i in range(len(label2id))]))
+    print("\n📊  Per-Class (Last Fold):")
+    print(classification_report(y_te, voter.predict(X_te_k), target_names=[id2label[i] for i in range(len(label2id))]))
 
 if __name__ == "__main__":
     main()
