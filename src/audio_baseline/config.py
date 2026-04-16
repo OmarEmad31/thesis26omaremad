@@ -38,20 +38,19 @@ if IS_COLAB:
     if not DATA_ROOT:
         DATA_ROOT = Path("/content/drive/MyDrive/Thesis Project")
 
-    CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_ast")
-    OFFLINE_FEATURES_DIR = Path("/content/drive/MyDrive/Thesis Project/data/processed/ast_offline")
+    CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_whisper")
+    OFFLINE_FEATURES_DIR = Path("/content/drive/MyDrive/Thesis Project/data/processed/whisper_offline")
 else:
     DATA_ROOT       = Path("dataset/Final Modalink Dataset MERGED")
     SPLIT_CSV_DIR   = Path("data/processed/splits/audio_eligible")
-    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_ast")
-    OFFLINE_FEATURES_DIR = Path("data/processed/ast_offline")
+    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_whisper")
+    OFFLINE_FEATURES_DIR = Path("data/processed/whisper_offline")
 
 # ---------------------------------------------------------------------------
 # MODEL CONFIGURATION (SOTA TRANSFORMER)
 # ---------------------------------------------------------------------------
-# MIT's Audio Spectrogram Transformer (AST). 
-# Chosen to bypass Arabic linguistic bias by utilizing Vision Transformer logic over frequencies.
-MODEL_NAME        = "MIT/ast-finetuned-audioset-10-10-0.4593"
+# Tarteel's Whisper setup physically maps Arabic semantics and phonetics organically.
+MODEL_NAME        = "tarteel-ai/whisper-base-ar"
 N_MELS            = 128
 HOP_LENGTH        = 512
 
