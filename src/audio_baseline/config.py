@@ -38,13 +38,15 @@ if IS_COLAB:
     if not DATA_ROOT:
         DATA_ROOT = Path("/content/drive/MyDrive/Thesis Project")
 
-    CHECKPOINT_DIR  = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_whisper")
-    OFFLINE_FEATURES_DIR = Path("/content/drive/MyDrive/Thesis Project/data/processed/whisper_offline")
+    CHECKPOINT_DIR     = Path("/content/drive/MyDrive/Thesis Project/checkpoints/audio_wavlm")
+    OFFLINE_FEATURES_DIR= Path("/content/drive/MyDrive/Thesis Project/data/processed/whisper_offline")
+    SER_FEATURES_DIR    = Path("/content/drive/MyDrive/Thesis Project/data/processed/ser_offline")
 else:
-    DATA_ROOT       = Path("dataset/Final Modalink Dataset MERGED")
-    SPLIT_CSV_DIR   = Path("data/processed/splits/audio_eligible")
-    CHECKPOINT_DIR  = Path("D:/thesis_checkpoints/audio_whisper")
-    OFFLINE_FEATURES_DIR = Path("data/processed/whisper_offline")
+    DATA_ROOT           = Path("dataset/Final Modalink Dataset MERGED")
+    SPLIT_CSV_DIR       = Path("data/processed/splits/audio_eligible")
+    CHECKPOINT_DIR      = Path("D:/thesis_checkpoints/audio_wavlm")
+    OFFLINE_FEATURES_DIR= Path("data/processed/whisper_offline")
+    SER_FEATURES_DIR    = Path("data/processed/ser_offline")
 
 # ---------------------------------------------------------------------------
 # MODEL CONFIGURATION (SOTA TRANSFORMER)
@@ -77,3 +79,4 @@ SCL_WEIGHT        = 0.1
 
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 OFFLINE_FEATURES_DIR.mkdir(parents=True, exist_ok=True)
+SER_FEATURES_DIR.mkdir(parents=True, exist_ok=True)
