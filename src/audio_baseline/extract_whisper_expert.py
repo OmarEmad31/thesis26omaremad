@@ -64,12 +64,24 @@ def main():
                 inputs = extractor(audio, sampling_rate=16000, return_tensors="pt")
                 input_features = inputs.input_features.to(device)
                 
-                # Execute the 6-Layer Whisper Base Acoustic Encoder specifically.
+                # Execute the Whisper Acoustic Encoder specifically.
                 encoder_outputs = model.encoder(input_features)
                 last_hidden_state = encoder_outputs.last_hidden_state
                 
-                # Crush sequential dimension [batch, seq=1500, dim=512] -> [512] Vector
-                pooled = last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+                # MATHEMATICAL FIX: Padding Dilution Isolation
+                # Whisper outputs exactly 50 sequence frames per second.
+                # We calculate the precise fraction of seconds in this specific clip and slice the array to entirely avoid 0-padded features.
+                duration_seconds = len(audio) / 16000.0
+                active_frames = min(1500, int(duration_seconds * 50))
+                
+                if active_frames < 1:
+                    active_frames = 1  # Failsafe for mathematically glitched silent files
+                    
+                # Extract only the physical vocal array: [batch=1, active_frames, dim=768]
+                active_state = last_hidden_state[0, :active_frames, :]
+                
+                # Crush sequential dimension -> [768] Concentrated Dense Vector
+                pooled = active_state.mean(dim=0).squeeze().cpu().numpy()
                 
                 features_list.append(pooled)
                 valid_indices.append(idx)
