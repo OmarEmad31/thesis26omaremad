@@ -37,7 +37,7 @@ MODEL_ID        = "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
 MAX_WAV_SAMPLES = 5 * 16000
 BATCH_SIZE      = 8            # Physical batch
 ACCUM_STEPS     = 4            # Effective Batch = 32
-UNFREEZE_LAYERS = 12           # High capacity (12 of 24 blocks)
+UNFREEZE_LAYERS = 6            # Optimized capacity (6 of 24 blocks)
 LR_ENCODER      = 1e-5         # Conservatory for the foundation
 LR_HEAD         = 4e-4         # Aggressive for the decision maker
 NUM_EPOCHS      = 30
@@ -148,15 +148,17 @@ def train_epoch_hc(model, loader, optimizer, loss_fn, device):
         
         out = model(input_values=iv, attention_mask=mk, output_hidden_states=True)
         
-        # Mask-aware pooling (The standard for SER)
+        # 🛠️ Fix: Ensure we use the Masked Pooled Embedding for the decider
         last_hidden = out.hidden_states[-1]
         mask_float = mk.unsqueeze(1).float()
         mask_resized = F.interpolate(mask_float, size=last_hidden.size(1), mode='nearest').squeeze(1)
         mask_expanded = mask_resized.unsqueeze(-1).expand_as(last_hidden)
         emb = (last_hidden * mask_expanded).sum(dim=1) / torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+
+        proj = model.projector(emb)
+        logits = model.classifier(proj)
         
-        # We use the model's logits which already handle pooling for classification
-        loss = loss_fn(out.logits, lb) / ACCUM_STEPS
+        loss = loss_fn(logits, lb) / ACCUM_STEPS
         loss.backward()
         
         if (i + 1) % ACCUM_STEPS == 0:
@@ -174,8 +176,18 @@ def evaluate_hc(model, loader, device):
     for batch in loader:
         iv = batch["input_values"].to(device)
         mk = batch["attention_mask"].to(device)
-        # SequenceClassification handles pooling internally for logits
-        logits = model(input_values=iv, attention_mask=mk).logits
+        out = model(input_values=iv, attention_mask=mk, output_hidden_states=True)
+        
+        # Must replicate masked pooling at inference
+        last_hidden = out.hidden_states[-1]
+        mask_float = mk.unsqueeze(1).float()
+        mask_resized = F.interpolate(mask_float, size=last_hidden.size(1), mode='nearest').squeeze(1)
+        mask_expanded = mask_resized.unsqueeze(-1).expand_as(last_hidden)
+        emb = (last_hidden * mask_expanded).sum(dim=1) / torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+        
+        proj = model.projector(emb)
+        logits = model.classifier(proj)
+        
         preds.extend(torch.argmax(logits, 1).cpu().numpy())
         truth.extend(batch["label"].numpy())
     return accuracy_score(truth, preds), f1_score(truth, preds, average="macro"), preds, truth
@@ -239,10 +251,12 @@ def main():
 
         for epoch in range(1, NUM_EPOCHS + 1):
             avg_loss = train_epoch_hc(model, tr_loader, optimizer, loss_fn, device)
-            _, va_f1, _, _ = evaluate_hc(model, va_loader, device)
+            tr_acc, tr_f1, _, _ = evaluate_hc(model, tr_loader, device)
+            va_acc, va_f1, _, _ = evaluate_hc(model, va_loader, device)
             scheduler.step(va_f1)
             
-            print(f"  Ep {epoch:2d} | Loss {avg_loss:.4f} | Val F1 {va_f1:.4f}")
+            print(f"  Ep {epoch:2d}/{NUM_EPOCHS} | Loss {avg_loss:.4f} | "
+                  f"Train {tr_acc:.2f}/{tr_f1:.2f} | Val {va_acc:.2f}/{va_f1:.2f}")
             
             if va_f1 > best_f1:
                 best_f1 = va_f1; torch.save(model.state_dict(), ckpt); no_improve = 0
