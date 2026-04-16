@@ -162,7 +162,7 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"🔥  Arabic-Native SER  |  {MODEL_ID.split('/')[-1]}")
-    print(f"    Unfreeze last {UNFREEZE_LAYERS} blocks  |  LR={LR}  |  {device.upper()}")
+    print(f"    Unfreeze last {UNFREEZE_LAYERS} blocks  |  LR_enc={LR_ENCODER}  LR_head={LR_HEAD}  |  {device.upper()}")
     print(f"{'='*60}\n")
 
     # Audio map
