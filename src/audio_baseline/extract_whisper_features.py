@@ -47,28 +47,31 @@ def main():
     
     print(f"Processing {len(all_df)} total audio files...")
     
+    # 2.5 Completely Indestructible Path Mapping
+    # Because Google Colab zip extraction paths vary wildly depending on how it was bundled, 
+    # we physically scan the entire Colab disk for .wav files once to guarantee perfect location binding.
+    print("Mapping audio files seamlessly...")
+    audio_map = {}
+    for p in Path("/content").rglob("*.wav"):
+        audio_map[p.name] = p
+        
+    print(f"Found {len(audio_map)} physical audio files on disk.")
+    
     # 3. Extract Loop
     features_list = []
     valid_indices = []
     
     with torch.no_grad():
         for idx, row in tqdm(all_df.iterrows(), total=len(all_df)):
-            fldr = str(row["folder"]).strip()
             rel = str(row["audio_relpath"]).replace("\\", "/").lstrip("/")
+            basename = Path(rel).name
             
-            # Bulletproof path resolving for varying Colab extraction structures
-            audio_path = config.DATA_ROOT / fldr / rel
-            if not audio_path.exists():
-                audio_path = Path("/content/Thesis Project") / fldr / rel
-            if not audio_path.exists():
-                audio_path = config.DATA_ROOT / rel
-            if not audio_path.exists():
-                audio_path = Path("/content/drive/MyDrive/Thesis Project") / fldr / rel
-                
-            if not audio_path.exists():
-                print(f"[Warning] Missing file: {rel}")
+            if basename not in audio_map:
+                print(f"[Warning] Missing file from ZIP: {basename}")
                 continue
                 
+            audio_path = audio_map[basename]
+            
             try:
                 audio, _ = librosa.load(audio_path, sr=config.SAMPLING_RATE, mono=True)
                 audio = audio[:config.MAX_AUDIO_SAMPLES].astype(np.float32)
