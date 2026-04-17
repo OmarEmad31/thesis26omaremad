@@ -153,8 +153,8 @@ def main():
 
     for fold_idx, (tr_idx, va_idx) in enumerate(skf.split(X, y)):
         print(f"\n🌀 FOLD {fold_idx+1}")
-        tr_loader = DataLoader(HybridSERDataset(all_df.iloc[tr_idx], label2id, audio_map, augment=True), batch_size=BATCH_SIZE, shuffle=True)
-        va_loader = DataLoader(HybridSERDataset(all_df.iloc[va_idx], label2id, audio_map), batch_size=BATCH_SIZE)
+        tr_loader = DataLoader(HybridSERDataset(all_df.iloc[tr_idx], label2id, audio_map, augment=True), batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+        va_loader = DataLoader(HybridSERDataset(all_df.iloc[va_idx], label2id, audio_map), batch_size=BATCH_SIZE, drop_last=True)
 
         model = HybridSERModel(num_labels, device).to(device)
         cw = compute_class_weight("balanced", classes=np.unique(y[tr_idx]), y=y[tr_idx])
