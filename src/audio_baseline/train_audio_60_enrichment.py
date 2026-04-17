@@ -162,7 +162,7 @@ def main():
     # Calculate Class Weights to fix that low F1
     classes = sorted(train_df["emotion_final"].unique())
     y_train_labels = train_df["emotion_final"].tolist()
-    weights = compute_class_weight('balanced', classes=classes, y=y_train_labels)
+    weights = compute_class_weight('balanced', classes=np.array(classes), y=np.array(y_train_labels))
     class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
     
     label2id = {l: i for i, l in enumerate(classes)}
