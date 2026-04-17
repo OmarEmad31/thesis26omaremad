@@ -177,11 +177,21 @@ def main():
     model.load_state_dict(torch.load(teacher_ckpt)); model.eval()
     
     # Load full metadata (this should exist from your earlier preprocessing)
-    try:
-        full_df = pd.read_csv(Path(config.SPLIT_CSV_DIR).parent.parent / "processed_metadata.csv")
-    except:
-        print("Falling back to scanning drive...")
-        full_files = [p.name for p in audio_map.values()]
+    full_df = None
+    search_paths = [
+        Path(config.SPLIT_CSV_DIR).parent.parent / "manifest.csv",
+        Path(config.SPLIT_CSV_DIR).parent.parent / "manifest_with_split.csv",
+        Path("/content/dataset/data/processed/manifest.csv"),
+    ]
+    for p in search_paths:
+        if p.exists():
+            full_df = pd.read_csv(p)
+            print(f"✅ Loaded master manifest from: {p}")
+            break
+
+    if full_df is None:
+        print("⚠️ manifest.csv not found. Falling back to scanning audio files...")
+        full_files = [str(Path(p).relative_to(config.DATA_ROOT)) for p in audio_map.values()]
         full_df = pd.DataFrame({"audio_relpath": full_files, "emotion_final": ["Unknown"] * len(full_files)})
 
     # Filter out files already in Gold

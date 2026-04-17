@@ -5,6 +5,7 @@ IS_COLAB = "COLAB_GPU" in os.environ or os.path.exists("/content")
 
 if IS_COLAB:
     split_search_paths = [
+        Path("/content/dataset/data/processed/splits/audio_eligible"),
         Path("/content/Thesis Project/data/processed/splits/audio_eligible"),
         Path("/content/data/processed/splits/audio_eligible"),
         Path("/content/drive/MyDrive/Thesis Project/data/processed/splits/audio_eligible")
