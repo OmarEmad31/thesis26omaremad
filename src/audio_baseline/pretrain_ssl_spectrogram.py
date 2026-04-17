@@ -130,9 +130,13 @@ def main():
     print("🧠  METHOD 11: SSL PRE-TRAINING (EGYPTIAN SPEECH DOMAIN)")
     print(f"{'='*70}\n")
 
-    # 1. Collect all 5,702 paths
-    data_dir = Path("dataset/Final Modalink Dataset MERGED")
-    all_paths = list(data_dir.rglob("*.wav"))
+    # 1. Collect all 5,702 paths (Case-insensitive search)
+    data_dir = Path(config.DATA_ROOT)
+    if not data_dir.exists():
+        # Fallback for Colab structures
+        data_dir = Path("dataset/Final Modalink Dataset MERGED")
+
+    all_paths = [p for p in data_dir.rglob("*") if p.suffix.lower() in [".wav", ".mp3"]]
     print(f"Loaded {len(all_paths)} unlabeled Egyptian audio clips.")
 
     dataset = SSLAudioDataset(all_paths)
