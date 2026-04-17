@@ -33,7 +33,7 @@ BATCH_SIZE     = 4     # WavLM is heavy, use small batch + accumulation
 ACCUM_STEPS    = 16    # Virtual Batch 64
 NUM_EPOCHS_T   = 10    # Teacher training
 NUM_EPOCHS_S   = 15    # Student training
-LR             = 2e-5
+LR             = 5e-5
 SR             = 16000
 MAX_DURATION   = 6
 CONF_THRESHOLD = 0.85
@@ -75,14 +75,15 @@ class WavLMDataset(Dataset):
 # ---------------------------------------------------------------------------
 # TRAINING LOGIC
 # ---------------------------------------------------------------------------
-def train_loop(model, tr_loader, va_loader, optimizer, device, epochs, ckpt_path):
+def train_loop(model, tr_loader, va_loader, optimizer, device, epochs, ckpt_path, class_weights=None):
     best_f1 = 0
+    ce_fn = nn.CrossEntropyLoss(weight=class_weights) if class_weights is not None else nn.CrossEntropyLoss()
     for epoch in range(1, epochs + 1):
         model.train(); t_loss = 0; optimizer.zero_grad()
         for b_idx, batch in enumerate(tqdm(tr_loader, desc=f"Ep{epoch}", leave=False)):
             inputs, lbs = batch["input_values"].to(device), batch["label"].to(device)
-            outputs = model(inputs, labels=lbs)
-            loss = outputs.loss
+            outputs = model(inputs)
+            loss = ce_fn(outputs.logits, lbs)
             (loss / ACCUM_STEPS).backward()
             if (b_idx+1) % ACCUM_STEPS == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -138,7 +139,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     
     teacher_ckpt = config.CHECKPOINT_DIR / "wavlm_teacher.pt"
-    train_loop(model, tr_loader, va_loader, optimizer, device, NUM_EPOCHS_T, teacher_ckpt)
+    train_loop(model, tr_loader, va_loader, optimizer, device, NUM_EPOCHS_T, teacher_ckpt, class_weights=class_weights)
 
     print(f"\n🚀 PHASE 2: PSEUDO-LABELING (SILVER ENRICHMENT)")
     model.load_state_dict(torch.load(teacher_ckpt)); model.eval()
@@ -176,7 +177,7 @@ def main():
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=LR)
     
     student_ckpt = config.CHECKPOINT_DIR / "final_60_audio_wavlm.pt"
-    train_loop(student_model, final_tr_loader, va_loader, optimizer, device, NUM_EPOCHS_S, student_ckpt)
+    train_loop(student_model, final_tr_loader, va_loader, optimizer, device, NUM_EPOCHS_S, student_ckpt, class_weights=class_weights)
 
     print(f"\n🏆 TITAN COMPLETE. MODEL: {student_ckpt}")
 
