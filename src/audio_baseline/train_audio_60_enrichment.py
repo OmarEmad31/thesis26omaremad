@@ -28,14 +28,14 @@ from src.audio_baseline import config
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-BATCH_SIZE     = 16
-ACCUM_STEPS    = 8
-NUM_EPOCHS_T   = 20   # Teacher training
-NUM_EPOCHS_S   = 25   # Student (Enriched) training
-LR             = 3e-4
+BATCH_SIZE     = 32
+ACCUM_STEPS    = 4    # Virtual Batch 128
+NUM_EPOCHS_T   = 20
+NUM_EPOCHS_S   = 30
+LR             = 1e-4
 SCL_TEMP       = 0.1
-SCL_WEIGHT     = 0.1
-LABEL_SMOOTH   = 0.1
+SCL_WEIGHT     = 0.2
+LABEL_SMOOTH   = 0.05
 CONF_THRESHOLD = 0.85 # Confidence required for pseudo-labeling
 SR             = 16000
 MAX_DURATION   = 5
