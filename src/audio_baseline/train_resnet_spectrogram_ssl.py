@@ -1,15 +1,16 @@
 """
-Method 12 (Improved): High-Capacity Visual Audio Baseline.
-Architecture: ResNet-50 (Upgraded from ResNet-18).
-Input: 3-Channel Spectrograms (Static, Delta, Delta-Delta).
-Optimization: Uniform LR + Weighted CrossEntropy.
-Goal: Final push for 58%+ individual audio accuracy.
+Method 15: Contrastive ResNet-50 "The Hammer".
+Architecture: ResNet-50 + SCL Projection Head.
+Input: 3-Channel Spectrograms.
+Optimization: Supervised Contrastive Learning (SCL) + Label Smoothing.
+Goal: Reach 60% accuracy.
 
 Run: python -m src.audio_baseline.train_resnet_spectrogram_ssl
 """
 
 import os, sys, random, torch, librosa, numpy as np, pandas as pd
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 from sklearn.model_selection import StratifiedKFold
@@ -27,13 +28,38 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────
-# CONFIG
+BATCH_SIZE     = 16
+NUM_EPOCHS     = 30
+LR             = 5e-5 
+SCL_TEMP       = 0.1
+SCL_WEIGHT     = 0.3          # 30% Clustering, 70% Classification
+LABEL_SMOOTH   = 0.1          # Prevent over-fitting
+MAX_DURATION   = 5
+SR             = 16000
+
 # ─────────────────────────────────────────────
-BATCH_SIZE = 16 # ResNet-50 is larger, so we reduce batch slightly
-NUM_EPOCHS = 30
-LR = 5e-5 
-MAX_DURATION = 5
-SR = 16000
+# LOSS FUNCTIONS
+# ─────────────────────────────────────────────
+class SupervisedContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, features, labels):
+        features = F.normalize(features, p=2, dim=1)
+        sim = torch.matmul(features, features.T) / self.temperature
+        mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float()
+        bs = labels.size(0)
+        diag = torch.ones_like(mask) - torch.eye(bs, device=mask.device)
+        mask = mask * diag
+        max_s, _ = torch.max(sim, dim=1, keepdim=True)
+        sim = sim - max_s.detach()
+        exp_s = torch.exp(sim) * diag
+        log_p = sim - torch.log(exp_s.sum(1, keepdim=True) + 1e-8)
+        valid = mask.sum(1) > 0
+        if valid.any():
+            return -(mask[valid] * log_p[valid]).sum(1).div(mask[valid].sum(1) + 1e-8).mean()
+        return torch.tensor(0.0, device=features.device, requires_grad=True)
 
 # ─────────────────────────────────────────────
 # DATASET
@@ -79,10 +105,35 @@ class VisualSERDataset(Dataset):
 # ─────────────────────────────────────────────
 # MODEL (ResNet-50)
 # ─────────────────────────────────────────────
-def build_improved_model(num_labels, device):
-    print("💎 Initializing Improved ResNet-50 Backend...")
-    model = models.resnet50(pretrained=True) 
-    model.fc = nn.Linear(model.fc.in_features, num_labels)
+class ContrastiveResNet(nn.Module):
+    def __init__(self, num_labels):
+        super().__init__()
+        self.backbone = models.resnet50(pretrained=True)
+        dim_in = self.backbone.fc.in_features
+        self.backbone.fc = nn.Identity() # Remove default head
+        
+        # Projection head for SCL (Clustering)
+        self.projection_head = nn.Sequential(
+            nn.Linear(dim_in, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128)
+        )
+        
+        # Classifier (Prediction)
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(dim_in, num_labels)
+        )
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        embeddings = self.projection_head(feat)
+        logits = self.classifier(feat)
+        return logits, embeddings
+
+def build_model(num_labels, device):
+    print("💎 Initializing Contrastive ResNet-50 (Method 15)...")
+    model = ContrastiveResNet(num_labels)
     return model.to(device)
 
 def main():
@@ -111,21 +162,30 @@ def main():
         tr_loader = DataLoader(VisualSERDataset(all_df.iloc[tr_idx], label2id, audio_map, augment=True), batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
         va_loader = DataLoader(VisualSERDataset(all_df.iloc[va_idx], label2id, audio_map), batch_size=BATCH_SIZE, drop_last=True)
 
-        model = build_improved_model(num_labels, device)
+        model = build_model(num_labels, device)
         cw = compute_class_weight("balanced", classes=np.unique(y[tr_idx]), y=y[tr_idx])
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32).to(device))
-        optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-        # Settle the learning at the end
+        ce_fn  = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32).to(device), label_smoothing=LABEL_SMOOTH)
+        scl_fn = SupervisedContrastiveLoss(SCL_TEMP)
+        
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
         
-        best_f1, best_acc = 0, 0
+        best_f1 = 0
         ckpt = config.CHECKPOINT_DIR / f"best_resnet50_fold_{fold_idx}.pt"
 
         for epoch in range(1, NUM_EPOCHS + 1):
             model.train(); t_loss = 0
             for batch in tqdm(tr_loader, desc=f"Ep{epoch}", leave=False):
                 imgs, lbs = batch["image"].to(device), batch["label"].to(device)
-                optimizer.zero_grad(); out = model(imgs); loss = criterion(out, lbs); loss.backward(); optimizer.step()
+                optimizer.zero_grad()
+                logits, feat = model(imgs)
+                
+                loss_ce  = ce_fn(logits, lbs)
+                loss_scl = scl_fn(feat, lbs)
+                loss     = (1 - SCL_WEIGHT) * loss_ce + SCL_WEIGHT * loss_scl
+                
+                loss.backward()
+                optimizer.step()
                 t_loss += loss.item()
             
             scheduler.step()
@@ -133,17 +193,20 @@ def main():
             model.eval(); preds, truth = [], []
             with torch.no_grad():
                 for b in va_loader:
-                    out = model(b["image"].to(device)); preds.extend(torch.argmax(out, 1).cpu().numpy()); truth.extend(b["label"].numpy())
+                    logits, _ = model(b["image"].to(device))
+                    preds.extend(torch.argmax(logits, 1).cpu().numpy())
+                    truth.extend(b["label"].numpy())
             va_acc, va_f1 = accuracy_score(truth, preds), f1_score(truth, preds, average="macro")
             
             # Eval Test
             tp, tt = [], []
             with torch.no_grad():
                 for b in test_loader:
-                    o = model(b["image"].to(device)); tp.extend(torch.argmax(o, 1).cpu().numpy()); tt.extend(b["label"].numpy())
+                    ls, _ = model(b["image"].to(device))
+                    tp.extend(torch.argmax(ls, 1).cpu().numpy()); tt.extend(b["label"].numpy())
             te_acc, te_f1 = accuracy_score(tt, tp), f1_score(tt, tp, average="macro")
 
-            print(f"   Ep {epoch:2d}/{NUM_EPOCHS} | Val {va_acc:.3f}/{va_f1:.3f} | Test {te_acc:.3f}/{te_f1:.3f}")
+            print(f"   Ep {epoch:2d}/{NUM_EPOCHS} | Loss {t_loss/len(tr_loader):.3f} | Val {va_acc:.3f}/{va_f1:.3f} | Test {te_acc:.3f}/{te_f1:.3f}")
             if va_f1 > best_f1: best_f1 = va_f1; best_acc = va_acc; torch.save(model.state_dict(), ckpt)
         
         fold_results.append({"acc": best_acc, "f1": best_f1})
