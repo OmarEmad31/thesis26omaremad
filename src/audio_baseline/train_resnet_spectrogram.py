@@ -60,17 +60,33 @@ class VisualSERDataset(Dataset):
         if len(audio) > target_len: audio = audio[:target_len]
         else: audio = np.pad(audio, (0, target_len - len(audio)))
         
-        # 3. Generate Mel Spectrogram
-        # Standard settings: 128 bins, 25ms window, 10ms hop
-        mel = librosa.feature.melspectrogram(y=audio, sr=SR, n_mels=128, n_fft=400, hop_length=160)
-        mel_db = librosa.power_to_db(mel, ref=np.max)
+        # 3. Generate 3-Channel Spectrogram (Static, Delta, Delta-Delta)
+        mel = librosa.feature.melspectrogram(y=audio.astype(np.float32), sr=SR, n_mels=128, n_fft=400, hop_length=160)
+        static = librosa.power_to_db(mel, ref=np.max)
+        delta_1 = librosa.feature.delta(static, order=1)
+        delta_2 = librosa.feature.delta(static, order=2)
         
-        # 4. Normalize to [0, 1] for CNN
-        mel_scaled = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-9)
+        img = np.stack([static, delta_1, delta_2], axis=0)
         
-        # 5. Convert to 3-channel "image" for ResNet
-        # Image shape: [3, 128, 501]
-        img = np.stack([mel_scaled, mel_scaled, mel_scaled], axis=0)
+        # 4. SpecAugment (Training only)
+        if self.augment:
+            # Frequency masking
+            num_f_masks = 2
+            for _ in range(num_f_masks):
+                f = random.randint(0, 15)
+                f0 = random.randint(0, 128 - f)
+                img[:, f0:f0+f, :] = img.min()
+            # Time masking
+            num_t_masks = 2
+            for _ in range(num_t_masks):
+                t = random.randint(0, 25)
+                t0 = random.randint(0, img.shape[2] - t)
+                img[:, :, t0:t0+t] = img.min()
+
+        # Normalize each channel to [0, 1]
+        img_min = img.min(axis=(1, 2), keepdims=True)
+        img_max = img.max(axis=(1, 2), keepdims=True)
+        img = (img - img_min) / (img_max - img_min + 1e-9)
         
         return {
             "image": torch.tensor(img, dtype=torch.float32),
@@ -94,7 +110,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"\n{'='*70}")
-    print("🌅  METHOD 9: VISUAL RESET (RESNET-18 + SPECTROGRAMS)")
+    print("🌅  METHOD 10: 3D VISUAL UPGRADE (RESNET-18 + 3-CHANNEL)")
     print(f"{'='*70}\n")
 
     # 1. Load Data
@@ -141,17 +157,28 @@ def main():
                 optimizer.step()
                 train_loss += loss.item()
             
-            # Eval
+            # Eval Val
             model.eval(); preds, truth = [], []
             with torch.no_grad():
                 for batch in va_loader:
                     out = model(batch["image"].to(device))
                     preds.extend(torch.argmax(out, 1).cpu().numpy())
                     truth.extend(batch["label"].numpy())
-            
             va_acc = accuracy_score(truth, preds)
             va_f1 = f1_score(truth, preds, average="macro")
-            print(f"   Ep {epoch}/{NUM_EPOCHS} | Loss {train_loss/len(tr_loader):.4f} | Val Acc {va_acc:.3f} | Val F1 {va_f1:.3f}")
+
+            # Eval Test
+            t_preds, t_truth = [], []
+            with torch.no_grad():
+                for batch in test_loader:
+                    out = model(batch["image"].to(device))
+                    t_preds.extend(torch.argmax(out, 1).cpu().numpy())
+                    t_truth.extend(batch["label"].numpy())
+            te_acc = accuracy_score(t_truth, t_preds)
+            te_f1 = f1_score(t_truth, t_preds, average="macro")
+            
+            print(f"   Ep {epoch}/{NUM_EPOCHS} | Loss {train_loss/len(tr_loader):.4f} | "
+                  f"Val {va_acc:.3f}/{va_f1:.3f} | Test {te_acc:.3f}/{te_f1:.3f}")
             
             if va_f1 > best_f1:
                 best_f1 = va_f1; best_acc = va_acc
