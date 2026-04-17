@@ -82,20 +82,29 @@ class HybridSERDataset(Dataset):
         }
 
 # ─────────────────────────────────────────────
-# HYBRID MODEL
+# HYBRID MODEL (SSL-Enhanced)
 # ─────────────────────────────────────────────
 class HybridSERModel(nn.Module):
     def __init__(self, num_labels, device):
         super().__init__()
-        # Branch A: Vision
-        self.resnet = models.resnet18(pretrained=True)
+        # Branch A: Vision (Loading SSL Weights)
+        self.resnet = models.resnet18(pretrained=False)
+        ssl_path = config.CHECKPOINT_DIR / "egyptian_ssl_resnet18.pt"
+        if ssl_path.exists():
+            print(f"💎 Loading Egyptian-Native SSL Weights from {ssl_path}...")
+            state_dict = torch.load(ssl_path, map_location=device)
+            self.resnet.load_state_dict(state_dict, strict=False)
+        else:
+            print("⚠️ SSL Weights not found! Using standard ImageNet.")
+            self.resnet = models.resnet18(pretrained=True)
+
         self.resnet_dim = self.resnet.fc.in_features
-        self.resnet.fc = nn.Identity() # Remove classifier
+        self.resnet.fc = nn.Identity()
 
         # Branch B: Speech
         print(f"Loading {W2V_MODEL_ID}...")
         self.w2v = Wav2Vec2Model.from_pretrained(W2V_MODEL_ID)
-        self.w2v_dim = self.w2v.config.hidden_size # Usually 1024
+        self.w2v_dim = self.w2v.config.hidden_size 
 
         # Fusion Head
         combined_dim = self.resnet_dim + self.w2v_dim
@@ -109,22 +118,18 @@ class HybridSERModel(nn.Module):
             nn.Linear(256, num_labels)
         )
         
-        # Freeze early layers of Wav2Vec2 to save memory / prevent corruption
+        # Selective Unfreezing
         for p in self.w2v.feature_extractor.parameters(): p.requires_grad = False
-        for p in self.w2v.encoder.layers[:12].parameters(): p.requires_grad = False
+        # Unfreeze last 6 layers of Wav2Vec2 for phonetic specialization
+        total_layers = len(self.w2v.encoder.layers)
+        for i, layer in enumerate(self.w2v.encoder.layers):
+            layer.requires_grad = (i >= total_layers - 6)
 
     def forward(self, image, raw_audio):
-        # 1. Vision Forward
-        feat_vis = self.resnet(image) # [B, 512]
-        
-        # 2. Speech Forward
+        feat_vis = self.resnet(image)
         w2v_out = self.w2v(raw_audio).last_hidden_state
-        feat_seq = torch.mean(w2v_out, dim=1) # Global Mean Pool [B, 1024]
-        
-        # 3. Concatenate
+        feat_seq = torch.mean(w2v_out, dim=1) 
         combined = torch.cat([feat_vis, feat_seq], dim=1)
-        
-        # 4. Final Classification
         return self.fusion(combined)
 
 # ─────────────────────────────────────────────
@@ -133,7 +138,7 @@ class HybridSERModel(nn.Module):
 def main():
     torch.manual_seed(42); np.random.seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n{'='*70}\n🚀 METHOD 13: HYBRID FUSION (RESNET + WAV2VEC2)\n{'='*70}\n")
+    print(f"\n{'='*70}\n🚀 METHOD 13.1: HYBRID SSL-FUSION (THE FINAL PUSH)\n{'='*70}\n")
 
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
@@ -159,7 +164,13 @@ def main():
         model = HybridSERModel(num_labels, device).to(device)
         cw = compute_class_weight("balanced", classes=np.unique(y[tr_idx]), y=y[tr_idx])
         criterion = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32).to(device), label_smoothing=0.1)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+        
+        # Differential Learning Rates
+        optimizer = torch.optim.AdamW([
+            {"params": model.resnet.parameters(), "lr": LR / 10},
+            {"params": model.w2v.parameters(), "lr": LR / 10},
+            {"params": model.fusion.parameters(), "lr": LR},
+        ])
         
         best_f1 = 0
         ckpt = config.CHECKPOINT_DIR / f"best_hybrid_fold_{fold_idx}.pt"
@@ -171,7 +182,6 @@ def main():
                 out = model(imgs, raws)
                 loss = criterion(out, lbs) / ACCUM_STEPS
                 loss.backward()
-                
                 if (b_idx + 1) % ACCUM_STEPS == 0:
                     optimizer.step(); optimizer.zero_grad()
             
@@ -180,9 +190,17 @@ def main():
                 for b in va_loader:
                     o = model(b["image"].to(device), b["raw_audio"].to(device))
                     preds.extend(torch.argmax(o, 1).cpu().numpy()); truth.extend(b["label"].numpy())
-            
             va_acc, va_f1 = accuracy_score(truth, preds), f1_score(truth, preds, average="macro")
-            print(f"   Ep {epoch:2d}/{NUM_EPOCHS} | Val Acc {va_acc:.3f} | Val F1 {va_f1:.3f}")
+
+            # Eval Test
+            tp, tt = [], []
+            with torch.no_grad():
+                for b in test_loader:
+                    o = model(b["image"].to(device), b["raw_audio"].to(device))
+                    tp.extend(torch.argmax(o, 1).cpu().numpy()); tt.extend(b["label"].numpy())
+            te_acc, te_f1 = accuracy_score(tt, tp), f1_score(tt, tp, average="macro")
+
+            print(f"   Ep {epoch:2d}/{NUM_EPOCHS} | Val {va_acc:.3f}/{va_f1:.3f} | Test {te_acc:.3f}/{te_f1:.3f}")
             if va_f1 > best_f1: best_f1 = va_f1; torch.save(model.state_dict(), ckpt)
         
         fold_results.append({"f1": best_f1})
