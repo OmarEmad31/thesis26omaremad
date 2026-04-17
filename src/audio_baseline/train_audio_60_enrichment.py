@@ -33,6 +33,7 @@ ACCUM_STEPS    = 8
 NUM_EPOCHS_T   = 15   # Teacher training
 NUM_EPOCHS_S   = 20   # Student (Enriched) training
 LR             = 5e-5
+SCL_TEMP       = 0.1
 SCL_WEIGHT     = 0.1
 LABEL_SMOOTH   = 0.1
 CONF_THRESHOLD = 0.85 # Confidence required for pseudo-labeling
@@ -105,7 +106,9 @@ class SupervisedContrastiveLoss(nn.Module):
 class ContrastiveResNet(nn.Module):
     def __init__(self, num_labels):
         super().__init__()
-        self.backbone = models.resnet50(pretrained=True)
+        # Use modern weights API
+        weights = models.ResNet50_Weights.DEFAULT
+        self.backbone = models.resnet50(weights=weights)
         dim_in = self.backbone.fc.in_features
         self.backbone.fc = nn.Identity()
         self.projection_head = nn.Sequential(nn.Linear(dim_in, 512), nn.ReLU(), nn.Linear(512, 128))
