@@ -76,8 +76,13 @@ class VisualSERDataset(Dataset):
             if random.random() > 0.5:
                 t = random.randint(0, 30); t0 = random.randint(0, img.shape[2]-t); img[:, :, t0:t0+t] = img.min()
 
-        mn, mx = img.min(axis=(1, 2), keepdims=True), img.max(axis=(1, 2), keepdims=True)
+        mn, mx = img.min(), img.max()
         img = (img - mn) / (mx - mn + 1e-9)
+        
+        # Standard ImageNet Normalization
+        mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+        std  = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+        img = (img - mean) / std
         
         label = row["emotion_final"]
         label_id = self.label2id[label] if label in self.label2id else -1
