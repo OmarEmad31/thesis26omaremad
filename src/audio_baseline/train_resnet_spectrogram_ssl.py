@@ -1,9 +1,8 @@
 """
-Method 15: Contrastive ResNet-50 "The Hammer".
-Architecture: ResNet-50 + SCL Projection Head.
-Input: 3-Channel Spectrograms.
-Optimization: Supervised Contrastive Learning (SCL) + Label Smoothing.
-Goal: Reach 60% accuracy.
+Method 16: Balanced Contrastive Tuning "The Balanced Hammer".
+Architecture: ResNet-50 + SCL + Gradient Accumulation.
+Optimization: Virtual Batch Size 128 (16 * 8) + SCL Weight 0.1.
+Goal: Break 45% individual audio barrier.
 
 Run: python -m src.audio_baseline.train_resnet_spectrogram_ssl
 """
@@ -28,11 +27,12 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────
-BATCH_SIZE     = 16
+BATCH_SIZE     = 16           # Local batch
+ACCUM_STEPS    = 8            # Virtual batch = 16 * 8 = 128 (CRITICAL FOR SCL)
 NUM_EPOCHS     = 30
 LR             = 5e-5 
 SCL_TEMP       = 0.1
-SCL_WEIGHT     = 0.3          # 30% Clustering, 70% Classification
+SCL_WEIGHT     = 0.1          # Reduced (Clustering is now just a guide)
 LABEL_SMOOTH   = 0.1          # Prevent over-fitting
 MAX_DURATION   = 5
 SR             = 16000
@@ -174,18 +174,22 @@ def main():
         ckpt = config.CHECKPOINT_DIR / f"best_resnet50_fold_{fold_idx}.pt"
 
         for epoch in range(1, NUM_EPOCHS + 1):
-            model.train(); t_loss = 0
-            for batch in tqdm(tr_loader, desc=f"Ep{epoch}", leave=False):
+            model.train(); t_loss = 0; optimizer.zero_grad()
+            for b_idx, batch in enumerate(tqdm(tr_loader, desc=f"Ep{epoch}", leave=False)):
                 imgs, lbs = batch["image"].to(device), batch["label"].to(device)
-                optimizer.zero_grad()
                 logits, feat = model(imgs)
                 
                 loss_ce  = ce_fn(logits, lbs)
                 loss_scl = scl_fn(feat, lbs)
                 loss     = (1 - SCL_WEIGHT) * loss_ce + SCL_WEIGHT * loss_scl
                 
-                loss.backward()
-                optimizer.step()
+                # Gradient Accumulation Logic
+                (loss / ACCUM_STEPS).backward()
+                
+                if (b_idx + 1) % ACCUM_STEPS == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step(); optimizer.zero_grad()
+                
                 t_loss += loss.item()
             
             scheduler.step()

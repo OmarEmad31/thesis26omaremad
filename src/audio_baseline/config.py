@@ -18,6 +18,7 @@ if IS_COLAB:
         SPLIT_CSV_DIR = Path("/content/drive/MyDrive/Thesis Project/data/processed/splits/audio_eligible")
 
     search_roots = [
+        Path("/content/dataset"),
         Path("/content/drive/MyDrive/Thesis Project/dataset"),
         Path("/content/drive/MyDrive/Thesis Project"),
         Path("/content/Thesis Project"),
