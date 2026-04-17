@@ -123,10 +123,20 @@ def main():
         model = build_ssl_tuned_model(num_labels, device)
         # 🧪 FIX: Weighted Loss to boost F1
         cw = compute_class_weight("balanced", classes=np.unique(y[tr_idx]), y=y[tr_idx])
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32).to(device))
-        optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+        # 🧬 Precision Tuning: 
+        # 1. Differential Learning Rates (Protect SSL weights, tune the head)
+        optimizer = torch.optim.AdamW([
+            {"params": [p for n, p in model.named_parameters() if "fc" not in n], "lr": LR / 10},
+            {"params": model.fc.parameters(), "lr": LR},
+        ], weight_decay=1e-4)
+
+        # 2. Cosine Annealing Scheduler (Smooth descent)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+
+        # 3. Label Smoothing (Prevents overconfidence)
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32).to(device), label_smoothing=0.1)
         
-        best_f1, best_acc = 0, 0
+        best_f1, best_acc, no_improve = 0, 0, 0
         ckpt = config.CHECKPOINT_DIR / f"best_ssl_fold_{fold_idx}.pt"
 
         for epoch in range(1, NUM_EPOCHS + 1):
@@ -136,6 +146,8 @@ def main():
                 optimizer.zero_grad(); out = model(imgs); loss = criterion(out, lbs); loss.backward(); optimizer.step()
                 t_loss += loss.item()
             
+            scheduler.step() # Advance scheduler
+
             model.eval(); preds, truth = [], []
             with torch.no_grad():
                 for b in va_loader:
@@ -150,8 +162,17 @@ def main():
                     o = model(b["image"].to(device)); tp.extend(torch.argmax(o, 1).cpu().numpy()); tt.extend(b["label"].numpy())
             te_acc, te_f1 = accuracy_score(tt, tp), f1_score(tt, tp, average="macro")
 
-            print(f"   Ep {epoch:2d}/{NUM_EPOCHS} | Val {va_acc:.3f}/{va_f1:.3f} | Test {te_acc:.3f}/{te_f1:.3f}")
-            if va_f1 > best_f1: best_f1 = va_f1; best_acc = va_acc; torch.save(model.state_dict(), ckpt)
+            print(f"   Ep {epoch:2d}/{NUM_EPOCHS} | Val {va_acc:.3f}/{va_f1:.3f} | Test {te_acc:.3f}/{te_f1:.3f} | LR: {optimizer.param_groups[1]['lr']:.2e}")
+            
+            if va_f1 > best_f1: 
+                best_f1 = va_f1; best_acc = va_acc; torch.save(model.state_dict(), ckpt)
+                no_improve = 0
+            else:
+                no_improve += 1
+            
+            if no_improve >= 8: # Early Stopping
+                print(f"   🛑 Early stopping at epoch {epoch}")
+                break
         
         fold_results.append({"acc": best_acc, "f1": best_f1})
         print(f"📊 FOLD {fold_idx+1} Result: Acc {best_acc*100:.1f}% | F1 {best_f1*100:.1f}%")
