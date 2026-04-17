@@ -2,8 +2,10 @@ import pandas as pd
 import numpy as np
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
 from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import StratifiedKFold
 from pathlib import Path
 import random
 
@@ -59,23 +61,38 @@ def main():
         X_tr, X_va = X_trainval[train_index], X_trainval[val_index]
         y_tr, y_va = y_trainval[train_index], y_trainval[val_index]
         
-        # 1. Feature Scaling (Acoustic SVM hyperplanes shatter if scales are uneven)
+        # 1. PCA: Compress noisy 512-D space into dense 128-D manifold
+        # This dramatically improves SVM separability on small datasets by removing low-variance noise dimensions
         scaler = StandardScaler()
         X_tr_scaled = scaler.fit_transform(X_tr)
         X_va_scaled = scaler.transform(X_va)
         X_test_scaled = scaler.transform(X_test_raw)
 
-        # 2. Support Vector Machine Setup
-        # probability=True maintains Multimodal Late-Fusion Output Logging limits
-        svm = SVC(kernel='rbf', C=1.0, class_weight='balanced', probability=True, random_state=config.SEED)
+        n_components = min(128, X_tr_scaled.shape[0] - 1, X_tr_scaled.shape[1])
+        pca = PCA(n_components=n_components, random_state=config.SEED)
+        X_tr_pca = pca.fit_transform(X_tr_scaled)
+        X_va_pca = pca.transform(X_va_scaled)
+        X_test_pca = pca.transform(X_test_scaled)
+        print(f"  PCA: {X_tr_scaled.shape[1]}D → {n_components}D ({pca.explained_variance_ratio_.sum()*100:.1f}% variance retained)")
+
+        # 2. SVM GridSearch: Tune C and gamma on inner cross-validation
+        # C=1 is far too conservative on 512-dimensional embeddings with 600 samples
+        param_grid = {
+            'C': [0.1, 1, 10, 100],
+            'gamma': ['scale', 'auto'],
+        }
+        inner_cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=config.SEED)
+        svm_base = SVC(kernel='rbf', class_weight='balanced', probability=True, random_state=config.SEED)
+        grid_search = GridSearchCV(svm_base, param_grid, cv=inner_cv, scoring='f1_macro', n_jobs=-1)
+        grid_search.fit(X_tr_pca, y_tr)
         
-        # 3. Fit Model (Instant calculation of Arabic structural geometries)
-        svm.fit(X_tr_scaled, y_tr)
+        svm = grid_search.best_estimator_
+        print(f"  Best SVM params: C={grid_search.best_params_['C']}, gamma={grid_search.best_params_['gamma']}")
         
         # 4. Metrics Logging
-        tr_preds = svm.predict(X_tr_scaled)
-        va_preds = svm.predict(X_va_scaled)
-        test_preds = svm.predict(X_test_scaled)
+        tr_preds = svm.predict(X_tr_pca)
+        va_preds = svm.predict(X_va_pca)
+        test_preds = svm.predict(X_test_pca)
         
         train_acc = accuracy_score(y_tr, tr_preds)
         train_f1 = f1_score(y_tr, tr_preds, average="macro")
