@@ -30,9 +30,9 @@ from src.audio_baseline import config
 # ---------------------------------------------------------------------------
 BATCH_SIZE     = 16
 ACCUM_STEPS    = 8
-NUM_EPOCHS_T   = 15   # Teacher training
-NUM_EPOCHS_S   = 20   # Student (Enriched) training
-LR             = 5e-5
+NUM_EPOCHS_T   = 20   # Teacher training
+NUM_EPOCHS_S   = 25   # Student (Enriched) training
+LR             = 3e-4
 SCL_TEMP       = 0.1
 SCL_WEIGHT     = 0.1
 LABEL_SMOOTH   = 0.1
@@ -159,7 +159,13 @@ def main():
     src = Path("/content") if Path("/content").exists() else Path(config.DATA_ROOT).parent
     for p in src.rglob("*.wav"): audio_map[p.name] = p
     
-    label2id = {l: i for i, l in enumerate(sorted(train_df["emotion_final"].unique()))}
+    # Calculate Class Weights to fix that low F1
+    classes = sorted(train_df["emotion_final"].unique())
+    y_train_labels = train_df["emotion_final"].tolist()
+    weights = compute_class_weight('balanced', classes=classes, y=y_train_labels)
+    class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
+    
+    label2id = {l: i for i, l in enumerate(classes)}
     id2label = {i: l for l, i in label2id.items()}
     num_labels = len(label2id)
 
@@ -168,7 +174,7 @@ def main():
     test_loader = DataLoader(VisualSERDataset(test_df, label2id, audio_map), batch_size=BATCH_SIZE)
 
     model = ContrastiveResNet(num_labels).to(device)
-    ce_fn = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
+    ce_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTH)
     scl_fn = SupervisedContrastiveLoss(SCL_TEMP)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS_T)
