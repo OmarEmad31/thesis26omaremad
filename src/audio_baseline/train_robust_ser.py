@@ -31,7 +31,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────
-MODEL_ID        = "audeering/wav2vec2-large-robust-24-ft-emotion-msp-corpus"
+MODEL_ID        = "superb/wav2vec2-large-superb-er"
 MAX_WAV_SAMPLES = 6 * 16000
 BATCH_SIZE      = 4            # Memory intensive model
 ACCUM_STEPS     = 8            # Virtual batch 32
