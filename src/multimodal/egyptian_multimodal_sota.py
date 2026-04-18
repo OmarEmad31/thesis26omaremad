@@ -206,7 +206,7 @@ def main():
     torch.manual_seed(42); np.random.seed(42); random.seed(42)
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    AUDIO_NAME = "facebook/wav2vec2-large-xlsr-53-arabic"
+    AUDIO_NAME = "jonatasgrosman/wav2vec2-large-xlsr-53-arabic"
     TEXT_NAME  = "UBC-NLP/MARBERT"
     
     # 1. Load All Data Splits
