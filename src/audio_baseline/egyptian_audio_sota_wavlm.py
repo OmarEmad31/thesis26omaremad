@@ -192,11 +192,28 @@ class EgyptianPerfectDataset(Dataset):
 # ---------------------------------------------------------------------------
 # SOTA TRAINING SYSTEM
 # ---------------------------------------------------------------------------
-def train_epoch(model, loader, device, opt, scheduler, l_sc, l_ce, alpha):
+# ---------------------------------------------------------------------------
+# SOTA EVALUATION & TRAINING SYSTEM
+# ---------------------------------------------------------------------------
+def evaluate_model(model, loader, device):
+    model.eval()
+    preds, truth = [], []
+    with torch.no_grad():
+        for b in loader:
+            ls, _ = model(b["wav"].to(device), None, b["mel"].to(device), b["mfcc"].to(device), b["chroma"].to(device))
+            preds.extend(torch.argmax(ls, 1).cpu().numpy()); truth.extend(b["label"].numpy())
+    acc = accuracy_score(truth, preds)
+    f1 = f1_score(truth, preds, average="macro")
+    return acc, f1
+
+def train_epoch(model, loader, device, opt, scheduler, l_sc, l_ce, alpha, epoch):
     model.train()
-    t_loss, preds, truth = 0, [], []
-    pbar = tqdm(loader, desc="Training", leave=False)
-    for b in pbar:
+    t_loss = 0
+    # Use a simpler progress report to avoid Colab spam
+    steps = len(loader)
+    report_interval = max(1, steps // 5)
+    
+    for i, b in enumerate(loader):
         wav = b["wav"].to(device); l = b["label"].to(device)
         mel = b["mel"].to(device); mfcc = b["mfcc"].to(device); chroma = b["chroma"].to(device)
         
@@ -205,21 +222,25 @@ def train_epoch(model, loader, device, opt, scheduler, l_sc, l_ce, alpha):
         
         opt.zero_grad(); loss.backward(); opt.step(); scheduler.step()
         t_loss += loss.item()
-        preds.extend(torch.argmax(logits, 1).cpu().numpy()); truth.extend(l.cpu().numpy())
-    return f1_score(truth, preds, average="macro")
+        
+        if (i + 1) % report_interval == 0:
+            print(f"   > Epoch {epoch} | Progress {100*(i+1)/steps:.0f}% | Loss: {loss.item():.4f}")
+    return t_loss / steps
 
 def main():
     torch.manual_seed(42); np.random.seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     W_NAME = "microsoft/wavlm-large"
 
+    print("📂 Loading Laboratory Splits (Train/Val/Test)...")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
+    test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
     
     classes = sorted(train_df["emotion_final"].unique())
     label2id = {l: i for i, l in enumerate(classes)}
-    train_df["label_id"] = train_df["emotion_final"].map(label2id)
-    val_df["label_id"] = val_df["emotion_final"].map(label2id)
+    for df in [train_df, val_df, test_df]:
+        df["label_id"] = df["emotion_final"].map(label2id)
     
     audio_map = {}
     src = Path("/content") if Path("/content").exists() else Path(config.DATA_ROOT).parent
@@ -230,34 +251,46 @@ def main():
     samples_weight = torch.from_numpy(np.array([1.0/np.bincount(y_tr)[t] for t in y_tr]))
     sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
 
+    print("💎 Initializing WavLM-Large Architecture...")
     model = EgyptianAudioSOTA(len(classes), W_NAME).to(device)
     
-    # LOSS & DATA
     l_ce = nn.CrossEntropyLoss(weight=weights)
     l_sc = SupConLoss(temperature=0.1)
     
     tr_loader = DataLoader(EgyptianPerfectDataset(train_df, audio_map, augment=True), batch_size=2, sampler=sampler)
     va_loader = DataLoader(EgyptianPerfectDataset(val_df, audio_map), batch_size=2)
+    te_loader = DataLoader(EgyptianPerfectDataset(test_df, audio_map), batch_size=2)
 
     # TWO-STAGE PROTOCOL
-    print("🔥 STAGE 1: WARMUP HEADS (FROZEN WAVLM)")
+    print("\n🔥 STAGE 1: WARMUP HEADS (FROZEN BACKBONE)")
     for param in model.wavlm.parameters(): param.requires_grad = False
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
     sch = get_cosine_schedule_with_warmup(opt, 0, len(tr_loader)*3)
-    for _ in range(3): train_epoch(model, tr_loader, device, opt, sch, l_sc, l_ce, alpha=0.5)
+    for epoch in range(1, 4):
+        loss = train_epoch(model, tr_loader, device, opt, sch, l_sc, l_ce, alpha=0.5, epoch=epoch)
+        v_acc, v_f1 = evaluate_model(model, va_loader, device)
+        print(f"📑 End Stage 1 Epoch {epoch} | Val Acc: {v_acc:.3f} | Val F1: {v_f1:.3f}")
 
-    print("🚀 STAGE 2: FINE-TUNING (UNFROZEN)")
+    print("\n🚀 STAGE 2: FINE-TUNING (UNFROZEN)")
     for param in model.wavlm.parameters(): param.requires_grad = True
     opt = torch.optim.AdamW([{"params": model.wavlm.parameters(), "lr": 1e-6}, {"params": model.classifier.parameters(), "lr": 1e-4}], lr=1e-4)
     sch = get_cosine_schedule_with_warmup(opt, 0, len(tr_loader)*12)
+    
+    best_f1 = 0
     for epoch in range(1, 13):
-        f1 = train_epoch(model, tr_loader, device, opt, sch, l_sc, l_ce, alpha=0.7)
-        # Eval
-        model.eval(); vp, vt = [], []
-        with torch.no_grad():
-            for b in va_loader:
-                ls, _ = model(b["wav"].to(device), None, b["mel"].to(device), b["mfcc"].to(device), b["chroma"].to(device))
-                vp.extend(torch.argmax(ls, 1).cpu().numpy()); vt.extend(b["label"].numpy())
-        print(f"🏆 Ep {epoch} | Val Mac-F1: {f1_score(vt, vp, average='macro'):.3f}")
+        loss = train_epoch(model, tr_loader, device, opt, sch, l_sc, l_ce, alpha=0.7, epoch=epoch)
+        
+        # Comprehensive Metrics
+        v_acc, v_f1 = evaluate_model(model, va_loader, device)
+        t_acc, t_f1 = evaluate_model(model, te_loader, device)
+        
+        print(f"🏆 Epoch {epoch} Results:")
+        print(f"   VALIDATION -> Acc: {v_acc:.3f} | Macro-F1: {v_f1:.3f}")
+        print(f"   TESTING    -> Acc: {t_acc:.3f} | Macro-F1: {t_f1:.3f}")
+        
+        if v_f1 > best_f1:
+            best_f1 = v_f1
+            torch.save(model.state_dict(), config.CHECKPOINT_DIR / "perfect_wavlm_sota.pt")
+            print(f"   🌟 New Best F1 Saved")
 
 if __name__ == "__main__": main()
