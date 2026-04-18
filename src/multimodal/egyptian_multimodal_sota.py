@@ -159,7 +159,7 @@ class MultimodalDataset(Dataset):
         audio_inputs = self.audio_proc(audio, sampling_rate=16000, padding="max_length", max_length=self.max_audio_len, truncation=True, return_tensors="pt")
         
         # Text Preprocessing
-        text_inputs = self.tokenizer(str(row["text"]), padding="max_length", max_length=64, truncation=True, return_tensors="pt")
+        text_inputs = self.tokenizer(str(row["transcript"]), padding="max_length", max_length=64, truncation=True, return_tensors="pt")
         
         return {
             "input_values": audio_inputs.input_values.squeeze(0),
