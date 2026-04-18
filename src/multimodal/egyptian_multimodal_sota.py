@@ -196,36 +196,86 @@ def train_stage(model, loader, val_loader, device, optimizer, scheduler, alpha=0
     return accuracy_score(truth, preds), f1_score(truth, preds, average="macro")
 
 def main():
-    AUDIO_NAME = "facebook/wav2vec2-large-xlsr-53-arabic"
-    TEXT_NAME  = "UBC-NLP/MARBERT"
+    torch.manual_seed(42); np.random.seed(42); random.seed(42)
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Placeholder for Dataset Loading (assuming CSVs exist)
-    # df = pd.read_csv(...) 
-    # For actual integration, map emotion labels to IDs
+    AUDIO_NAME = "facebook/wav2vec2-large-xlsr-53-arabic"
+    TEXT_NAME  = "UBC-NLP/MARBERT"
     
-    model = EgyptianMultimodalModel(num_labels=8, audio_name=AUDIO_NAME, text_name=TEXT_NAME).to(DEVICE)
+    # 1. Load All Data Splits
+    print("📂 Loading Dataset Splits...")
+    train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
+    val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     
-    # STAGE 1: FREEZE TRANSFORMERS
+    # Resolve Audio Paths
+    audio_map = {}
+    src = Path("/content/dataset") if Path("/content/dataset").exists() else Path(config.DATA_ROOT).parent
+    for p in src.rglob("*.wav"): audio_map[p.name] = p
+    
+    # Label Mapping
+    classes = sorted(train_df["emotion_final"].unique())
+    label2id = {l: i for i, l in enumerate(classes)}
+    train_df["label_id"] = train_df["emotion_final"].map(label2id)
+    val_df["label_id"] = val_df["emotion_final"].map(label2id)
+    
+    # 2. Initialize Processors & Model
+    print("💎 Initializing SOTA Transformers...")
+    audio_proc = AutoProcessor.from_pretrained(AUDIO_NAME)
+    text_tokenizer = AutoTokenizer.from_pretrained(TEXT_NAME)
+    
+    model = EgyptianMultimodalModel(num_labels=len(classes), audio_name=AUDIO_NAME, text_name=TEXT_NAME).to(DEVICE)
+    
+    train_ds = MultimodalDataset(train_df, audio_proc, text_tokenizer, audio_map)
+    val_ds   = MultimodalDataset(val_df, audio_proc, text_tokenizer, audio_map)
+    
+    # Use small batch for Wav2Vec2-Large memory constraints
+    train_loader = DataLoader(train_ds, batch_size=2, shuffle=True)
+    val_loader   = DataLoader(val_ds, batch_size=2)
+    
+    # ---------------------------------------------------------------------------
+    # STAGE 1: WARMUP (FROZEN BACKBONES)
+    # ---------------------------------------------------------------------------
+    print("\n🔥 STAGE 1: TRAINING FUSION HEADS (FROZEN BACKBONES)")
     for param in model.audio_encoder.parameters(): param.requires_grad = False
     for param in model.text_encoder.parameters(): param.requires_grad = False
     
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
-    # ... scheduler ...
-    # train_stage(...)
+    num_steps = len(train_loader) * 3
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=num_steps)
     
-    # STAGE 2: UNFREEZE AND FINE-TUNE
+    for epoch in range(1, 4):
+        acc, f1 = train_stage(model, train_loader, val_loader, DEVICE, optimizer, scheduler, alpha=0.7)
+        print(f"📊 Stage 1 | Ep {epoch} | Val Acc: {acc:.3f} | F1: {f1:.3f}")
+    
+    # ---------------------------------------------------------------------------
+    # STAGE 2: UNFREEZE AND FINE-TUNE (DIFFERENTIAL LR)
+    # ---------------------------------------------------------------------------
+    print("\n🚀 STAGE 2: END-TO-END FINE-TUNING (UNFROZEN)")
     for param in model.audio_encoder.parameters(): param.requires_grad = True
     for param in model.text_encoder.parameters(): param.requires_grad = True
     
-    # Differential LR
+    # Use differential learning rates to protect pre-trained weights
     optimizer = torch.optim.AdamW([
-        {"params": model.audio_encoder.parameters(), "lr": 2e-5},
-        {"params": model.text_encoder.parameters(), "lr": 1e-5},
-        {"params": model.classifier.parameters(), "lr": 1e-3}
+        {"params": model.audio_encoder.parameters(), "lr": 2e-6}, # Very low for Audio
+        {"params": model.text_encoder.parameters(), "lr": 1e-6},  # Very low for Text
+        {"params": model.classifier.parameters(), "lr": 5e-4}     # Normal for Head
     ])
     
-    print("🚀 SOTA Training Initialized.")
+    num_steps = len(train_loader) * 10
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=len(train_loader), num_training_steps=num_steps)
+    
+    best_acc = 0
+    checkpoint_path = config.CHECKPOINT_DIR / "sota_multimodal_egyptian.pt"
+    
+    for epoch in range(1, 11):
+        acc, f1 = train_stage(model, train_loader, val_loader, DEVICE, optimizer, scheduler, alpha=0.5)
+        print(f"🏆 Stage 2 | Ep {epoch} | Val Acc: {acc:.3f} | F1: {f1:.3f}")
+        if acc > best_acc:
+            best_acc = acc
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"   🌟 New Graduation Peak: {best_acc*100:.2f}%")
+
+    print(f"\n✅ TRAINING COMPLETE. FINAL PEAK ACCURACY: {best_acc*100:.2f}%")
 
 if __name__ == "__main__":
     main()
