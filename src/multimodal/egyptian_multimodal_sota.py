@@ -16,6 +16,13 @@ from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 from pathlib import Path
 
+# Add project root for local imports
+project_root = str(Path(__file__).parent.parent.parent.absolute())
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from src.audio_baseline import config
+
 # ---------------------------------------------------------------------------
 # SOTA LOSS: SUPERVISED CONTRASTIVE LOSS
 # ---------------------------------------------------------------------------
