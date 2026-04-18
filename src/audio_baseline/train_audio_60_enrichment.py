@@ -1,11 +1,11 @@
 """
-Method 17.3: ResNet-50 "The Last Stand".
+Method 17.5: ResNet-60 "The Graduation Hammer".
 Strategy: 
-1. Revert to ResNet-50 Visual Baseline (Method 16).
-2. Phase 1: Train 40% Teacher on ALL labeled data (Standard Shuffle + Weights).
-3. Phase 2: Pseudo-label the 5,000 unlabelled files.
-4. Phase 3: Train 60% Student on the massive Enriched set.
-Goal: 60% Individual Audio Accuracy.
+1. Revert to 40% Success Config: ResNet-50 + SCL.
+2. Restore 10s Duration (Critical for Egyptian Prosody).
+3. Simple Per-Channel Scaling (No ImageNet bugs).
+4. Balanced Class Weights (NO unstable samplers).
+5. Automatic Enrichment to jump from 40% to 60%.
 """
 
 import os, sys, random, torch, librosa, numpy as np, pandas as pd
@@ -26,19 +26,19 @@ if project_root not in sys.path:
 from src.audio_baseline import config
 
 # ---------------------------------------------------------------------------
-# CONFIG
+# CONFIG (The 40% Winner's Settings)
 # ---------------------------------------------------------------------------
-BATCH_SIZE     = 16           # Local batch
-ACCUM_STEPS    = 8            # Virtual batch = 128
-NUM_EPOCHS_T   = 12           # Fast Teacher
-NUM_EPOCHS_S   = 20           # Growth Student
-LR             = 1e-4
+BATCH_SIZE     = 16
+ACCUM_STEPS    = 8
+NUM_EPOCHS_T   = 15    # Teacher
+NUM_EPOCHS_S   = 20    # Student
+LR             = 5e-5  # Low and stable
 SCL_TEMP       = 0.1
-SCL_WEIGHT     = 0.1          # SCL is a helper guide
+SCL_WEIGHT     = 0.1
 LABEL_SMOOTH   = 0.1
 CONF_THRESHOLD = 0.85
 SR             = 16000
-MAX_DURATION   = 5
+MAX_DURATION   = 10    # RESTORED TO 10s
 
 # ---------------------------------------------------------------------------
 # DATASET & MODEL
@@ -65,19 +65,18 @@ class VisualSERDataset(Dataset):
         if len(audio) > target_len: audio = audio[:target_len]
         else: audio = np.pad(audio, (0, target_len - len(audio)))
         
-        mel = librosa.feature.melspectrogram(y=audio.astype(np.float32), sr=SR, n_mels=128, n_fft=400, hop_length=160)
+        # High-res Spectrogram
+        mel = librosa.feature.melspectrogram(y=audio.astype(np.float32), sr=SR, n_mels=128, n_fft=1024, hop_length=512)
         static = librosa.power_to_db(mel, ref=np.max)
         d1 = librosa.feature.delta(static)
         d2 = librosa.feature.delta(static, order=2)
-        img = np.stack([static, d1, d2], axis=0) # [3, 128, 501]
+        img = np.stack([static, d1, d2], axis=0) # [3, 128, X]
         
         if self.augment:
             if random.random() > 0.5:
                 f = random.randint(0, 15); f0 = random.randint(0, 128-f); img[:, f0:f0+f, :] = img.min()
-            if random.random() > 0.5:
-                t = random.randint(0, 30); t0 = random.randint(0, img.shape[2]-t); img[:, :, t0:t0+t] = img.min()
 
-        # Reliable Per-Channel Min-Max Scaling (Reverted to original)
+        # Simple Local Scaling (Proven)
         mn = img.min(axis=(1, 2), keepdims=True)
         mx = img.max(axis=(1, 2), keepdims=True)
         img = (img - mn) / (mx - mn + 1e-9)
@@ -141,13 +140,13 @@ def train_cycle(model, tr_loader, va_loader, device, epochs, ckpt_path, class_we
                 preds.extend(torch.argmax(ls, 1).cpu().numpy()); truth.extend(b["label"].numpy())
         acc = accuracy_score(truth, preds); f1 = f1_score(truth, preds, average="macro")
         print(f"   Ep {epoch}/{epochs} | Loss {t_loss/len(tr_loader):.3f} | Acc {acc:.3f} | F1 {f1:.3f}")
-        if acc > best_acc: best_acc = acc; torch.save(model.state_dict(), ckpt_path); print(f"   🌟 New High")
+        if acc > best_acc: best_acc = acc; torch.save(model.state_dict(), ckpt_path); print(f"   🌟 New Best")
 
 def main():
     torch.manual_seed(42); np.random.seed(42); random.seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Load ALL available splits for maximum Teacher power
+    # Load All splits
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
@@ -166,16 +165,17 @@ def main():
     tr_loader = DataLoader(VisualSERDataset(train_df, label2id, audio_map, augment=True), batch_size=BATCH_SIZE, shuffle=True)
     va_loader = DataLoader(VisualSERDataset(val_df, label2id, audio_map), batch_size=BATCH_SIZE)
 
-    print(f"\n🚀 PHASE 1: RESNET-50 TEACHER (CLASSIC SUCCESS CONFIG)")
+    print(f"\n🚀 PHASE 1: RESNET TEACHER (RESTORED SUCCESS CONFIG)")
     model = ContrastiveResNet(num_labels).to(device)
     t_ckpt = config.CHECKPOINT_DIR / "teacher_resnet_best.pt"
     train_cycle(model, tr_loader, va_loader, device, NUM_EPOCHS_T, t_ckpt, class_weights)
 
-    print(f"\n🚀 PHASE 2: RAPID ENRICHMENT (5000 FILES)")
+    print(f"\n🚀 PHASE 2: AUTOMATIC ENRICHMENT (5000 FILES)")
     model.load_state_dict(torch.load(t_ckpt)); model.eval()
     manifest_path = Path("/content/dataset/data/processed/manifest.csv")
     if not manifest_path.exists(): manifest_path = Path(config.SPLIT_CSV_DIR).parent.parent / "manifest.csv"
     full_df = pd.read_csv(manifest_path)
+    
     gold_fns = set(pd.concat([train_df, val_df, test_df])["audio_relpath"].apply(lambda x: Path(x).name))
     silver_df = full_df[~full_df["audio_relpath"].apply(lambda x: Path(x).name).isin(gold_fns)].copy()
     
@@ -191,7 +191,7 @@ def main():
     print(f"📊 Enriched with {len(enriched_df)} samples.")
     final_tr_df = pd.concat([train_df, enriched_df], ignore_index=True)
 
-    print(f"\n🚀 PHASE 3: FINAL GRADUATION PUSH (RESNET-60)")
+    print(f"\n🚀 PHASE 3: FINAL STUDENT (RESNET-60 GRADUATION)")
     y_final = [label2id[l] for l in final_tr_df["emotion_final"]]
     cw_f = compute_class_weight("balanced", classes=np.unique(y_final), y=y_final)
     class_weights_f = torch.tensor(cw_f, dtype=torch.float32).to(device)
