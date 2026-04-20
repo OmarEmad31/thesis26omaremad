@@ -204,9 +204,9 @@ def main():
     l_ce = nn.CrossEntropyLoss(weight=weights)
     l_sc = SupConLoss(temperature=0.1)
     
-    tr_loader = DataLoader(EgyptianFbankDataset(train_df, audio_map), batch_size=32, sampler=sampler)
-    va_loader = DataLoader(EgyptianFbankDataset(val_df, audio_map), batch_size=32)
-    te_loader = DataLoader(EgyptianFbankDataset(test_df, audio_map), batch_size=32)
+    tr_loader = DataLoader(EgyptianFbankDataset(train_df, audio_map), batch_size=16, sampler=sampler)
+    va_loader = DataLoader(EgyptianFbankDataset(val_df, audio_map), batch_size=16)
+    te_loader = DataLoader(EgyptianFbankDataset(test_df, audio_map), batch_size=16)
 
     print("\n🔥 STAGE 1: HEAD TUNING (FROZEN ECAPA)")
     for param in model.backbone.parameters(): param.requires_grad = False
@@ -223,9 +223,22 @@ def main():
         va, vf = evaluate(model, va_loader, device)
         print(f"📊 Epoch {epoch} | Val Acc: {va:.3f} | Val F1: {vf:.3f}")
 
-    print("\n🚀 STAGE 2: END-TO-END FINE-TUNING")
+    print("\n🚀 STAGE 2: PRECISION FINE-TUNING (DISCRIMINATIVE LR)")
     for param in model.backbone.parameters(): param.requires_grad = True
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
+    
+    # Bucket 1: Backbone (Ultralow LR to preserve speaker features)
+    # Bucket 2: Projector/Classifier (Higher LR to adapt to Egyptian emotions)
+    optimizer_grouped_parameters = [
+        {"params": model.backbone.parameters(), "lr": 1e-6},
+        {"params": model.projector.parameters(), "lr": 5e-4},
+        {"params": model.classifier.parameters(), "lr": 5e-4},
+    ]
+    opt = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
+    
+    # 2-Epoch Re-Warmup to stabilize backbone gradients
+    total_steps = len(tr_loader) * 15
+    from transformers import get_cosine_schedule_with_warmup
+    sch = get_cosine_schedule_with_warmup(opt, num_warmup_steps=len(tr_loader)*2, num_training_steps=total_steps)
     
     best_f1 = 0
     for epoch in range(1, 16):
@@ -233,16 +246,20 @@ def main():
         for b in tqdm(tr_loader, desc=f"Fine-tune Ep{epoch}", leave=False):
             fb = b["fbank"].to(device); l = b["label"].to(device)
             logits, z = model(fb)
-            loss = 0.8 * l_ce(logits, l) + 0.2 * l_sc(z, l)
-            opt.zero_grad(); loss.backward(); opt.step()
+            # Adjust SCL alpha for stable fine-tuning
+            loss = 0.85 * l_ce(logits, l) + 0.15 * l_sc(z, l)
+            opt.zero_grad(); loss.backward(); opt.step(); sch.step()
             
         va, vf = evaluate(model, va_loader, device)
         ta, tf = evaluate(model, te_loader, device)
-        print(f"🏆 Epoch {epoch} | Val F1: {vf:.3f} | Test F1: {tf:.3f}")
+        
+        print(f"🏆 Epoch {epoch} Results:")
+        print(f"   VALIDATION -> Acc: {va:.3f} | Macro-F1: {vf:.3f}")
+        print(f"   TESTING    -> Acc: {ta:.3f} | Macro-F1: {tf:.3f}")
         
         if vf > best_f1:
             best_f1 = vf
-            torch.save(model.state_dict(), config.CHECKPOINT_DIR / "ecapa_ser_best.pt")
-            print("🌟 New Best F1 Saved")
+            torch.save(model.state_dict(), config.CHECKPOINT_DIR / "ecapa_precision_sota.pt")
+            print("   🌟 New Best F1 Saved")
 
 if __name__ == "__main__": main()
