@@ -96,7 +96,7 @@ class AugmentedEgyptianDataset(Dataset):
                 AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
                 TimeStretch(min_rate=0.8, max_rate=1.2, p=0.4),
                 PitchShift(min_semitones=-4, max_semitones=4, p=0.4),
-                Shift(min_fraction=-0.5, max_fraction=0.5, p=0.5),
+                Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
             ])
 
     def __len__(self): return len(self.df)
