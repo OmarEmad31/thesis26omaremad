@@ -177,14 +177,17 @@ def main():
     data_search_path = Path("/content/dataset") if Path("/content/dataset").exists() else Path("/content")
     print(f"🔍 Scanning {data_search_path} for audio files...")
     
-    for p in data_search_path.rglob("*.wav"):
-        audio_map[p.name] = p
+    # Case-insensitive rglob manually or multiple patterns
+    for ext in ["*.wav", "*.WAV", "*.Wav"]:
+        for p in data_search_path.rglob(ext):
+            audio_map[p.name] = p
     
     if len(audio_map) == 0:
         # Emergency secondary scan
-        print("⚠️ Warning: No .wav files found in primary path. Scanning entire /content disk...")
-        for p in Path("/content").rglob("*.wav"):
-            audio_map[p.name] = p
+        print("⚠️ Warning: No audio files found in primary path. Scanning entire /content disk...")
+        for ext in ["*.wav", "*.WAV", "*.Wav"]:
+            for p in Path("/content").rglob(ext):
+                audio_map[p.name] = p
             
     print(f"✅ Found {len(audio_map)} audio files in mapping.")
 
