@@ -131,14 +131,14 @@ def main():
     for ext in ["*.wav", "*.WAV", "*.Wav"]:
         for p in data_search_path.rglob(ext): audio_map[p.name] = p
 
-    # LOSS WEIGHTS: Re-introduced to fix the F1 collapse
+    # DAMPED LOSS WEIGHTS: Re-introduced but softened to prevent Acc collapse
     y_tr = train_df["label_id"].values
     weights = torch.tensor(compute_class_weight("balanced", classes=np.unique(y_tr), y=y_tr), dtype=torch.float32).to(device)
+    weights = torch.pow(weights, 0.5) # Square-root damping for stability
 
     model = WavLMWeightedBasic(len(classes), W_NAME).to(device)
     l_ce = nn.CrossEntropyLoss(weight=weights) 
     
-    # BS 32 / Shuffle (Proven Stability)
     tr_loader = DataLoader(SimpleEgyptianDataset(train_df, audio_map), batch_size=32, shuffle=True)
     va_loader = DataLoader(SimpleEgyptianDataset(val_df, audio_map), batch_size=32)
     te_loader = DataLoader(SimpleEgyptianDataset(test_df, audio_map), batch_size=32)
@@ -159,9 +159,16 @@ def main():
         va, vf = evaluate(model, va_loader, device)
         print(f"📈 Warmup Epoch {epoch} | Val Acc: {va:.3f} | Val F1: {vf:.3f}")
 
-    print("\n🚀 STAGE 2: FINE-TUNING")
+    print("\n🚀 STAGE 2: DISCRIMINATIVE FINE-TUNING")
     for param in model.wavlm.parameters(): param.requires_grad = True
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
+    
+    # BUCKET 1: Backbone (Ultralow 1e-6 to preserve 31%+ Acc)
+    # BUCKET 2: Head (Higher 1e-4 to continue F1 sharpening)
+    opt = torch.optim.AdamW([
+        {"params": model.wavlm.parameters(), "lr": 1e-6},
+        {"params": model.classifier.parameters(), "lr": 1e-4}
+    ], weight_decay=0.01)
+    
     sch = get_cosine_schedule_with_warmup(opt, num_warmup_steps=len(tr_loader), num_training_steps=len(tr_loader)*10)
     
     best_va = 0
@@ -183,7 +190,7 @@ def main():
         
         if va > best_va:
             best_va = va
-            torch.save(model.state_dict(), config.CHECKPOINT_DIR / "wavlm_weighted_basic_best.pt")
-            print("   🌟 New Best Baseline Saved")
+            torch.save(model.state_dict(), config.CHECKPOINT_DIR / "wavlm_harmonized_best.pt")
+            print("   🌟 New Harmonized Best Saved")
 
 if __name__ == "__main__": main()
