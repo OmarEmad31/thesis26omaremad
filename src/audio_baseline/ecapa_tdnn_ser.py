@@ -119,10 +119,19 @@ class EgyptianFbankDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        # Clean basename extraction
         bn = Path(str(row["audio_relpath"]).replace("\\", "/")).name
         path = self.audio_map.get(bn)
         
-        audio, _ = librosa.load(path, sr=16000, mono=True)
+        if path is None:
+            # Fallback: try case-insensitive or common naming variations if needed
+            raise FileNotFoundError(f"❌ CRITICAL ERROR: Could not find audio file '{bn}' anywhere in /content. Please ensure the dataset is unzipped correctly.")
+
+        try:
+            audio, _ = librosa.load(path, sr=16000, mono=True)
+        except Exception as e:
+            raise RuntimeError(f"❌ ERROR loading {path}: {str(e)}")
+            
         if len(audio) > self.max_len: audio = audio[:self.max_len]
         else: audio = np.pad(audio, (0, self.max_len - len(audio)))
 
@@ -164,8 +173,20 @@ def main():
     for df in [train_df, val_df, test_df]: df["label_id"] = df["emotion_final"].map(label2id)
     
     audio_map = {}
-    src = Path("/content") if Path("/content").exists() else Path(config.DATA_ROOT).parent
-    for p in src.rglob("*.wav"): audio_map[p.name] = p
+    # Prioritize specialized dataset folder, fallback to scanning /content
+    data_search_path = Path("/content/dataset") if Path("/content/dataset").exists() else Path("/content")
+    print(f"🔍 Scanning {data_search_path} for audio files...")
+    
+    for p in data_search_path.rglob("*.wav"):
+        audio_map[p.name] = p
+    
+    if len(audio_map) == 0:
+        # Emergency secondary scan
+        print("⚠️ Warning: No .wav files found in primary path. Scanning entire /content disk...")
+        for p in Path("/content").rglob("*.wav"):
+            audio_map[p.name] = p
+            
+    print(f"✅ Found {len(audio_map)} audio files in mapping.")
 
     y_tr = train_df["label_id"].values
     weights = torch.tensor(compute_class_weight("balanced", classes=np.unique(y_tr), y=y_tr), dtype=torch.float32).to(device)
