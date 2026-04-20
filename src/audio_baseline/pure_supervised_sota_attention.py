@@ -1,22 +1,21 @@
 """
-HArnESS-SOTA-Flagship: Egyptian Arabic SER (The 57% Milestone Push).
-Final high-capacity supervised implementation.
+HArnESS-Stable-SOTA: Egyptian Arabic SER (Baseline Recovery).
+The definitive Individual Audio baseline configuration.
 
-Backbone: WavLM-Large (315M parameters).
-Pooling: Attentive Masked Pooling (Focus on emotional spikes).
-Balance: WeightedRandomSampler + WeightedCrossEntropyLoss.
-Stability: Input Normalization + Discriminative Fine-Tuning.
+Backbone: WavLM-Base-Plus (768 dim, PROVEN STABILITY).
+Pooling: Attentive Masked Pooling (Smart Temporal Focus).
+Balance: WeightedRandomSampler (Batch Balanced).
+Training: BS 32 (Standard), Standard CrossEntropy.
 """
 
 import os, sys, torch, librosa, numpy as np, pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from transformers import WavLMModel, get_cosine_schedule_with_warmup
 from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 from pathlib import Path
-from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift
 
 # Add project root
 project_root = str(Path(__file__).parent.parent.parent.absolute())
@@ -26,7 +25,7 @@ if project_root not in sys.path:
 from src.audio_baseline import config
 
 # ---------------------------------------------------------------------------
-# ARCHITECTURE: ATTENTIVE MASKED POOLING
+# ARCHITECTURE: STABLE ATTENTIVE POOLING
 # ---------------------------------------------------------------------------
 class AttentivePooling(nn.Module):
     def __init__(self, hidden_dim):
@@ -45,23 +44,20 @@ class AttentivePooling(nn.Module):
         pooled = torch.sum(x * weights, dim=1) # [BS, Hidden]
         return pooled
 
-class WavLMSOTAFlagship(nn.Module):
-    def __init__(self, num_labels, wavlm_name="microsoft/wavlm-large"):
+class WavLMStableSOTA(nn.Module):
+    def __init__(self, num_labels, wavlm_name="microsoft/wavlm-base-plus"):
         super().__init__()
         self.wavlm = WavLMModel.from_pretrained(wavlm_name)
         
-        # Stability: Multi-layer Head for High-Param model
-        self.pooling = AttentivePooling(1024)
+        # Stability: 768-dim Attention + Linear Head
+        self.pooling = AttentivePooling(768)
         self.classifier = nn.Sequential(
-            nn.Linear(1024, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, num_labels)
+            nn.Dropout(0.25),
+            nn.Linear(768, num_labels)
         )
 
     def forward(self, wav, mask=None):
-        # 1. Normalization (Crucial for attention stability)
+        # 1. Normalization
         wav = (wav - wav.mean(dim=-1, keepdim=True)) / (wav.std(dim=-1, keepdim=True) + 1e-6)
         
         # 2. Backbone
@@ -79,22 +75,13 @@ class WavLMSOTAFlagship(nn.Module):
         return logits
 
 # ---------------------------------------------------------------------------
-# DATASET: ONLINE AUGMENTATION PIPELINE
+# DATASET: STABLE MASKING
 # ---------------------------------------------------------------------------
-class SOTAAugmentedDataset(Dataset):
-    def __init__(self, df, audio_map, augment=False):
+class StableEgyptianDataset(Dataset):
+    def __init__(self, df, audio_map):
         self.df = df
         self.audio_map = audio_map
         self.max_len = 160000 
-        self.augment = augment
-        
-        if self.augment:
-            self.augmentor = Compose([
-                AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.4),
-                TimeStretch(min_rate=0.8, max_rate=1.2, p=0.3),
-                PitchShift(min_semitones=-4, max_semitones=4, p=0.4),
-                Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
-            ])
 
     def __len__(self): return len(self.df)
 
@@ -106,9 +93,6 @@ class SOTAAugmentedDataset(Dataset):
         if path is None: raise FileNotFoundError(f"Missing: {bn}")
         audio, _ = librosa.load(path, sr=16000, mono=True)
         
-        if self.augment:
-            audio = self.augmentor(samples=audio, sample_rate=16000)
-
         mask = np.zeros(self.max_len, dtype=np.float32)
         if len(audio) > self.max_len:
             audio = audio[:self.max_len]
@@ -124,7 +108,7 @@ class SOTAAugmentedDataset(Dataset):
         }
 
 # ---------------------------------------------------------------------------
-# TRAINING SCRIPT
+# EVALUATION & TRAINING
 # ---------------------------------------------------------------------------
 def evaluate(model, loader, device):
     model.eval()
@@ -138,9 +122,9 @@ def evaluate(model, loader, device):
 def main():
     torch.manual_seed(42); np.random.seed(42)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    W_NAME = "microsoft/wavlm-large"
+    W_NAME = "microsoft/wavlm-base-plus"
 
-    print("🏗️ Initializing SOTA Flagship Engine...")
+    print("🏗️ Initializing Stable SOTA Engine...")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
@@ -155,76 +139,61 @@ def main():
         for p in data_search_path.rglob(ext): audio_map[p.name] = p
 
     # BALANCE CALCULATION
-    from sklearn.utils.class_weight import compute_class_weight
     y_tr = train_df["label_id"].values
-    weights = torch.tensor(compute_class_weight("balanced", classes=np.unique(y_tr), y=y_tr), dtype=torch.float32).to(device)
-    
-    from torch.utils.data import WeightedRandomSampler
     class_sample_count = np.bincount(y_tr)
     weight = 1. / class_sample_count
     samples_weight = torch.from_numpy(np.array([weight[t] for t in y_tr]))
     sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
 
-    model = WavLMSOTAFlagship(len(classes), W_NAME).to(device)
-    l_ce = nn.CrossEntropyLoss(weight=weights) 
+    model = WavLMStableSOTA(len(classes), W_NAME).to(device)
+    l_ce = nn.CrossEntropyLoss() 
     
-    # Batch Size 8 + 4-step Gradient Accumulation = Effective BS 32 for stability
-    # BS 8 fits easily on any Colab GPU with the Large model
-    tr_loader = DataLoader(SOTAAugmentedDataset(train_df, audio_map, augment=True), batch_size=8, sampler=sampler)
-    va_loader = DataLoader(SOTAAugmentedDataset(val_df, audio_map), batch_size=8)
-    te_loader = DataLoader(SOTAAugmentedDataset(test_df, audio_map), batch_size=8)
-    accum_steps = 4
+    # BS 32 for smooth gradients (The Win of Today)
+    tr_loader = DataLoader(StableEgyptianDataset(train_df, audio_map), batch_size=32, sampler=sampler)
+    va_loader = DataLoader(StableEgyptianDataset(val_df, audio_map), batch_size=32)
+    te_loader = DataLoader(StableEgyptianDataset(test_df, audio_map), batch_size=32)
 
-    print("\n🔥 STAGE 1: HEAD WARMUP (2 Epochs)")
+    print("\n🔥 STAGE 1: HEAD WARMUP (STABLE ATTENTION)")
     for param in model.wavlm.parameters(): param.requires_grad = False
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     
-    for epoch in range(1, 3):
+    for epoch in range(1, 4):
         model.train()
         pbar = tqdm(tr_loader, desc=f"Warmup Ep{epoch}")
-        for i, b in enumerate(pbar):
+        for b in pbar:
             wav = b["wav"].to(device); l = b["label"].to(device); m = b["mask"].to(device)
             logits = model(wav, m)
-            loss = l_ce(logits, l) / accum_steps
-            loss.backward()
-            if (i+1) % accum_steps == 0:
-                opt.step(); opt.zero_grad()
-            pbar.set_postfix({"loss": f"{loss.item()*accum_steps:.4f}"})
+            loss = l_ce(logits, l)
+            opt.zero_grad(); loss.backward(); opt.step()
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         va, vf = evaluate(model, va_loader, device)
         print(f"📈 Warmup Epoch {epoch} | Val Acc: {va:.3f} | Val F1: {vf:.3f}")
 
-    print("\n🚀 STAGE 2: SOTA FINE-TUNING (15 Epochs)")
+    print("\n🚀 STAGE 2: FINE-TUNING")
     for param in model.wavlm.parameters(): param.requires_grad = True
-    # Discriminative LR for Backbone Preservation
-    opt = torch.optim.AdamW([
-        {"params": model.wavlm.parameters(), "lr": 2e-6},
-        {"params": model.classifier.parameters(), "lr": 1e-4}
-    ], weight_decay=0.01)
-    
-    sch = get_cosine_schedule_with_warmup(opt, num_warmup_steps=len(tr_loader), num_training_steps=len(tr_loader)*15)
+    opt = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    sch = get_cosine_schedule_with_warmup(opt, num_warmup_steps=len(tr_loader), num_training_steps=len(tr_loader)*10)
     
     best_va = 0
-    for epoch in range(1, 16):
+    for epoch in range(1, 11):
         model.train()
-        pbar = tqdm(tr_loader, desc=f"SOTA Ep{epoch}")
-        for i, b in enumerate(pbar):
+        pbar = tqdm(tr_loader, desc=f"Fine-tune Ep{epoch}")
+        for b in pbar:
             wav = b["wav"].to(device); l = b["label"].to(device); m = b["mask"].to(device)
             logits = model(wav, m)
-            loss = l_ce(logits, l) / accum_steps
-            loss.backward()
-            if (i+1) % accum_steps == 0:
-                opt.step(); opt.zero_grad(); sch.step()
-            pbar.set_postfix({"loss": f"{loss.item()*accum_steps:.4f}"})
+            loss = l_ce(logits, l)
+            opt.zero_grad(); loss.backward(); opt.step(); sch.step()
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
         va, vf = evaluate(model, va_loader, device)
         ta, tf = evaluate(model, te_loader, device)
-        print(f"🏆 Epoch {epoch} Results:")
+        print(f"🏆 Epoch {epoch}:")
         print(f"   VALIDATION -> Acc: {va:.3f} | Macro-F1: {vf:.3f}")
         print(f"   TESTING    -> Acc: {ta:.3f} | Macro-F1: {tf:.3f}")
         
         if va > best_va:
             best_va = va
-            torch.save(model.state_dict(), config.CHECKPOINT_DIR / "wavlm_flagship_best.pt")
-            print("   🌟 SOTA Best Model Saved")
+            torch.save(model.state_dict(), config.CHECKPOINT_DIR / "wavlm_stable_sota_best.pt")
+            print("   🌟 New Best Baseline Saved")
 
 if __name__ == "__main__": main()
