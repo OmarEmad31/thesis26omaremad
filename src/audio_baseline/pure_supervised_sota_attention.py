@@ -1,19 +1,20 @@
 """
-HArnESS-Stable-SOTA: Egyptian Arabic SER (Baseline Recovery).
-The definitive Individual Audio baseline configuration.
+HArnESS-Weighted-Basic: Egyptian Arabic SER (Recovery Mode).
+Stability-focused implementation to restore the 34.5%+ baseline.
 
-Backbone: WavLM-Base-Plus (768 dim, PROVEN STABILITY).
-Pooling: Attentive Masked Pooling (Smart Temporal Focus).
-Balance: WeightedRandomSampler (Batch Balanced).
-Training: BS 32 (Standard), Standard CrossEntropy.
+Backbone: WavLM-Base-Plus (768 dim, STABLE).
+Pooling: Masked Mean Pooling (Proven Signal).
+Loss: Weighted CrossEntropy (Class Awareness).
+Training: BS 32, Standard Shuffle (Unbiased).
 """
 
 import os, sys, torch, librosa, numpy as np, pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from transformers import WavLMModel, get_cosine_schedule_with_warmup
 from sklearn.metrics import accuracy_score, f1_score
+from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
 from pathlib import Path
 
@@ -25,59 +26,51 @@ if project_root not in sys.path:
 from src.audio_baseline import config
 
 # ---------------------------------------------------------------------------
-# ARCHITECTURE: STABLE ATTENTIVE POOLING
+# ARCHITECTURE: MASK-AWARE MEAN POOLING (THE WINNER)
 # ---------------------------------------------------------------------------
-class AttentivePooling(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.attention = nn.Linear(hidden_dim, 1)
-
-    def forward(self, x, mask=None):
+class MaskedMeanPooling(nn.Module):
+    def forward(self, x, mask):
         # x: [BS, Seq, Hidden], mask: [BS, Seq]
-        attn_logits = self.attention(x) # [BS, Seq, 1]
-        
-        if mask is not None:
-            mask = mask.unsqueeze(-1) # [BS, Seq, 1]
-            attn_logits = attn_logits.masked_fill(mask == 0, -1e9)
-            
-        weights = torch.softmax(attn_logits, dim=1) # [BS, Seq, 1]
-        pooled = torch.sum(x * weights, dim=1) # [BS, Hidden]
-        return pooled
+        if mask is None:
+            return x.mean(dim=1)
+        # 1 for real, 0 for pad
+        mask_expanded = mask.unsqueeze(-1).expand(x.size()).float()
+        sum_embeddings = torch.sum(x * mask_expanded, 1)
+        sum_mask = mask_expanded.sum(1)
+        sum_mask = torch.clamp(sum_mask, min=1e-9)
+        return sum_embeddings / sum_mask
 
-class WavLMStableSOTA(nn.Module):
+class WavLMWeightedBasic(nn.Module):
     def __init__(self, num_labels, wavlm_name="microsoft/wavlm-base-plus"):
         super().__init__()
         self.wavlm = WavLMModel.from_pretrained(wavlm_name)
-        
-        # Stability: 768-dim Attention + Linear Head
-        self.pooling = AttentivePooling(768)
+        self.pooling = MaskedMeanPooling()
         self.classifier = nn.Sequential(
-            nn.Dropout(0.25),
+            nn.Dropout(0.2),
             nn.Linear(768, num_labels)
         )
 
     def forward(self, wav, mask=None):
-        # 1. Normalization
+        # Normalization
         wav = (wav - wav.mean(dim=-1, keepdim=True)) / (wav.std(dim=-1, keepdim=True) + 1e-6)
         
-        # 2. Backbone
+        # Backbone
         outputs = self.wavlm(wav).last_hidden_state
         
-        # 3. Mask Alignment (Factor 320 for WavLM)
+        # Mask Downsampling (factor 320)
         if mask is not None:
             down_mask = mask[:, ::320][:, :outputs.shape[1]]
         else:
             down_mask = None
             
-        # 4. Pooling & Classification
         pooled = self.pooling(outputs, mask=down_mask)
         logits = self.classifier(pooled)
         return logits
 
 # ---------------------------------------------------------------------------
-# DATASET: STABLE MASKING
+# DATASET: STABLE LOADING
 # ---------------------------------------------------------------------------
-class StableEgyptianDataset(Dataset):
+class SimpleEgyptianDataset(Dataset):
     def __init__(self, df, audio_map):
         self.df = df
         self.audio_map = audio_map
@@ -108,7 +101,7 @@ class StableEgyptianDataset(Dataset):
         }
 
 # ---------------------------------------------------------------------------
-# EVALUATION & TRAINING
+# TRAINING SCRIPT
 # ---------------------------------------------------------------------------
 def evaluate(model, loader, device):
     model.eval()
@@ -124,7 +117,7 @@ def main():
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     W_NAME = "microsoft/wavlm-base-plus"
 
-    print("🏗️ Initializing Stable SOTA Engine...")
+    print("🏗️ Initializing Weighted Basic Engine...")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
@@ -138,22 +131,19 @@ def main():
     for ext in ["*.wav", "*.WAV", "*.Wav"]:
         for p in data_search_path.rglob(ext): audio_map[p.name] = p
 
-    # BALANCE CALCULATION
+    # LOSS WEIGHTS: Re-introduced to fix the F1 collapse
     y_tr = train_df["label_id"].values
-    class_sample_count = np.bincount(y_tr)
-    weight = 1. / class_sample_count
-    samples_weight = torch.from_numpy(np.array([weight[t] for t in y_tr]))
-    sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
+    weights = torch.tensor(compute_class_weight("balanced", classes=np.unique(y_tr), y=y_tr), dtype=torch.float32).to(device)
 
-    model = WavLMStableSOTA(len(classes), W_NAME).to(device)
-    l_ce = nn.CrossEntropyLoss() 
+    model = WavLMWeightedBasic(len(classes), W_NAME).to(device)
+    l_ce = nn.CrossEntropyLoss(weight=weights) 
     
-    # BS 32 for smooth gradients (The Win of Today)
-    tr_loader = DataLoader(StableEgyptianDataset(train_df, audio_map), batch_size=32, sampler=sampler)
-    va_loader = DataLoader(StableEgyptianDataset(val_df, audio_map), batch_size=32)
-    te_loader = DataLoader(StableEgyptianDataset(test_df, audio_map), batch_size=32)
+    # BS 32 / Shuffle (Proven Stability)
+    tr_loader = DataLoader(SimpleEgyptianDataset(train_df, audio_map), batch_size=32, shuffle=True)
+    va_loader = DataLoader(SimpleEgyptianDataset(val_df, audio_map), batch_size=32)
+    te_loader = DataLoader(SimpleEgyptianDataset(test_df, audio_map), batch_size=32)
 
-    print("\n🔥 STAGE 1: HEAD WARMUP (STABLE ATTENTION)")
+    print("\n🔥 STAGE 1: HEAD WARMUP")
     for param in model.wavlm.parameters(): param.requires_grad = False
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     
@@ -171,7 +161,7 @@ def main():
 
     print("\n🚀 STAGE 2: FINE-TUNING")
     for param in model.wavlm.parameters(): param.requires_grad = True
-    opt = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
     sch = get_cosine_schedule_with_warmup(opt, num_warmup_steps=len(tr_loader), num_training_steps=len(tr_loader)*10)
     
     best_va = 0
@@ -187,13 +177,13 @@ def main():
             
         va, vf = evaluate(model, va_loader, device)
         ta, tf = evaluate(model, te_loader, device)
-        print(f"🏆 Epoch {epoch}:")
+        print(f"🏆 Epoch {epoch} Results:")
         print(f"   VALIDATION -> Acc: {va:.3f} | Macro-F1: {vf:.3f}")
         print(f"   TESTING    -> Acc: {ta:.3f} | Macro-F1: {tf:.3f}")
         
         if va > best_va:
             best_va = va
-            torch.save(model.state_dict(), config.CHECKPOINT_DIR / "wavlm_stable_sota_best.pt")
+            torch.save(model.state_dict(), config.CHECKPOINT_DIR / "wavlm_weighted_basic_best.pt")
             print("   🌟 New Best Baseline Saved")
 
 if __name__ == "__main__": main()
