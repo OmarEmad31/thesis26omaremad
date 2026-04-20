@@ -16,13 +16,16 @@ from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
 from pathlib import Path
 
-# SpeechBrain integration
+# SpeechBrain integration (Updated for 1.0+)
 try:
-    from speechbrain.lobes.models.ECAPA_TDNN import ECAPA_TDNN
-    from speechbrain.pretrained import EncoderClassifier
+    from speechbrain.inference import EncoderClassifier
     HAS_SB = True
 except ImportError:
-    HAS_SB = False
+    try:
+        from speechbrain.pretrained import EncoderClassifier
+        HAS_SB = True
+    except ImportError:
+        HAS_SB = False
 
 # Add project root
 project_root = str(Path(__file__).parent.parent.parent.absolute())
@@ -158,7 +161,7 @@ def evaluate(model, loader, device):
 
 def main():
     torch.manual_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     
     if not HAS_SB:
         print("❌ ERROR: speechbrain not installed. Run !pip install speechbrain")
