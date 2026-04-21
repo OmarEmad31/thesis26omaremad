@@ -126,8 +126,8 @@ def main():
     model = AggressiveChampionWavLM(len(classes)).to(device)
     l_sup = SupConLoss(temperature=0.07); l_ce = nn.CrossEntropyLoss(label_smoothing=0.1)
     
-    tr_loader = DataLoader(StableDataset(master_df, audio_map), batch_size=24, sampler=sampler)
-    te_loader = DataLoader(StableDataset(test_df, audio_map), batch_size=24)
+    tr_loader = DataLoader(StableDataset(master_df, audio_map), batch_size=16, sampler=sampler)
+    te_loader = DataLoader(StableDataset(test_df, audio_map), batch_size=16)
 
     # DLR: 1e-5 backbone, 5e-4 head
     opt = torch.optim.AdamW([
