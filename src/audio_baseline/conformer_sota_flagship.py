@@ -4,14 +4,14 @@ The 600M-parameter Definitive SOTA for individual audio.
 
 Backbone: Wav2Vec2-BERT-2.0 (Conformer-based, 600M params).
 Head: Multi-Head Self-Attention + Hybrid (Avg+Max) Pooling.
-Pre-processing: 160-dim Log-Mel Filterbanks (Wav2Vec2BertProcessor).
+Pre-processing: 160-dim Log-Mel Filterbanks (Wav2Vec2BertFeatureExtractor).
 """
 
 import os, sys, torch, librosa, numpy as np, pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import Wav2Vec2BertModel, Wav2Vec2BertProcessor, get_cosine_schedule_with_warmup
+from transformers import Wav2Vec2BertModel, Wav2Vec2BertFeatureExtractor, get_cosine_schedule_with_warmup
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
@@ -88,10 +88,10 @@ class ConformerSOTAFlagship(nn.Module):
 # DATASET: SPECTRAL EXTRACTION
 # ---------------------------------------------------------------------------
 class FlagshipEgyptianDataset(Dataset):
-    def __init__(self, df, audio_map, processor):
+    def __init__(self, df, audio_map, feature_extractor):
         self.df = df
         self.audio_map = audio_map
-        self.processor = processor
+        self.feature_extractor = feature_extractor
         self.max_len = 160000 
 
     def __len__(self): return len(self.df)
@@ -100,8 +100,8 @@ class FlagshipEgyptianDataset(Dataset):
         row = self.df.iloc[idx]
         bn = Path(str(row["audio_relpath"]).replace("\\", "/")).name
         path = self.audio_map.get(bn); audio, _ = librosa.load(path, sr=16000, mono=True)
-        inputs = self.processor(audio, sampling_rate=16000, max_length=self.max_len, 
-                               truncation=True, padding="max_length", return_tensors="pt")
+        inputs = self.feature_extractor(audio, sampling_rate=16000, max_length=self.max_len, 
+                                       truncation=True, padding="max_length", return_tensors="pt")
         return {
             "input_features": inputs.input_features.squeeze(0),
             "attention_mask": inputs.attention_mask.squeeze(0),
@@ -124,9 +124,9 @@ def main():
     torch.manual_seed(42); np.random.seed(42)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     P_NAME = "facebook/w2v-bert-2.0"
-    processor = Wav2Vec2BertProcessor.from_pretrained(P_NAME)
+    feature_extractor = Wav2Vec2BertFeatureExtractor.from_pretrained(P_NAME)
 
-    print("🏗️ Initializing Conformer Spectral Masterclass...")
+    print("🏗️ Initializing Conformer Acoustic Masterclass...")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
@@ -146,12 +146,12 @@ def main():
     model = ConformerSOTAFlagship(len(classes), P_NAME).to(device)
     loss_fn = FocalLoss(alpha=weights, gamma=2.0) 
 
-    tr_loader = DataLoader(FlagshipEgyptianDataset(train_df, audio_map, processor), batch_size=4, shuffle=True)
-    va_loader = DataLoader(FlagshipEgyptianDataset(val_df, audio_map, processor), batch_size=4)
-    te_loader = DataLoader(FlagshipEgyptianDataset(test_df, audio_map, processor), batch_size=4)
+    tr_loader = DataLoader(FlagshipEgyptianDataset(train_df, audio_map, feature_extractor), batch_size=4, shuffle=True)
+    va_loader = DataLoader(FlagshipEgyptianDataset(val_df, audio_map, feature_extractor), batch_size=4)
+    te_loader = DataLoader(FlagshipEgyptianDataset(test_df, audio_map, feature_extractor), batch_size=4)
     accum_steps = 8
 
-    print("\n🔥 STAGE 1: SPECTRAL WARMUP")
+    print("\n🔥 STAGE 1: ACOUSTIC WARMUP")
     for param in model.backbone.parameters(): param.requires_grad = False
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     
@@ -162,10 +162,11 @@ def main():
             x = b["input_features"].to(device); l = b["label"].to(device); m = b["attention_mask"].to(device)
             logits = model(x, m); loss = loss_fn(logits, l) / accum_steps; loss.backward()
             if (i+1) % accum_steps == 0: opt.step(); opt.zero_grad()
+            pbar.set_postfix({"loss": f"{loss.item()*accum_steps:.4f}"})
         va, vf = evaluate(model, va_loader, device)
         print(f"📈 Warmup Epoch {epoch} | Val Acc: {va:.3f} | Val F1: {vf:.3f}")
 
-    print("\n🚀 STAGE 2: SPECTRAL FINE-TUNING")
+    print("\n🚀 STAGE 2: ACOUSTIC FINE-TUNING")
     for param in model.backbone.parameters(): param.requires_grad = True
     opt = torch.optim.AdamW([{"params": model.backbone.parameters(), "lr": 5e-7},
                             {"params": model.classifier.parameters(), "lr": 1e-4}], weight_decay=0.01)
@@ -179,6 +180,7 @@ def main():
             x = b["input_features"].to(device); l = b["label"].to(device); m = b["attention_mask"].to(device)
             logits = model(x, m); loss = loss_fn(logits, l) / accum_steps; loss.backward()
             if (i+1) % accum_steps == 0: opt.step(); opt.zero_grad(); sch.step()
+            pbar.set_postfix({"loss": f"{loss.item()*accum_steps:.4f}"})
         va, vf = evaluate(model, va_loader, device)
         ta, tf = evaluate(model, te_loader, device)
         print(f"🏆 Epoch {epoch} Results: VAL Acc: {va:.3f} F1: {vf:.3f} | TEST Acc: {ta:.3f} F1: {tf:.3f}")
