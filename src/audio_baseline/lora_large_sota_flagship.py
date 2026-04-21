@@ -75,7 +75,7 @@ class LoRALargeSER(nn.Module):
         lora_config = LoraConfig(
             r=16, 
             lora_alpha=32, 
-            target_modules=["query_proj", "value_proj"], 
+            target_modules=["q_proj", "v_proj"], 
             lora_dropout=0.1, 
             bias="none"
         )
