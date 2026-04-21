@@ -77,7 +77,7 @@ class EnsembleMember(nn.Module):
         else: return self.projector(pooled), self.classifier(pooled)
 
 # ---------------------------------------------------------------------------
-# DATASET: HEAVY ONLINE AUGMENTATION
+# DATASET: FAST ONLINE AUGMENTATION
 # ---------------------------------------------------------------------------
 class HeavyAugDataset(Dataset):
     def __init__(self, df, audio_map, augment=False):
@@ -89,15 +89,15 @@ class HeavyAugDataset(Dataset):
         row = self.df.iloc[idx]; bn = Path(str(row["audio_relpath"]).replace("\\", "/")).name
         path = self.audio_map.get(bn); audio, _ = librosa.load(path, sr=16000, mono=True)
         
-        # ONLINE AUGMENTATION (Prosody Variation)
+        # FAST ONLINE AUGMENTATION
         if self.augment:
-            # 1. Pitch Shifting (-2 to +2 semitones)
+            # 1. Random Time Stretch (0.9x to 1.1x) - Fast Resampling
             if np.random.rand() > 0.5:
-                audio = librosa.effects.pitch_shift(audio, sr=16000, n_steps=np.random.uniform(-1.5, 1.5))
-            # 2. Add White Noise
+                stretch_factor = np.random.uniform(0.9, 1.1)
+                audio = np.interp(np.arange(0, len(audio), stretch_factor), np.arange(len(audio)), audio).astype(np.float32)
+            # 2. Add White Noise - Very Fast
             if np.random.rand() > 0.5:
-                noise = np.random.randn(len(audio))
-                audio = audio + 0.005 * noise * np.max(audio)
+                audio = audio + 0.002 * np.random.randn(len(audio)) * np.max(audio)
         
         mask = np.zeros(self.max_len, dtype=np.float32)
         if len(audio) > self.max_len:
@@ -119,9 +119,9 @@ def train_one_fold(fold_idx, train_loader, val_loader, num_classes, device):
     # Stage 1: Warmup
     for p in model.wavlm.parameters(): p.requires_grad = False
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
-    for _ in range(2):
-        model.train()
-        for b in train_loader:
+    for epoch in range(2):
+        model.train(); pbar = tqdm(train_loader, desc=f"Fold {fold_idx+1} Warmup {epoch+1}")
+        for b in pbar:
             p, c = model(b["wav"].to(device), b["mask"].to(device), mode="both")
             loss = l_sup(p, b["label"].to(device)) + l_ce(c, b["label"].to(device))
             opt.zero_grad(); loss.backward(); opt.step()
@@ -130,9 +130,9 @@ def train_one_fold(fold_idx, train_loader, val_loader, num_classes, device):
     for p in model.wavlm.parameters(): p.requires_grad = True
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
     best_acc, ckpt = 0, None
-    for epoch in range(1, 16): # Faster folds
-        model.train()
-        for b in train_loader:
+    for epoch in range(1, 16): 
+        model.train(); pbar = tqdm(train_loader, desc=f"Fold {fold_idx+1} Push {epoch}")
+        for b in pbar:
             p, c = model(b["wav"].to(device), b["mask"].to(device), mode="both")
             loss = l_sup(p, b["label"].to(device)) + l_ce(c, b["label"].to(device))
             opt.zero_grad(); loss.backward(); opt.step()
@@ -144,6 +144,7 @@ def train_one_fold(fold_idx, train_loader, val_loader, num_classes, device):
                 l = model(b["wav"].to(device), b["mask"].to(device), mode="classify")
                 ps.extend(torch.argmax(l, 1).cpu().numpy()); ts.extend(b["label"].numpy())
         acc = accuracy_score(ts, ps)
+        print(f"📈 Epoch {epoch} | Val Acc: {acc:.3f}")
         if acc > best_acc:
             best_acc = acc; ckpt = model.state_dict()
     
