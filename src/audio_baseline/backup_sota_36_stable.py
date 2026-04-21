@@ -1,5 +1,6 @@
 """
-HArnESS-SOTA-36-STABLE (Restored Flagship).
+HArnESS-SOTA-36-STABLE (Project Backup).
+This is the verified high-performance individual audio baseline.
 Performance: VAL Acc: 36.0% | TEST Acc: 35.8% | F1: 18.3%.
 
 Backbone: WavLM-Base-Plus (microsoft/wavlm-base-plus).
@@ -112,7 +113,7 @@ class StableDataset(Dataset):
                 "label": torch.tensor(row["label_id"], dtype=torch.long)}
 
 # ---------------------------------------------------------------------------
-# MAIN
+# EVALUATION & MAIN
 # ---------------------------------------------------------------------------
 def evaluate(model, loader, device):
     model.eval(); ps, ts = [], []
@@ -146,11 +147,12 @@ def main():
     va_loader = DataLoader(StableDataset(val_df, audio_map), batch_size=32)
     te_loader = DataLoader(StableDataset(test_df, audio_map), batch_size=32)
 
+    # REPLICATING THE 36% RUN
     print("\n🏗️ Restoring 36% SOTA Baseline...")
     for param in model.wavlm.parameters(): param.requires_grad = False
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     
-    for epoch in range(1, 4):
+    for epoch in range(1, 4): # Warmup
         model.train(); pbar = tqdm(tr_loader, desc=f"Warmup Ep{epoch}")
         for b in pbar:
             w = b["wav"].to(device); l = b["label"].to(device); m = b["mask"].to(device)
