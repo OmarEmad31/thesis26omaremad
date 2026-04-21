@@ -160,16 +160,19 @@ def main():
             opt.zero_grad(); loss.backward(); opt.step()
         va, vf = evaluate(model, va_loader, device); print(f"📈 Warmup Epoch {epoch} | Val Acc: {va:.3f} | Val F1: {vf:.3f}")
 
-    print("\n🚀 STAGE 2: DLR FINE-TUNING (Sprinting toward 50%)")
+    print("\n🚀 STAGE 2: DLR FINE-TUNING + SWA (Pushing for 50%)")
     for param in model.wavlm.parameters(): param.requires_grad = True
     
-    # DISCRIMINATIVE LEARNING RATES: 50x faster head learning
     optimizer_grouped_parameters = [
         {"params": model.wavlm.parameters(), "lr": 1e-5},
         {"params": [p for n, p in model.named_parameters() if "wavlm" not in n], "lr": 5e-4},
     ]
     opt = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
     sch = get_cosine_schedule_with_warmup(opt, num_warmup_steps=len(tr_loader), num_training_steps=len(tr_loader)*25)
+    
+    # SWA Initialization
+    swa_model = torch.optim.swa_utils.AveragedModel(model)
+    swa_start = 10
     
     best_va = 0
     for epoch in range(1, 26):
@@ -178,9 +181,16 @@ def main():
             w, m, l = b["wav"].to(device), b["mask"].to(device), b["label"].to(device)
             p, c = model(w, m, mode="both"); loss = 1.0 * l_sup(p, l) + 1.0 * l_ce(c, l)
             opt.zero_grad(); loss.backward(); opt.step(); sch.step()
-        va, vf = evaluate(model, va_loader, device); ta, tf = evaluate(model, te_loader, device)
+        
+        if epoch >= swa_start:
+            swa_model.update_parameters(model)
+        
+        # Eval with SWA if active
+        eval_model = swa_model if epoch >= swa_start else model
+        va, vf = evaluate(eval_model, va_loader, device); ta, tf = evaluate(eval_model, te_loader, device)
         print(f"🏆 Epoch {epoch} Results: VAL Acc: {va:.3f} F1: {vf:.3f} | TEST Acc: {ta:.3f} F1: {tf:.3f}")
+        
         if va > best_va:
-            best_va = va; torch.save(model.state_dict(), config.CHECKPOINT_DIR / "dlr_stable_best.pt")
+            best_va = va; torch.save(eval_model.state_dict(), config.CHECKPOINT_DIR / "diamond_swa_best.pt")
 
 if __name__ == "__main__": main()
