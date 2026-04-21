@@ -57,21 +57,21 @@ class SupConLoss(nn.Module):
 # ARCHITECTURE: THE EMOTIONAL APOSTLE
 # ---------------------------------------------------------------------------
 class EmotionalApostle(nn.Module):
-    def __init__(self, num_labels, model_name="harshit345/wavlm-base-plus-finetuned"):
+    def __init__(self, num_labels, model_name="ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition"):
         super().__init__()
         # Load the model which already knows what anger/sadness sounds like
-        # Note: Model is hosted as Wav2Vec2Model compatible on HF
         self.wavlm = Wav2Vec2Model.from_pretrained(model_name)
         
+        # High-res projection for XLS-R (1024 dims)
         self.projector = nn.Sequential(
-            nn.Linear(768, 512),
+            nn.Linear(1024, 512),
             nn.ReLU(),
             nn.Linear(512, 128)
         )
         
         self.classifier = nn.Sequential(
             nn.Dropout(0.3),
-            nn.Linear(768, 512),
+            nn.Linear(1024, 512),
             nn.ReLU(),
             nn.Linear(512, num_labels)
         )
@@ -82,6 +82,7 @@ class EmotionalApostle(nn.Module):
         
         # Masked Mean Pooling
         if mask is not None:
+            # XLS-R has different downsampling factor sometimes, keeping base 320 for consistency
             down_mask = mask[:, ::320][:, :outputs.shape[1]]
             mask_exp = down_mask.unsqueeze(-1).expand(outputs.size()).float()
             pooled = torch.sum(outputs * mask_exp, 1) / torch.clamp(mask_exp.sum(1), min=1e-9)
