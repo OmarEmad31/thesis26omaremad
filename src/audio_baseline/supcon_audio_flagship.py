@@ -177,7 +177,7 @@ def main():
     swa_model = torch.optim.swa_utils.AveragedModel(model); swa_start = 12; best_va = 0
 
     for epoch in range(1, 31):
- acoustic        model.train(); pbar = tqdm(tr_loader, desc=f"Push Ep{epoch}")
+        model.train(); pbar = tqdm(tr_loader, desc=f"Push Ep{epoch}")
         for b in pbar:
             w, m, l = b["wav"].to(device), b["mask"].to(device), b["label"].to(device)
             p, c = model(w, m, mode="both"); loss = 1.0 * l_sup(p, l) + 2.0 * l_focal(c, l) # Focal weight
