@@ -117,7 +117,11 @@ class StableDataset(Dataset):
         if len(audio) > self.max_len:
             audio = audio[:self.max_len]; mask[:] = 1.0
         else:
-            mask[:len(audio)] = 1.0; audio = np.pad(audio, np.random.randint(0, self.max_len - len(audio)) if len(audio) < self.max_len else (0, 0)) # Stochastic Pad
+            mask[:len(audio)] = 1.0
+            pad_total = self.max_len - len(audio)
+            pad_before = np.random.randint(0, pad_total + 1)
+            pad_after = pad_total - pad_before
+            audio = np.pad(audio, (pad_before, pad_after)) # Correct Stochastic Shift
         return {"wav": torch.tensor(audio, dtype=torch.float32), 
                 "mask": torch.tensor(mask, dtype=torch.float32), 
                 "label": torch.tensor(row["label_id"], dtype=torch.long)}
