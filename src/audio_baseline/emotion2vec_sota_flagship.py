@@ -1,8 +1,8 @@
 """
-HArnESS-Emotion2Vec-SOTA: Egyptian Arabic SER (The 50% Milestone Push).
-Specialized Emotional Representations + Geometric Clustering.
+HArnESS-UniSpeech-SOTA: Egyptian Arabic SER (The 50% Milestone Push).
+Acoustic Specialization via UniSpeech-SAT.
 
-Backbone: alibaba-damo/emotion2vec_base_25k (Domain-Specific).
+Backbone: microsoft/unispeech-sat-base-plus (Speaker/Emotion Specific).
 Loss: Hybrid SupCon (Geometric) + Label Smoothed CrossEntropy.
 Protocol: Stable 10s context.
 Target: 50% Milestone.
@@ -54,13 +54,13 @@ class SupConLoss(nn.Module):
         return -mean_log_prob_pos.mean()
 
 # ---------------------------------------------------------------------------
-# ARCHITECTURE: EMOTION2VEC BACKBONE
+# ARCHITECTURE: UNISPEECH-SAT BACKBONE
 # ---------------------------------------------------------------------------
-class Emotion2VecSOTA(nn.Module):
-    def __init__(self, num_labels, model_name="alibaba-damo/emotion2vec_base"):
+class UniSpeechSOTA(nn.Module):
+    def __init__(self, num_labels, model_name="microsoft/unispeech-sat-base-plus"):
         super().__init__()
-        # Load specialized emotion backbone
-        self.backbone = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+        # UniSpeech-SAT is specialized for Speaker/Emotion
+        self.backbone = AutoModel.from_pretrained(model_name)
         
         self.projector = nn.Sequential(
             nn.Linear(768, 512),
@@ -76,15 +76,11 @@ class Emotion2VecSOTA(nn.Module):
         )
 
     def forward(self, wav, mask=None, mode="train"):
-        # Normalized input
         wav = (wav - wav.mean(dim=-1, keepdim=True)) / (wav.std(dim=-1, keepdim=True) + 1e-6)
-        
-        # emotion2vec feature extraction
         outputs = self.backbone(wav).last_hidden_state
         
         # Masked Mean Pooling
         if mask is not None:
-            # Factor 320 for these architectures
             down_mask = mask[:, ::320][:, :outputs.shape[1]]
             mask_exp = down_mask.unsqueeze(-1).expand(outputs.size()).float()
             pooled = torch.sum(outputs * mask_exp, 1) / torch.clamp(mask_exp.sum(1), min=1e-9)
@@ -130,7 +126,7 @@ def evaluate(model, loader, device):
 def main():
     torch.manual_seed(42); np.random.seed(42); device = "cuda:0" if torch.cuda.is_available() else "cpu"
     
-    print("🏗️ Initializing Emotion2Vec SOTA Engine...")
+    print("🏗️ Initializing UniSpeech-SAT SOTA Engine...")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
@@ -145,14 +141,14 @@ def main():
     y_tr = train_df["label_id"].values
     weights = torch.tensor(compute_class_weight("balanced", classes=np.unique(y_tr), y=y_tr), dtype=torch.float32).to(device)
 
-    model = Emotion2VecSOTA(len(classes)).to(device)
+    model = UniSpeechSOTA(len(classes)).to(device)
     l_sup = SupConLoss(temperature=0.07); l_ce = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
     
     tr_loader = DataLoader(StableDataset(train_df, audio_map), batch_size=32, shuffle=True)
     va_loader = DataLoader(StableDataset(val_df, audio_map), batch_size=32)
     te_loader = DataLoader(StableDataset(test_df, audio_map), batch_size=32)
 
-    print("\n🔥 STAGE 1: DOMAIN ALIGNMENT (Warmup)")
+    print("\n🔥 STAGE 1: ACOUSTIC ALIGNMENT (Warmup)")
     for param in model.backbone.parameters(): param.requires_grad = False
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     
@@ -168,7 +164,7 @@ def main():
 
     print("\n🚀 STAGE 2: EMOTIVE FINE-TUNING (The 50% Push)")
     for param in model.backbone.parameters(): param.requires_grad = True
-    opt = torch.optim.AdamW([{"params": model.parameters(), "lr": 1e-5}], weight_decay=0.01)
+    opt = torch.optim.AdamW([{"params": model.parameters(), "lr": 2e-5}], weight_decay=0.01)
     sch = get_cosine_schedule_with_warmup(opt, num_warmup_steps=len(tr_loader), num_training_steps=len(tr_loader)*25)
     
     best_va = 0
@@ -183,6 +179,6 @@ def main():
         ta, tf = evaluate(model, te_loader, device)
         print(f"🏆 Epoch {epoch} Results: VAL Acc: {va:.3f} F1: {vf:.3f} | TEST Acc: {ta:.3f} F1: {tf:.3f}")
         if va > best_va:
-            best_va = va; torch.save(model.state_dict(), config.CHECKPOINT_DIR / "emotion2vec_best.pt")
+            best_va = va; torch.save(model.state_dict(), config.CHECKPOINT_DIR / "unispeech_best.pt")
 
 if __name__ == "__main__": main()
