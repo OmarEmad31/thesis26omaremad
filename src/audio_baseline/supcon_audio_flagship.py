@@ -1,20 +1,19 @@
 """
-HArnESS-SupCon-Acoustic: Egyptian Arabic SER (The 50% Geometric Push).
-Clustering 857 samples via Supervised Contrastive Learning.
+HArnESS-SupCon-Density: Egyptian Arabic SER (The 50% Final Push).
+Geometric Boundary Learning (SupCon) + High-Density Signal (3s Crops).
 
 Backbone: WavLM-Base-Plus.
-Loss: Hybrid SupCon (Geometric) + CrossEntropy (Classification).
-Projector: MLP-based Contrastive Head.
-Target: 50% Milestone.
+Loss: SupCon (Geometric) + CrossEntropy (label_smoothing=0.1).
+Sampler: WeightedRandomSampler (F1 Optimization).
+Protocol: 3s Random Cropping (Density Multiplication).
 """
 
 import os, sys, torch, librosa, numpy as np, pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from transformers import WavLMModel, get_cosine_schedule_with_warmup
 from sklearn.metrics import accuracy_score, f1_score
-from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
 from pathlib import Path
 
@@ -34,31 +33,23 @@ class SupConLoss(nn.Module):
         self.temperature = temperature
 
     def forward(self, features, labels):
-        # features: [BS, Dim], labels: [BS]
         device = features.device
         batch_size = features.shape[0]
         labels = labels.contiguous().view(-1, 1)
         mask = torch.eq(labels, labels.T).float().to(device)
 
-        # Normalize features
         features = F.normalize(features, dim=1)
-        
-        # Compute similarities
         logits = torch.div(torch.matmul(features, features.T), self.temperature)
         
-        # Numerical stability (subtract max)
         logits_max, _ = torch.max(logits, dim=1, keepdim=True)
         logits = logits - logits_max.detach()
 
-        # Mask for self-similarity (ignore diagonal)
         logits_mask = torch.scatter(torch.ones_like(mask), 1, torch.arange(batch_size).view(-1, 1).to(device), 0)
         mask = mask * logits_mask
 
-        # Log prob
         exp_logits = torch.exp(logits) * logits_mask
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
 
-        # Mean log-likelihood over positive pairs
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1).clamp(min=1)
         loss = -mean_log_prob_pos.mean()
         return loss
@@ -71,16 +62,14 @@ class SupConWavLM(nn.Module):
         super().__init__()
         self.wavlm = WavLMModel.from_pretrained(model_name)
         
-        # 1. Contrastive Projector (Clustering)
         self.projector = nn.Sequential(
             nn.Linear(768, 512),
             nn.ReLU(),
-            nn.Linear(512, 128) # 128-dim embedding space for clustering
+            nn.Linear(512, 128)
         )
         
-        # 2. Classifier Head
         self.classifier = nn.Sequential(
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),
             nn.Linear(768, 512),
             nn.ReLU(),
             nn.Linear(512, num_labels)
@@ -90,7 +79,6 @@ class SupConWavLM(nn.Module):
         wav = (wav - wav.mean(dim=-1, keepdim=True)) / (wav.std(dim=-1, keepdim=True) + 1e-6)
         outputs = self.wavlm(wav).last_hidden_state
         
-        # Masked Mean Pooling
         if mask is not None:
             down_mask = mask[:, ::320][:, :outputs.shape[1]]
             mask_expanded = down_mask.unsqueeze(-1).expand(outputs.size()).float()
@@ -106,11 +94,11 @@ class SupConWavLM(nn.Module):
             return self.projector(pooled), self.classifier(pooled)
 
 # ---------------------------------------------------------------------------
-# DATASET: STABLE SNAPSHOT
+# DATASET: RANDOM 3S CROPPING ENGINE
 # ---------------------------------------------------------------------------
-class SupConDataset(Dataset):
-    def __init__(self, df, audio_map):
-        self.df = df; self.audio_map = audio_map; self.max_len = 160000 
+class DensitySupConDataset(Dataset):
+    def __init__(self, df, audio_map, is_train=False):
+        self.df = df; self.audio_map = audio_map; self.crop_len = 48000; self.is_train = is_train
 
     def __len__(self): return len(self.df)
 
@@ -118,11 +106,17 @@ class SupConDataset(Dataset):
         row = self.df.iloc[idx]
         bn = Path(str(row["audio_relpath"]).replace("\\", "/")).name
         path = self.audio_map.get(bn); audio, _ = librosa.load(path, sr=16000, mono=True)
-        mask = np.zeros(self.max_len, dtype=np.float32)
-        if len(audio) > self.max_len:
-            audio = audio[:self.max_len]; mask[:] = 1.0
+        
+        if len(audio) > self.crop_len:
+            if self.is_train:
+                start = np.random.randint(0, len(audio) - self.crop_len)
+            else:
+                start = (len(audio) - self.crop_len) // 2
+            audio = audio[start:start+self.crop_len]; mask = np.ones(self.crop_len, dtype=np.float32)
         else:
-            mask[:len(audio)] = 1.0; audio = np.pad(audio, (0, self.max_len - len(audio)))
+            mask = np.zeros(self.crop_len, dtype=np.float32)
+            mask[:len(audio)] = 1.0; audio = np.pad(audio, (0, self.crop_len - len(audio)))
+            
         return {
             "wav": torch.tensor(audio, dtype=torch.float32),
             "mask": torch.tensor(mask, dtype=torch.float32),
@@ -130,7 +124,7 @@ class SupConDataset(Dataset):
         }
 
 # ---------------------------------------------------------------------------
-# TRAINING
+# TRAINING SOTA
 # ---------------------------------------------------------------------------
 def evaluate(model, loader, device):
     model.eval()
@@ -144,7 +138,7 @@ def evaluate(model, loader, device):
 def main():
     torch.manual_seed(42); np.random.seed(42); device = "cuda:0" if torch.cuda.is_available() else "cpu"
     
-    print("🏗️ Initializing SupCon-Acoustic Engine...")
+    print("🏗️ Initializing SupCon-Density Final Engine...")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
@@ -157,15 +151,21 @@ def main():
     for ext in ["*.wav", "*.WAV", "*.Wav"]:
         for p in data_search_path.rglob(ext): audio_map[p.name] = p
 
-    model = SupConWavLM(len(classes)).to(device)
-    l_sup = SupConLoss(temperature=0.07)
-    l_ce = nn.CrossEntropyLoss()
-    
-    tr_loader = DataLoader(SupConDataset(train_df, audio_map), batch_size=32, shuffle=True)
-    va_loader = DataLoader(SupConDataset(val_df, audio_map), batch_size=32)
-    te_loader = DataLoader(SupConDataset(test_df, audio_map), batch_size=32)
+    # WEIGHTED SAMPLER FOR F1 OPTIMIZATION
+    y_tr = train_df["label_id"].values
+    counts = np.bincount(y_tr)
+    weights = 1. / counts
+    sample_weights = torch.from_numpy(np.array([weights[t] for t in y_tr]))
+    sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
 
-    print("\n🔥 STAGE 1: GEOMETRIC WARMUP (Hybrid Loss)")
+    model = SupConWavLM(len(classes)).to(device)
+    l_sup = SupConLoss(temperature=0.07); l_ce = nn.CrossEntropyLoss(label_smoothing=0.1)
+    
+    tr_loader = DataLoader(DensitySupConDataset(train_df, audio_map, is_train=True), batch_size=32, sampler=sampler)
+    va_loader = DataLoader(DensitySupConDataset(val_df, audio_map), batch_size=32)
+    te_loader = DataLoader(DensitySupConDataset(test_df, audio_map), batch_size=32)
+
+    print("\n🔥 STAGE 1: DENSITY GEOMETRIC WARMUP")
     for param in model.wavlm.parameters(): param.requires_grad = False
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     
@@ -173,18 +173,17 @@ def main():
         model.train()
         pbar = tqdm(tr_loader, desc=f"Warmup Ep{epoch}")
         for b in pbar:
-            wav = b["wav"].to(device); lbl = b["label"].to(device); msk = b["mask"].to(device)
-            proj, logits = model(wav, msk, mode="both")
-            loss = 1.0 * l_sup(proj, lbl) + 1.0 * l_ce(logits, lbl)
+            w = b["wav"].to(device); l = b["label"].to(device); m = b["mask"].to(device)
+            p, c = model(w, m, mode="both")
+            loss = 1.0 * l_sup(p, l) + 1.0 * l_ce(c, l)
             opt.zero_grad(); loss.backward(); opt.step()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         va, vf = evaluate(model, va_loader, device)
         print(f"📈 Warmup Epoch {epoch} | Val Acc: {va:.3f} | Val F1: {vf:.3f}")
 
-    print("\n🚀 STAGE 2: GEOMETRIC FINE-TUNING (The 50% Push)")
+    print("\n🚀 STAGE 2: THE 50% DENSITY PUSH (25 Epochs)")
     for param in model.wavlm.parameters(): param.requires_grad = True
     opt = torch.optim.AdamW([
-        {"params": model.wavlm.parameters(), "lr": 2e-5}, # Higher for contrastive shift
+        {"params": model.wavlm.parameters(), "lr": 1e-5},
         {"params": model.projector.parameters(), "lr": 1e-4},
         {"params": model.classifier.parameters(), "lr": 1e-4}
     ], weight_decay=0.01)
@@ -195,15 +194,14 @@ def main():
         model.train()
         pbar = tqdm(tr_loader, desc=f"Push Ep{epoch}")
         for b in pbar:
-            wav = b["wav"].to(device); lbl = b["label"].to(device); msk = b["mask"].to(device)
-            proj, logits = model(wav, msk, mode="both")
-            loss = 1.0 * l_sup(proj, lbl) + 1.0 * l_ce(logits, lbl)
+            w = b["wav"].to(device); l = b["label"].to(device); m = b["mask"].to(device)
+            p, c = model(w, m, mode="both")
+            loss = 1.0 * l_sup(p, l) + 1.1 * l_ce(c, l) # Slight bias to CE for final accuracy
             opt.zero_grad(); loss.backward(); opt.step(); sch.step()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         va, vf = evaluate(model, va_loader, device)
         ta, tf = evaluate(model, te_loader, device)
         print(f"🏆 Epoch {epoch} Results: VAL Acc: {va:.3f} | TEST Acc: {ta:.3f} F1: {tf:.3f}")
         if va > best_va:
-            best_va = va; torch.save(model.state_dict(), config.CHECKPOINT_DIR / "supcon_audio_best.pt")
+            best_va = va; torch.save(model.state_dict(), config.CHECKPOINT_DIR / "supcon_density_best.pt")
 
 if __name__ == "__main__": main()
