@@ -57,7 +57,7 @@ class SupConLoss(nn.Module):
 # ARCHITECTURE: EMOTION2VEC BACKBONE
 # ---------------------------------------------------------------------------
 class Emotion2VecSOTA(nn.Module):
-    def __init__(self, num_labels, model_name="alibaba-damo/emotion2vec_base_25k"):
+    def __init__(self, num_labels, model_name="alibaba-damo/emotion2vec_base"):
         super().__init__()
         # Load specialized emotion backbone
         self.backbone = AutoModel.from_pretrained(model_name, trust_remote_code=True)
