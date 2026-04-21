@@ -1,17 +1,17 @@
 """
-HArnESS-SOTA-36-STABLE (Restored Flagship).
-Performance: VAL Acc: 36.0% | TEST Acc: 35.8% | F1: 18.3%.
+HArnESS-Stable-Optimized: Egyptian Arabic SER (The 50% Milestone Push).
+Optimizing the 36% Baseline via Balanced Sampling & Batch Scaling.
 
-Backbone: WavLM-Base-Plus (microsoft/wavlm-base-plus).
-Pooling: Masked Mean Pooling.
-Loss: Hybrid SupCon (Geometric) + CrossEntropy.
-Context: Stable 10s Padded.
+Backbone: WavLM-Base-Plus (Verified 36% Architecture).
+Optimization: WeightedRandomSampler (Class Balancing).
+Optimization: Gradient Accumulation (2 Steps -> Batch 64).
+Loss: Hybrid SupCon (Geometric) + Label Smoothed CE.
 """
 
 import os, sys, torch, librosa, numpy as np, pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from transformers import WavLMModel, get_cosine_schedule_with_warmup
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.utils.class_weight import compute_class_weight
@@ -54,9 +54,9 @@ class SupConLoss(nn.Module):
         return -mean_log_prob_pos.mean()
 
 # ---------------------------------------------------------------------------
-# ARCHITECTURE: STABLE HYBRID MODEL
+# ARCHITECTURE: THE 36% WINNER (RESTORED)
 # ---------------------------------------------------------------------------
-class StableSupConWavLM(nn.Module):
+class StableOptimizedWavLM(nn.Module):
     def __init__(self, num_labels, model_name="microsoft/wavlm-base-plus"):
         super().__init__()
         self.wavlm = WavLMModel.from_pretrained(model_name)
@@ -91,7 +91,7 @@ class StableSupConWavLM(nn.Module):
         else: return self.projector(pooled), self.classifier(pooled)
 
 # ---------------------------------------------------------------------------
-# DATASET: STABLE 10SCONTEXT
+# DATASET: STABLE 10S
 # ---------------------------------------------------------------------------
 class StableDataset(Dataset):
     def __init__(self, df, audio_map):
@@ -112,7 +112,7 @@ class StableDataset(Dataset):
                 "label": torch.tensor(row["label_id"], dtype=torch.long)}
 
 # ---------------------------------------------------------------------------
-# MAIN
+# TRAINING
 # ---------------------------------------------------------------------------
 def evaluate(model, loader, device):
     model.eval(); ps, ts = [], []
@@ -125,6 +125,7 @@ def evaluate(model, loader, device):
 def main():
     torch.manual_seed(42); np.random.seed(42); device = "cuda:0" if torch.cuda.is_available() else "cpu"
     
+    print("🏗️ Initializing Stable-Optimized Flagship (36% Base)...")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
@@ -136,43 +137,56 @@ def main():
     for ext in ["*.wav", "*.WAV", "*.Wav"]:
         for p in data_search_path.rglob(ext): audio_map[p.name] = p
 
+    # OPTIMIZATION: BALANCED SAMPLING
     y_tr = train_df["label_id"].values
-    weights = torch.tensor(compute_class_weight("balanced", classes=np.unique(y_tr), y=y_tr), dtype=torch.float32).to(device)
+    class_sample_count = np.array([len(np.where(y_tr == t)[0]) for t in np.unique(y_tr)])
+    weight = 1. / class_sample_count
+    samples_weight = np.array([weight[t] for t in y_tr])
+    sampler = WeightedRandomSampler(torch.from_numpy(samples_weight).type(torch.DoubleTensor), len(samples_weight))
 
-    model = StableSupConWavLM(len(classes)).to(device)
-    l_sup = SupConLoss(temperature=0.07); l_ce = nn.CrossEntropyLoss(weight=weights)
+    model = StableOptimizedWavLM(len(classes)).to(device)
+    l_sup = SupConLoss(temperature=0.07); l_ce = nn.CrossEntropyLoss(label_smoothing=0.1) # Smooth for generalization
     
-    tr_loader = DataLoader(StableDataset(train_df, audio_map), batch_size=32, shuffle=True)
+    tr_loader = DataLoader(StableDataset(train_df, audio_map), batch_size=32, sampler=sampler) # Use Sampler
     va_loader = DataLoader(StableDataset(val_df, audio_map), batch_size=32)
     te_loader = DataLoader(StableDataset(test_df, audio_map), batch_size=32)
 
-    print("\n🏗️ Restoring 36% SOTA Baseline...")
+    # ACCUMULATION: Simulate batch 64 for SupCon Stability
+    accumulation_steps = 2
+
+    print("\n🔥 STAGE 1: STABLE WARMUP")
     for param in model.wavlm.parameters(): param.requires_grad = False
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     
-    for epoch in range(1, 4):
+    for epoch in range(1, 6):
         model.train(); pbar = tqdm(tr_loader, desc=f"Warmup Ep{epoch}")
-        for b in pbar:
-            w = b["wav"].to(device); l = b["label"].to(device); m = b["mask"].to(device)
-            p, c = model(w, m, mode="both"); loss = 1.0 * l_sup(p, l) + 1.0 * l_ce(c, l)
-            opt.zero_grad(); loss.backward(); opt.step()
+        for i, b in enumerate(pbar):
+            w, m, l = b["wav"].to(device), b["mask"].to(device), b["label"].to(device)
+            p, c = model(w, m, mode="both")
+            loss = (1.0 * l_sup(p, l) + 1.0 * l_ce(c, l)) / accumulation_steps
+            loss.backward()
+            if (i + 1) % accumulation_steps == 0:
+                opt.step(); opt.zero_grad()
         va, vf = evaluate(model, va_loader, device); print(f"📈 Warmup Epoch {epoch} | Val Acc: {va:.3f} | Val F1: {vf:.3f}")
 
-    print("\n🚀 Starting Stable Fine-Tuning...")
+    print("\n🚀 STAGE 2: OPTIMIZED FINE-TUNING (50% Push)")
     for param in model.wavlm.parameters(): param.requires_grad = True
-    opt = torch.optim.AdamW([{"params": model.parameters(), "lr": 2e-5}], weight_decay=0.01)
-    sch = get_cosine_schedule_with_warmup(opt, num_warmup_steps=len(tr_loader), num_training_steps=len(tr_loader)*25)
+    opt = torch.optim.AdamW([{"params": model.parameters(), "lr": 1e-5}], weight_decay=0.01)
+    sch = get_cosine_schedule_with_warmup(opt, num_warmup_steps=len(tr_loader), num_training_steps=len(tr_loader)*45)
     
     best_va = 0
-    for epoch in range(1, 26):
-        model.train(); pbar = tqdm(tr_loader, desc=f"FineTune Ep{epoch}")
-        for b in pbar:
-            w = b["wav"].to(device); l = b["label"].to(device); m = b["mask"].to(device)
-            p, c = model(w, m, mode="both"); loss = 1.0 * l_sup(p, l) + 1.0 * l_ce(c, l)
-            opt.zero_grad(); loss.backward(); opt.step(); sch.step()
+    for epoch in range(1, 46):
+        model.train(); pbar = tqdm(tr_loader, desc=f"Push Ep{epoch}")
+        for i, b in enumerate(pbar):
+            w, m, l = b["wav"].to(device), b["mask"].to(device), b["label"].to(device)
+            p, c = model(w, m, mode="both")
+            loss = (1.0 * l_sup(p, l) + 1.0 * l_ce(c, l)) / accumulation_steps
+            loss.backward()
+            if (i + 1) % accumulation_steps == 0:
+                opt.step(); opt.zero_grad(); sch.step()
         va, vf = evaluate(model, va_loader, device); ta, tf = evaluate(model, te_loader, device)
         print(f"🏆 Epoch {epoch} Results: VAL Acc: {va:.3f} F1: {vf:.3f} | TEST Acc: {ta:.3f} F1: {tf:.3f}")
         if va > best_va:
-            best_va = va; torch.save(model.state_dict(), config.CHECKPOINT_DIR / "stable_36_best.pt")
+            best_va = va; torch.save(model.state_dict(), config.CHECKPOINT_DIR / "stable_optimized_best.pt")
 
 if __name__ == "__main__": main()
