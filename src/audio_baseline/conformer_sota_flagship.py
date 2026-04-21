@@ -11,7 +11,7 @@ import os, sys, torch, librosa, numpy as np, pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import Wav2Vec2BertModel, Wav2Vec2BertFeatureExtractor, get_cosine_schedule_with_warmup
+from transformers import Wav2Vec2BertModel, AutoFeatureExtractor, get_cosine_schedule_with_warmup
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
@@ -124,7 +124,7 @@ def main():
     torch.manual_seed(42); np.random.seed(42)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     P_NAME = "facebook/w2v-bert-2.0"
-    feature_extractor = Wav2Vec2BertFeatureExtractor.from_pretrained(P_NAME)
+    feature_extractor = AutoFeatureExtractor.from_pretrained(P_NAME)
 
     print("🏗️ Initializing Conformer Acoustic Masterclass...")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
