@@ -1,10 +1,11 @@
 """
-HArnESS-SupCon-Refined: Egyptian Arabic SER (The 50% Milestone Push).
-Geometric Boundary Learning (SupCon) + Layer-4 Fusion + Focal Loss.
+HArnESS-Surgical-SOTA: Egyptian Arabic SER (The 50% Milestone Push).
+Weighted Layer Aggregation + Cosine Warm Restarts.
 
-Backbone: WavLM-Base-Plus (Last 4-Layer Fusion).
-Loss: SupCon (Geometric) + FocalLoss (F1 Hard-Example Mining).
-Protocol: Full 10s Stable Context.
+Backbone: WavLM-Base-Plus (Learnable Layer Weights).
+Features: Weighted Sum of All 13 Hidden Layers (768 dim).
+Scheduler: CosineAnnealingWarmRestarts (T_0=5).
+Context: Stable 10s.
 Target: 50% Milestone.
 """
 
@@ -26,10 +27,10 @@ if project_root not in sys.path:
 from src.audio_baseline import config
 
 # ---------------------------------------------------------------------------
-# LOSS: SUPCON + FOCAL
+# LOSS: SUPCON + LABEL SMOOTHED CE
 # ---------------------------------------------------------------------------
 class SupConLoss(nn.Module):
-    def __init__(self, temperature=0.1):
+    def __init__(self, temperature=0.07):
         super(SupConLoss, self).__init__()
         self.temperature = temperature
 
@@ -41,7 +42,6 @@ class SupConLoss(nn.Module):
 
         features = F.normalize(features, dim=1)
         logits = torch.div(torch.matmul(features, features.T), self.temperature)
-        
         logits_max, _ = torch.max(logits, dim=1, keepdim=True)
         logits = logits - logits_max.detach()
 
@@ -54,33 +54,16 @@ class SupConLoss(nn.Module):
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1).clamp(min=1)
         return -mean_log_prob_pos.mean()
 
-class FocalLoss(nn.Module):
-    def __init__(self, weight=None, gamma=2.0):
-        super().__init__()
-        self.weight = weight
-        self.gamma = gamma
-
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean()
-
 # ---------------------------------------------------------------------------
-# ARCHITECTURE: LAYER-4 FUSION + PROJECTOR
+# ARCHITECTURE: WEIGHTED LAYER AGGREGATION
 # ---------------------------------------------------------------------------
-class RefinedSupConWavLM(nn.Module):
+class SurgicalSupConWavLM(nn.Module):
     def __init__(self, num_labels, model_name="microsoft/wavlm-base-plus"):
         super().__init__()
         self.wavlm = WavLMModel.from_pretrained(model_name, output_hidden_states=True)
         
-        # Layer 4 Fusion: 768 * 4 = 3072 dims
-        # We project it back to 768 for the heads
-        self.fusion_projector = nn.Sequential(
-            nn.Linear(768 * 4, 768),
-            nn.LayerNorm(768),
-            nn.ReLU()
-        )
+        # SOTA TRICK: Learn weights for each of the 13 hidden layers
+        self.layer_weights = nn.Parameter(torch.ones(13) / 13)
         
         self.projector = nn.Sequential(
             nn.Linear(768, 512),
@@ -89,7 +72,7 @@ class RefinedSupConWavLM(nn.Module):
         )
         
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
+            nn.Dropout(0.3),
             nn.Linear(768, 512),
             nn.ReLU(),
             nn.Linear(512, num_labels)
@@ -97,13 +80,15 @@ class RefinedSupConWavLM(nn.Module):
 
     def forward(self, wav, mask=None, mode="train"):
         wav = (wav - wav.mean(dim=-1, keepdim=True)) / (wav.std(dim=-1, keepdim=True) + 1e-6)
-        outputs = self.wavlm(wav) # Using hidden_states
+        outputs = self.wavlm(wav) # Using all hidden_states
         
-        # Fuse last 4 layers
-        stacked = torch.stack(outputs.hidden_states[-4:], dim=0)
-        fused_hidden = torch.mean(stacked, dim=0) # [BS, Seq, 768]
+        # 1. Weighted Layer Aggregation
+        # hidden_states is tuple of 13 tensors [BS, Seq, 768]
+        stacked = torch.stack(outputs.hidden_states, dim=0) # [13, BS, Seq, 768]
+        softmax_weights = F.softmax(self.layer_weights, dim=0).view(13, 1, 1, 1)
+        fused_hidden = torch.sum(stacked * softmax_weights, dim=0) # [BS, Seq, 768]
         
-        # Masked Mean Pooling
+        # 2. Masked Mean Pooling
         if mask is not None:
             down_mask = mask[:, ::320][:, :fused_hidden.shape[1]]
             mask_exp = down_mask.unsqueeze(-1).expand(fused_hidden.size()).float()
@@ -111,15 +96,12 @@ class RefinedSupConWavLM(nn.Module):
         else:
             pooled = fused_hidden.mean(dim=1)
             
-        if mode == "contrast":
-            return self.projector(pooled)
-        elif mode == "classify":
-            return self.classifier(pooled)
-        else:
-            return self.projector(pooled), self.classifier(pooled)
+        if mode == "contrast": return self.projector(pooled)
+        elif mode == "classify": return self.classifier(pooled)
+        else: return self.projector(pooled), self.classifier(pooled)
 
 # ---------------------------------------------------------------------------
-# DATASET: STABLE 10S
+# DATASET: STABLE SNAPSHOT
 # ---------------------------------------------------------------------------
 class StableDataset(Dataset):
     def __init__(self, df, audio_map):
@@ -140,7 +122,7 @@ class StableDataset(Dataset):
                 "label": torch.tensor(row["label_id"], dtype=torch.long)}
 
 # ---------------------------------------------------------------------------
-# TRAINING
+# TRAINING SOTA
 # ---------------------------------------------------------------------------
 def evaluate(model, loader, device):
     model.eval(); ps, ts = [], []
@@ -153,7 +135,7 @@ def evaluate(model, loader, device):
 def main():
     torch.manual_seed(42); np.random.seed(42); device = "cuda:0" if torch.cuda.is_available() else "cpu"
     
-    print("🏗️ Initializing Geometric Refinement Engine...")
+    print("🏗️ Initializing Surgical SOTA Flagship...")
     train_df = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
     val_df   = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
     test_df  = pd.read_csv(config.SPLIT_CSV_DIR / "test.csv")
@@ -168,47 +150,46 @@ def main():
     y_tr = train_df["label_id"].values
     weights = torch.tensor(compute_class_weight("balanced", classes=np.unique(y_tr), y=y_tr), dtype=torch.float32).to(device)
 
-    model = RefinedSupConWavLM(len(classes)).to(device)
-    l_sup = SupConLoss(temperature=0.1); l_foc = FocalLoss(weight=weights, gamma=2.0)
+    model = SurgicalSupConWavLM(len(classes)).to(device)
+    l_sup = SupConLoss(temperature=0.07); l_ce = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
     
     tr_loader = DataLoader(StableDataset(train_df, audio_map), batch_size=32, shuffle=True)
     va_loader = DataLoader(StableDataset(val_df, audio_map), batch_size=32)
     te_loader = DataLoader(StableDataset(test_df, audio_map), batch_size=32)
 
-    print("\n🔥 STAGE 1: GEOMETRIC WARMUP (Layer Fusion)")
+    print("\n🔥 STAGE 1: ARCHITECTURAL ALIGNMENT (Warmup)")
     for param in model.wavlm.parameters(): param.requires_grad = False
     opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     
-    for epoch in range(1, 4):
+    for epoch in range(1, 6):
         model.train(); pbar = tqdm(tr_loader, desc=f"Warmup Ep{epoch}")
         for b in pbar:
             w = b["wav"].to(device); l = b["label"].to(device); m = b["mask"].to(device)
             p, c = model(w, m, mode="both")
-            loss = 1.0 * l_sup(p, l) + 1.2 * l_foc(c, l) # Slight bias to Focal for hard mining
+            loss = 1.0 * l_sup(p, l) + 1.0 * l_ce(c, l)
             opt.zero_grad(); loss.backward(); opt.step()
         va, vf = evaluate(model, va_loader, device)
         print(f"📈 Warmup Epoch {epoch} | Val Acc: {va:.3f} | Val F1: {vf:.3f}")
 
-    print("\n🚀 STAGE 2: GEOMETRIC FINE-TUNING (SOTA Push)")
+    print("\n🚀 STAGE 2: SURGICAL FINE-TUNING (50% Milestone Support)")
     for param in model.wavlm.parameters(): param.requires_grad = True
-    opt = torch.optim.AdamW([{"params": model.wavlm.parameters(), "lr": 1e-5},
-                            {"params": model.fusion_projector.parameters(), "lr": 1e-4},
-                            {"params": model.projector.parameters(), "lr": 1e-4},
-                            {"params": model.classifier.parameters(), "lr": 1e-4}], weight_decay=0.01)
-    sch = get_cosine_schedule_with_warmup(opt, num_warmup_steps=len(tr_loader), num_training_steps=len(tr_loader)*25)
+    opt = torch.optim.AdamW([{"params": model.parameters(), "lr": 2e-5}], weight_decay=0.01)
+    
+    # BREAK THE PLATEAU: Cosine Annealing with Warm Restarts every 5 epochs
+    sch = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=5, T_mult=1)
     
     best_va = 0
     for epoch in range(1, 26):
-        model.train(); pbar = tqdm(tr_loader, desc=f"Push Ep{epoch}")
+        model.train(); pbar = tqdm(tr_loader, desc=f"SOTA Ep{epoch}")
         for b in pbar:
             w = b["wav"].to(device); l = b["label"].to(device); m = b["mask"].to(device)
             p, c = model(w, m, mode="both")
-            loss = 1.0 * l_sup(p, l) + 1.2 * l_foc(c, l)
-            opt.zero_grad(); loss.backward(); opt.step(); sch.step()
+            loss = 1.0 * l_sup(p, l) + 1.0 * l_ce(c, l)
+            opt.zero_grad(); loss.backward(); opt.step(); sch.step(epoch + (pbar.n / len(tr_loader)))
         va, vf = evaluate(model, va_loader, device)
         ta, tf = evaluate(model, te_loader, device)
         print(f"🏆 Epoch {epoch} Results: VAL Acc: {va:.3f} F1: {vf:.3f} | TEST Acc: {ta:.3f} F1: {tf:.3f}")
         if va > best_va:
-            best_va = va; torch.save(model.state_dict(), config.CHECKPOINT_DIR / "supcon_refined_best.pt")
+            best_va = va; torch.save(model.state_dict(), config.CHECKPOINT_DIR / "surgical_sota_best.pt")
 
 if __name__ == "__main__": main()
