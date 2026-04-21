@@ -130,12 +130,13 @@ def main():
         for f in p_root.rglob(ext): audio_map[f.name] = f
 
     weights = torch.tensor(compute_class_weight("balanced", classes=np.unique(train_df["label_id"]), y=train_df["label_id"]), dtype=torch.float32).to(device)
+    torch.cuda.empty_cache() # FORCE CLEAR
     model = DiamondOptimizedWavLM(len(classes)).to(device)
     l_sup = SupConLoss(temperature=0.07); l_ce = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
     
-    tr_loader = DataLoader(StableDataset(train_df, audio_map), batch_size=32, shuffle=True)
-    va_loader = DataLoader(StableDataset(val_df, audio_map), batch_size=32)
-    te_loader = DataLoader(StableDataset(test_df, audio_map), batch_size=32)
+    tr_loader = DataLoader(StableDataset(train_df, audio_map), batch_size=16, shuffle=True)
+    va_loader = DataLoader(StableDataset(val_df, audio_map), batch_size=16)
+    te_loader = DataLoader(StableDataset(test_df, audio_map), batch_size=16)
 
     # DLR: Stable backbone, Slightly slower head for stability
     opt = torch.optim.AdamW([
