@@ -153,8 +153,10 @@ def train_one_fold(fold_idx, train_loader, val_loader, num_classes, device):
 
 def main():
     torch.manual_seed(42); np.random.seed(42); device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    full_df = pd.read_csv(config.SPLIT_CSV_DIR / "train_val_merged.csv") # Assuming merger for K-Fold
-    if not (config.SPLIT_CSV_DIR / "train_val_merged.csv").exists():
+    merged_path = config.SPLIT_CSV_DIR / "train_val_merged.csv"
+    if merged_path.exists():
+        full_df = pd.read_csv(merged_path)
+    else:
         tr = pd.read_csv(config.SPLIT_CSV_DIR / "train.csv")
         vl = pd.read_csv(config.SPLIT_CSV_DIR / "val.csv")
         full_df = pd.concat([tr, vl]).reset_index(drop=True)
