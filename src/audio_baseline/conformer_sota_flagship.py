@@ -100,7 +100,8 @@ class FlagshipEgyptianDataset(Dataset):
         row = self.df.iloc[idx]
         bn = Path(str(row["audio_relpath"]).replace("\\", "/")).name
         path = self.audio_map.get(bn); audio, _ = librosa.load(path, sr=16000, mono=True)
-        inputs = self.feature_extractor(audio, sampling_rate=16000, max_length=self.max_len, 
+        # Fix: max_length here refers to spectral FRAMES (e.g. 512), not raw samples.
+        inputs = self.feature_extractor(audio, sampling_rate=16000, max_length=512, 
                                        truncation=True, padding="max_length", return_tensors="pt")
         return {
             "input_features": inputs.input_features.squeeze(0),
