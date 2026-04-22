@@ -113,6 +113,11 @@ def main():
     if not (csv_dir / "train.csv").exists():
         print(f"[FATAL] Could not find train.csv in {csv_dir}")
         return
+
+    print(f"[INIT] Reading CSVs from {csv_dir}...")
+    tr_df = pd.read_csv(csv_dir / "train.csv")
+    va_df = pd.read_csv(csv_dir / "val.csv")
+    te_df = pd.read_csv(csv_dir / "test.csv")
     
     classes = sorted(tr_df["emotion_final"].unique())
     lid = {l: i for i, l in enumerate(classes)}
