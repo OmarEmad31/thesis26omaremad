@@ -126,11 +126,25 @@ def main():
             if not csv_dir: csv_dir = Path("/content")
 
         # 2. Search for Audio Dir (Handles nested zip extractions)
-        print("[DEBUG] Locating audio dataset directory...")
-        audio_dir = "/content"
-        for root, dirs, files in os.walk('/content'):
-            if any(f.endswith('.wav') for f in files):
-                audio_dir = root; break
+        print("[DEBUG] Locating audio dataset directory root...")
+        if os.path.exists("/content/dataset"):
+            audio_dir = "/content/dataset"
+        elif os.path.exists("/content/Thesis Project/dataset"):
+            audio_dir = "/content/Thesis Project/dataset"
+        else:
+            audio_dir = "/content"
+            for item in os.listdir('/content'):
+                item_path = os.path.join('/content', item)
+                if os.path.isdir(item_path) and item != 'drive' and item != 'sample_data':
+                    # If this top-level folder contains any WAVs, it is our root
+                    contains_wavs = False
+                    for root, dirs, files in os.walk(item_path):
+                        if any(f.endswith('.wav') for f in files):
+                            contains_wavs = True; break
+                    if contains_wavs:
+                        audio_dir = item_path
+                        print(f"[DEBUG] Found dataset root at: {audio_dir}")
+                        break
     else:
         csv_dir = Path("D:/Thesis Project/data/processed/splits/audio_eligible")
         audio_dir = "D:/Thesis Project/dataset"
