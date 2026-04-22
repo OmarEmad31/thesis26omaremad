@@ -87,17 +87,32 @@ class TitanDataset(Dataset):
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Automatic path resolution
+    
+    # --- AUTOMATIC PATH RESOLUTION ---
     if IS_COLAB:
-        csv_dir = Path("/content")
+        # Check standard location first
+        default_csv = Path("/content/drive/MyDrive/Thesis Project/data/processed/splits/text_hc")
+        if (default_csv / "train.csv").exists():
+            csv_dir = default_csv
+        else:
+            print("[DEBUG] Searching Drive for train.csv...")
+            csv_dir = None
+            for root, dirs, files in os.walk('/content/drive/MyDrive'):
+                if "train.csv" in files and "text_hc" in root:
+                    csv_dir = Path(root)
+                    print(f"[DEBUG] Found CSVs at: {csv_dir}")
+                    break
+            if not csv_dir:
+                # Last resort: check /content/
+                csv_dir = Path("/content")
         audio_dir = "/content/dataset"
     else:
         csv_dir = Path("D:/Thesis Project/data/processed/splits/audio_eligible")
         audio_dir = "D:/Thesis Project/dataset"
 
-    tr_df = pd.read_csv(csv_dir / "train.csv")
-    va_df = pd.read_csv(csv_dir / "val.csv")
-    te_df = pd.read_csv(csv_dir / "test.csv")
+    if not (csv_dir / "train.csv").exists():
+        print(f"[FATAL] Could not find train.csv in {csv_dir}")
+        return
     
     classes = sorted(tr_df["emotion_final"].unique())
     lid = {l: i for i, l in enumerate(classes)}
