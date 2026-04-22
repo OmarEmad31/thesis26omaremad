@@ -71,26 +71,49 @@ class SupConLoss(nn.Module):
 
 class TitanDataset(Dataset):
     def __init__(self, df, audio_dir, augment=False):
-        self.df = df; self.audio_dir = Path(audio_dir); self.max_len = 240000 
+        self.df = df
+        self.audio_dir = Path(audio_dir)
+        self.max_len = 240000 
         self.aug = Compose([AddGaussianNoise(p=0.3), PitchShift(p=0.4), TimeStretch(p=0.2)]) if augment else None
+        
+        # --- NEW: CACHE ACTUAL PATHS ---
+        print(f"[INIT] Scanning {audio_dir} for audio files...")
+        self.path_map = {f.name: f for f in self.audio_dir.rglob("*.wav")}
+        print(f"[INIT] Found {len(self.path_map)} valid audio files.")
+
     def __len__(self): return len(self.df)
+
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        p = self.audio_dir / Path(row["audio_relpath"]).name
-        if not p.exists(): return self.__getitem__((idx + 1) % len(self.df))
-        wav, _ = librosa.load(p, sr=16000)
-        if self.aug: wav = self.aug(samples=wav, sample_rate=16000)
-        mask = np.zeros(self.max_len, dtype=np.float32)
-        if len(wav) > self.max_len: wav = wav[:self.max_len]; mask[:] = 1.0
-        else: mask[:len(wav)] = 1.0; wav = np.pad(wav, (0, self.max_len - len(wav)))
-        return {"wav": torch.tensor(wav), "mask": torch.tensor(mask), "label": torch.tensor(row["lid"])}
+        # Safe loop instead of recursion to prevent RecursionError
+        for _ in range(len(self.df)):
+            row = self.df.iloc[idx]
+            fname = Path(row["audio_relpath"]).name
+            
+            if fname in self.path_map:
+                p = self.path_map[fname]
+                try:
+                    wav, _ = librosa.load(p, sr=16000)
+                    if self.aug: wav = self.aug(samples=wav, sample_rate=16000)
+                    mask = np.zeros(self.max_len, dtype=np.float32)
+                    if len(wav) > self.max_len: 
+                        wav = wav[:self.max_len]; mask[:] = 1.0
+                    else: 
+                        mask[:len(wav)] = 1.0; wav = np.pad(wav, (0, self.max_len - len(wav)))
+                    return {"wav": torch.tensor(wav), "mask": torch.tensor(mask), "label": torch.tensor(row["lid"])}
+                except Exception as e:
+                    print(f"[WARN] Failed to load {p}: {e}")
+            
+            # If file missing or load failed, try next index
+            idx = (idx + 1) % len(self.df)
+            
+        raise FileNotFoundError(f"Could not find any valid audio files in {self.audio_dir}")
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # --- AUTOMATIC PATH RESOLUTION ---
     if IS_COLAB:
-        # Check standard location first
+        # 1. Search for CSVs
         default_csv = Path("/content/drive/MyDrive/Thesis Project/data/processed/splits/text_hc")
         if (default_csv / "train.csv").exists():
             csv_dir = default_csv
@@ -99,13 +122,15 @@ def main():
             csv_dir = None
             for root, dirs, files in os.walk('/content/drive/MyDrive'):
                 if "train.csv" in files and "text_hc" in root:
-                    csv_dir = Path(root)
-                    print(f"[DEBUG] Found CSVs at: {csv_dir}")
-                    break
-            if not csv_dir:
-                # Last resort: check /content/
-                csv_dir = Path("/content")
-        audio_dir = "/content/dataset"
+                    csv_dir = Path(root); break
+            if not csv_dir: csv_dir = Path("/content")
+
+        # 2. Search for Audio Dir (Handles nested zip extractions)
+        print("[DEBUG] Locating audio dataset directory...")
+        audio_dir = "/content"
+        for root, dirs, files in os.walk('/content'):
+            if any(f.endswith('.wav') for f in files):
+                audio_dir = root; break
     else:
         csv_dir = Path("D:/Thesis Project/data/processed/splits/audio_eligible")
         audio_dir = "D:/Thesis Project/dataset"
