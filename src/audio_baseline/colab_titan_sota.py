@@ -35,7 +35,7 @@ from torch.amp import GradScaler, autocast
 
 # --- STEP 3: TITAN ARCHITECTURE ---
 class TitanAudioSER(nn.Module):
-    def __init__(self, num_labels, model_name="microsoft/wavlm-large-robust"):
+    def __init__(self, num_labels, model_name="microsoft/wavlm-large"):
         super().__init__()
         self.wavlm = WavLMModel.from_pretrained(model_name, output_hidden_states=True)
         self.wavlm.gradient_checkpointing_enable() 
