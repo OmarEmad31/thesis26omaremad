@@ -12,8 +12,8 @@ IS_COLAB = 'google.colab' in sys.modules or os.path.exists('/content')
 
 if IS_COLAB:
     print("[INIT] Colab Detected. Installing SOTA dependencies...")
-    subprocess.run(["pip", "install", "-q", "transformers==4.48.3", "audiomentations", "librosa", "accelerate", "pyloudnorm"])
-    DRIVE_ZIP = "/content/drive/MyDrive/Thesis_Full_Audio.zip"
+    subprocess.run(["pip", "install", "-q", "transformers==4.48.3", "audiomentations", "librosa", "accelerate", "pyloudnorm", "peft"])
+    DRIVE_ZIP = "/content/drive/MyDrive/Thesis Project/Thesis_Audio_Full.zip"
     if os.path.exists(DRIVE_ZIP) and not os.path.exists("/content/dataset"):
         print(f"[INIT] Extracting {DRIVE_ZIP}...")
         import zipfile
@@ -34,10 +34,20 @@ from audiomentations import Compose, AddGaussianNoise, PitchShift, TimeStretch
 from torch.amp import GradScaler, autocast
 
 # --- STEP 3: TITAN ARCHITECTURE ---
+from peft import LoraConfig, get_peft_model
+
 class TitanAudioSER(nn.Module):
     def __init__(self, num_labels, model_name="microsoft/wavlm-large"):
         super().__init__()
-        self.wavlm = WavLMModel.from_pretrained(model_name, output_hidden_states=True)
+        base_model = WavLMModel.from_pretrained(model_name, output_hidden_states=True)
+        
+        # LoRA Configuration for SER
+        peft_config = LoraConfig(
+            r=16, lora_alpha=32,
+            target_modules=["query", "value"],
+            lora_dropout=0.05, bias="none"
+        )
+        self.wavlm = get_peft_model(base_model, peft_config)
         self.wavlm.gradient_checkpointing_enable() 
         self.layer_weights = nn.Parameter(torch.ones(25)) 
         self.classifier = nn.Sequential(
@@ -184,15 +194,22 @@ def main():
     best_acc = 0
     for ep in range(1, EPOCHS + 1):
         model.train(); t_loss = 0
+        optimizer.zero_grad()
         pbar = tqdm(tr_loader, desc=f"Epoch {ep}")
         for b in pbar:
             w, m, l = b["wav"].to(device), b["mask"].to(device), b["label"].to(device)
             with autocast('cuda'):
                 logits, z = model(w, m)
                 loss = ((1-ALPHA)*l_ce(logits, l) + ALPHA*l_sc(z, l)) / ACCUM
+            
             scaler.scale(loss).backward()
+            
             if (pbar.n + 1) % ACCUM == 0:
-                scaler.step(optimizer); scaler.update(); optimizer.zero_grad(); scheduler.step()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
+            
             t_loss += loss.item() * ACCUM
             pbar.set_postfix({"loss": f"{t_loss/(pbar.n+1):.4f}"})
         
