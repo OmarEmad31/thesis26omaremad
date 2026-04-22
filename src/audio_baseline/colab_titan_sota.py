@@ -44,7 +44,7 @@ class TitanAudioSER(nn.Module):
         # LoRA Configuration for SER
         peft_config = LoraConfig(
             r=16, lora_alpha=32,
-            target_modules=["query", "value"],
+            target_modules=["q_proj", "v_proj"],
             lora_dropout=0.05, bias="none"
         )
         self.wavlm = get_peft_model(base_model, peft_config)
