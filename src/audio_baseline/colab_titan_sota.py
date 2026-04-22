@@ -73,7 +73,7 @@ class TitanDataset(Dataset):
     def __init__(self, df, audio_dir, augment=False):
         self.df = df
         self.audio_dir = Path(audio_dir)
-        self.max_len = 240000 
+        self.max_len = 160000 
         self.aug = Compose([AddGaussianNoise(p=0.3), PitchShift(p=0.4), TimeStretch(p=0.2)]) if augment else None
         
         # --- NEW: CACHE ACTUAL PATHS ---
@@ -162,8 +162,8 @@ def main():
     lid = {l: i for i, l in enumerate(classes)}
     for df in [tr_df, va_df, te_df]: df["lid"] = df["emotion_final"].map(lid)
     
-    BATCH = 16 if IS_COLAB else 2
-    ACCUM = 1 if IS_COLAB else 8
+    BATCH = 2 if IS_COLAB else 2
+    ACCUM = 8 if IS_COLAB else 8
     EPOCHS = 15; ALPHA = 0.3
     
     loader_args = {"batch_size": BATCH, "num_workers": 2 if IS_COLAB else 0, "pin_memory": True}
