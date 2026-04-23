@@ -29,6 +29,7 @@ class ConformerStableTitan(nn.Module):
         base_model = WavLMModel.from_pretrained(model_name, output_hidden_states=True)
         peft_config = LoraConfig(r=32, lora_alpha=64, target_modules=["q_proj", "v_proj"], lora_dropout=0.1, bias="none")
         self.wavlm = get_peft_model(base_model, peft_config)
+        self.wavlm.gradient_checkpointing_enable() 
         
         # The Conformer Brain
         encoder_layer = nn.TransformerEncoderLayer(d_model=1024, nhead=8, dim_feedforward=2048, dropout=0.2, batch_first=True)
@@ -42,12 +43,8 @@ class ConformerStableTitan(nn.Module):
     def forward(self, wav, mask, prosody):
         wav = (wav - wav.mean(dim=-1, keepdim=True)) / (wav.std(dim=-1, keepdim=True) + 1e-6)
         outputs = self.wavlm(wav, attention_mask=mask)
-        # Sequence input for transformer
-        hidden = outputs.last_hidden_state # [B, T, 1024]
-        # Conformer attention
-        ctx = self.conformer(hidden) # [B, T, 1024]
-        
-        # Mean pooling over the transformer context
+        hidden = outputs.last_hidden_state 
+        ctx = self.conformer(hidden) 
         pooled = ctx.mean(dim=1)
         fused = torch.cat([pooled, prosody], dim=-1)
         return self.classifier(fused)
@@ -82,11 +79,15 @@ def train():
     device = "cuda"; colab_root = Path("/content/drive/MyDrive/Thesis Project")
     csv_p = colab_root / "data/processed/splits/text_hc"
     
-    # Fast path sync
     print("[INIT] Scanning audio...")
     path_map = {f.name: f for f in colab_root.rglob("*.wav")}
     if not path_map:
-        zpath = colab_root / "dataset.zip"
+        zname = "Thesis_Audio_Full.zip"
+        zpath = colab_root / zname
+        if not zpath.exists():
+            for f in colab_root.iterdir():
+                if f.suffix == ".zip": zpath = f; break
+        print(f"[INIT] Extracting {zpath.name} to /content/dataset...")
         with zipfile.ZipFile(zpath, 'r') as z: z.extractall("/content/dataset")
         path_map = {f.name: f for f in Path("/content/dataset").rglob("*.wav")}
     
@@ -99,18 +100,17 @@ def train():
     te_loader = DataLoader(OlympicDataset(te_df, path_map), batch_size=4)
     
     model = ConformerStableTitan(7).to(device)
-    # Slow & Steady Learning Rate
     opt = torch.optim.AdamW([
-        {"params": model.wavlm.parameters(), "lr": 2e-6},
-        {"params": model.conformer.parameters(), "lr": 5e-5},
+        {"params": model.wavlm.parameters(), "lr": 1e-6},
+        {"params": model.conformer.parameters(), "lr": 2e-5},
         {"params": model.classifier.parameters(), "lr": 1e-4}
     ], weight_decay=0.01)
     
     sch = get_cosine_schedule_with_warmup(opt, len(tr_loader)*2, len(tr_loader)*30)
     scaler = GradScaler(); crit = nn.CrossEntropyLoss(label_smoothing=0.1)
     
-    print(f"[START] CONFORMER STABLE RUN. Target: 57%.")
-    for ep in range(1, 31):
+    print(f"[START] CONFORMER STABLE TITAN. Sync verified.")
+    for ep in range(1, 41):
         model.train(); tr_loss = 0
         for b in tqdm(tr_loader, desc=f"Ep {ep}", leave=False):
             w, p, l = b["wav"].to(device), b["prosody"].to(device), b["label"].to(device)
@@ -119,7 +119,6 @@ def train():
             opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); sch.step()
             tr_loss += loss.item()
         
-        # Eval
         model.eval(); ps, ts = [], []
         with torch.no_grad():
             for b in va_loader:
@@ -127,7 +126,6 @@ def train():
                 ps.extend(torch.argmax(l, 1).cpu().numpy()); ts.extend(b["label"].numpy())
         acc = accuracy_score(ts, ps); f1 = f1_score(ts, ps, average="macro")
         
-        # Test Eval
         tps, tts = [], []
         with torch.no_grad():
             for b in te_loader:
