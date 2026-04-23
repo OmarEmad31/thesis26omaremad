@@ -71,12 +71,36 @@ class OlympicDataset(Dataset):
                     f0 = librosa.yin(yt, fmin=65, fmax=2093); rms = np.mean(librosa.feature.rms(y=yt))
                     prosody = np.array([rms, np.mean(librosa.feature.zero_crossing_rate(y=yt)), np.nanmean(f0)/500, np.nanstd(f0)/100], dtype=np.float32)
                     if self.aug: yt = self.aug_pipe(samples=yt, sample_rate=16000)
-                    return {"wav": torch.tensor(yt), "prosody": torch.tensor(prosody), "label": torch.tensor(row["lid"])}
+                    return {"wav": torch.tensor(yt), "prosody": torch.tensor(prosody), "label": torch.tensor(row["lid"]), "path": str(p)}
                 except: pass
             idx = (idx + 1) % len(self.df)
         raise FileNotFoundError("Audio sync failed")
 
-def evaluate(model, loader, device):
+def sliding_window_eval(model, df, audio_dir, device, chunk_size=48000, stride=24000):
+    model.eval(); path_map = {f.name: f for f in Path(audio_dir).rglob("*.wav")}
+    all_ps, all_ts = [], []
+    print("[RUN] Sliding Window Intelligence Pass...")
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="SWE"):
+        p = path_map.get(Path(row["audio_relpath"]).name)
+        if not p: continue
+        try:
+            wav, _ = librosa.load(p, sr=16000); yt, _ = librosa.effects.trim(wav, top_db=20)
+            yt = (yt - np.mean(yt)) / (np.std(yt) + 1e-6); logits_list = []
+            for start in range(0, max(1, len(yt)-chunk_size+1), stride):
+                seg = yt[start:start+chunk_size]
+                if len(seg) < chunk_size: seg = np.pad(seg, (0, chunk_size-len(seg)))
+                f0 = librosa.yin(seg, fmin=65, fmax=2093); rms = np.mean(librosa.feature.rms(y=seg))
+                p_vec = torch.tensor([rms, np.mean(librosa.feature.zero_crossing_rate(y=seg)), np.nanmean(f0)/500, np.nanstd(f0)/100], dtype=torch.float32).unsqueeze(0).to(device)
+                with torch.no_grad(), torch.cuda.amp.autocast():
+                    l, _ = model(torch.tensor(seg).unsqueeze(0).to(device), torch.ones(1, chunk_size).to(device), p_vec)
+                    logits_list.append(F.softmax(l, dim=1))
+            if logits_list:
+                final_logits = torch.mean(torch.stack(logits_list), dim=0)
+                all_ps.append(final_logits.argmax(1).item()); all_ts.append(row["lid"])
+        except: pass
+    return accuracy_score(all_ts, all_ps), f1_score(all_ts, all_ps, average="macro")
+
+def evaluate_fast(model, loader, device):
     model.eval(); ps, ts = [], []
     with torch.no_grad():
         for b in loader:
@@ -85,34 +109,36 @@ def evaluate(model, loader, device):
     return accuracy_score(ts, ps), f1_score(ts, ps, average="macro")
 
 def train_fold(fold, tr_df, va_df, audio_dir, device):
-    print(f"\n[FOLD {fold}] Starting Marathon..."); 
-    tr_loader = DataLoader(OlympicDataset(tr_df, audio_dir, True), batch_size=4, shuffle=True)
-    va_loader = DataLoader(OlympicDataset(va_df, audio_dir), batch_size=4)
+    print(f"\n[FOLD {fold}] Starting Marathon (v2)..."); 
+    tr_loader = DataLoader(OlympicDataset(tr_df, audio_dir, True), batch_size=4, shuffle=True, drop_last=True)
+    va_loader = DataLoader(OlympicDataset(va_df, audio_dir), batch_size=4, drop_last=False)
     model = OlympicTitan(7).to(device)
     swa_model = torch.optim.swa_utils.AveragedModel(model)
     opt = torch.optim.AdamW([{"params": model.wavlm.parameters(), "lr": 1e-5}, {"params": [p for n, p in model.named_parameters() if "wavlm" not in n], "lr": 5e-4}], weight_decay=0.01)
-    sch = get_cosine_schedule_with_warmup(opt, len(tr_loader), len(tr_loader)*15)
+    sch = get_cosine_schedule_with_warmup(opt, len(tr_loader), len(tr_loader)*25)
     l_ce = nn.CrossEntropyLoss(label_smoothing=0.1); l_sc = SupConLoss(); scaler = GradScaler()
     
     best_acc, best_f1 = 0, 0
-    for ep in range(1, 16):
+    for ep in range(1, 26):
         model.train()
-        pbar = tqdm(tr_loader, desc=f"Fold {fold} Ep {ep}")
-        for b in pbar:
+        for b in tqdm(tr_loader, desc=f"Fold {fold} Ep {ep}", leave=False):
             w, p, l = b["wav"].to(device), b["prosody"].to(device), b["label"].to(device)
             with torch.cuda.amp.autocast():
-                logits, z = model(w, torch.ones_like(w).to(device), p)
-                loss = (0.7*l_ce(logits, l) + 0.3*l_sc(z, l)) 
+                logits, z = model(w, torch.ones_like(w).to(device), p); loss = (0.7*l_ce(logits, l) + 0.3*l_sc(z, l))
             scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); opt.zero_grad(); sch.step()
         
-        if ep >= 10: swa_model.update_parameters(model)
-        acc, f1 = evaluate(model, va_loader, device)
-        print(f"Fold {fold} Ep {ep} | Acc: {acc:.3f} | F1: {f1:.3f}")
-        if acc > best_acc: 
-            best_acc, best_f1 = acc, f1
-            torch.save(model.state_dict(), f"fold_{fold}_best.pt")
+        if ep >= 12: swa_model.update_parameters(model)
+        acc, f1 = evaluate_fast(model, va_loader, device)
+        if acc > best_acc: best_acc, best_f1 = acc, f1; torch.save(model.state_dict(), f"fold_{fold}_best.pt")
+        if ep % 5 == 0: print(f"Fold {fold} Ep {ep} | Fast Acc: {acc:.3f}")
     
-    return {"acc": best_acc, "f1": best_f1}
+    # FINAL INTELLIGENT EVAL
+    print(f"[FOLD {fold}] Phase 1 Complete. Triggering Sliding Window Evaluation...")
+    torch.optim.swa_utils.update_bn(tr_loader, swa_model, device=device)
+    sw_acc, sw_f1 = sliding_window_eval(swa_model, va_df, audio_dir, device)
+    print(f"[RESULT] Fold {fold} Final (SWE): Acc {sw_acc:.3f} | F1 {sw_f1:.3f}")
+    torch.save(swa_model.state_dict(), f"fold_{fold}_swa.pt")
+    return {"acc": sw_acc, "f1": sw_f1}
 
 def main():
     device = "cuda"; 
@@ -124,28 +150,21 @@ def main():
     else:
         csv_p = Path("D:/Thesis Project/data/processed/splits/text_hc")
         audio_dir = Path("D:/Thesis Project/dataset")
-        print(f"[ENV] Local Active. Data Root: {csv_p.parent}")
+        print(f"[ENV] Local Active.")
 
-    if not csv_p.exists(): raise FileNotFoundError(f"Missing CSV splits at {csv_p}")
-    
     dfs = [pd.read_csv(csv_p/f) for f in ["train.csv", "val.csv", "test.csv"]]
     full_df = pd.concat(dfs); lid = {l: i for i, l in enumerate(sorted(full_df["emotion_final"].unique()))}
-    full_df["lid"] = full_df["emotion_final"].map(lid); skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    for df in [full_df]: df["lid"] = df["emotion_final"].map(lid)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     
     results = []
-    print(f"[START] OLYMPIC ENSEMBLE PRODUCTION. 5-Fold Marathon Active.")
     for fold, (t_idx, v_idx) in enumerate(skf.split(full_df, full_df["lid"])):
         out = train_fold(fold+1, full_df.iloc[t_idx], full_df.iloc[v_idx], audio_dir, device)
         results.append(out)
     
     df_res = pd.DataFrame(results)
-    print("\n" + "="*40)
-    print("      GRAND OLYMPIC SUMMARY      ")
-    print("="*40)
-    for i, r in enumerate(results): print(f"Fold {i+1}: Accuracy {r['acc']:.3f} | F1 {r['f1']:.3f}")
-    print("-" * 40)
-    print(f"MEAN:  Accuracy {df_res['acc'].mean():.4f} | F1 {df_res['f1'].mean():.4f}")
-    print(f"STD:   Accuracy {df_res['acc'].std():.4f} | F1 {df_res['f1'].std():.4f}")
-    print("="*40)
+    print("\n" + "="*40 + "\n      GRAND OLYMPIC SUMMARY      \n" + "="*40)
+    for i, r in enumerate(results): print(f"Fold {i+1}: Acc {r['acc']:.3f} | F1 {r['f1']:.3f}")
+    print(f"-"*40 + f"\nMEAN: Acc {df_res['acc'].mean():.4f} | F1 {df_res['f1'].mean():.4f}\n" + "="*40)
 
 if __name__ == "__main__": main()
