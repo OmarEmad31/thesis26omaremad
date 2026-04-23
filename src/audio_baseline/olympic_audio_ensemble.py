@@ -56,35 +56,40 @@ class OlympicDataset(Dataset):
     def __len__(self): return len(self.df)
 
     def __getitem__(self, idx):
-        for _ in range(len(self.df)):
-            row = self.df.iloc[idx]; fname = Path(row["audio_relpath"]).name
-            if fname in self.path_map:
-                try:
-                    p = self.path_map[fname]
-                    wav, _ = librosa.load(p, sr=16000)
-                    yt, _ = librosa.effects.trim(wav, top_db=20)
-                    yt = (yt - np.mean(yt)) / (np.std(yt) + 1e-6)
-                    if len(yt) > self.max_len:
-                        start = random.randint(0, len(yt)-self.max_len) if self.aug else 0
-                        yt = yt[start:start+self.max_len]
-                    else: yt = np.pad(yt, (0, self.max_len - len(yt)))
-                    f0 = librosa.yin(yt, fmin=65, fmax=2093); rms = np.mean(librosa.feature.rms(y=yt))
-                    prosody = np.array([rms, np.mean(librosa.feature.zero_crossing_rate(y=yt)), np.nanmean(f0)/500, np.nanstd(f0)/100], dtype=np.float32)
-                    if self.aug: yt = self.aug_pipe(samples=yt, sample_rate=16000)
-                    return {"wav": torch.tensor(yt), "prosody": torch.tensor(prosody), "label": torch.tensor(row["lid"]), "path": str(p)}
-                except: pass
-            idx = (idx + 1) % len(self.df)
-        raise FileNotFoundError("Audio sync failed")
+        row = self.df.iloc[idx]; fname = Path(row["audio_relpath"]).name
+        if fname in self.path_map:
+            try:
+                p = self.path_map[fname]
+                wav, _ = librosa.load(p, sr=16000)
+                yt, _ = librosa.effects.trim(wav, top_db=20)
+                yt = (yt - np.mean(yt)) / (np.std(yt) + 1e-6)
+                if len(yt) > self.max_len:
+                    start = random.randint(0, len(yt)-self.max_len) if self.aug else 0
+                    yt = yt[start:start+self.max_len]
+                else: yt = np.pad(yt, (0, self.max_len - len(yt)))
+                f0 = librosa.yin(yt, fmin=65, fmax=2093); rms = np.mean(librosa.feature.rms(y=yt))
+                prosody = np.array([rms, np.mean(librosa.feature.zero_crossing_rate(y=yt)), np.nanmean(f0)/500, np.nanstd(f0)/100], dtype=np.float32)
+                if self.aug: yt = self.aug_pipe(samples=yt, sample_rate=16000)
+                return {"wav": torch.tensor(yt), "prosody": torch.tensor(prosody), "label": torch.tensor(row["lid"])}
+            except: pass
+        return self.__getitem__((idx + 1) % len(self.df))
+
+def evaluate_fast(model, loader, device):
+    model.eval(); ps, ts = [], []
+    with torch.no_grad():
+        for b in loader:
+            l, _ = model(b["wav"].to(device), torch.ones_like(b["wav"]).to(device), b["prosody"].to(device))
+            ps.extend(torch.argmax(l, 1).cpu().numpy()); ts.extend(b["label"].numpy())
+    return accuracy_score(ts, ps), f1_score(ts, ps, average="macro")
 
 def sliding_window_eval(model, df, audio_dir, device, chunk_size=48000, stride=24000):
     model.eval(); path_map = {f.name: f for f in Path(audio_dir).rglob("*.wav")}
     all_ps, all_ts = [], []
-    print("[RUN] Sliding Window Intelligence Pass...")
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="SWE"):
-        p = path_map.get(Path(row["audio_relpath"]).name)
-        if not p: continue
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="SWE", leave=False):
+        fname = Path(row["audio_relpath"]).name
+        if fname not in path_map: continue
         try:
-            wav, _ = librosa.load(p, sr=16000); yt, _ = librosa.effects.trim(wav, top_db=20)
+            wav, _ = librosa.load(path_map[fname], sr=16000); yt, _ = librosa.effects.trim(wav, top_db=20)
             yt = (yt - np.mean(yt)) / (np.std(yt) + 1e-6); logits_list = []
             for start in range(0, max(1, len(yt)-chunk_size+1), stride):
                 seg = yt[start:start+chunk_size]
@@ -100,18 +105,10 @@ def sliding_window_eval(model, df, audio_dir, device, chunk_size=48000, stride=2
         except: pass
     return accuracy_score(all_ts, all_ps), f1_score(all_ts, all_ps, average="macro")
 
-def evaluate_fast(model, loader, device):
-    model.eval(); ps, ts = [], []
-    with torch.no_grad():
-        for b in loader:
-            l, _ = model(b["wav"].to(device), torch.ones_like(b["wav"]).to(device), b["prosody"].to(device))
-            ps.extend(torch.argmax(l, 1).cpu().numpy()); ts.extend(b["label"].numpy())
-    return accuracy_score(ts, ps), f1_score(ts, ps, average="macro")
-
 def train_fold(fold, tr_df, va_df, audio_dir, device):
-    print(f"\n[FOLD {fold}] Starting Marathon (v2)..."); 
+    print(f"\n[FOLD {fold}] Monitoring Active..."); 
     tr_loader = DataLoader(OlympicDataset(tr_df, audio_dir, True), batch_size=4, shuffle=True, drop_last=True)
-    va_loader = DataLoader(OlympicDataset(va_df, audio_dir), batch_size=4, drop_last=False)
+    va_loader = DataLoader(OlympicDataset(va_df, audio_dir), batch_size=4)
     model = OlympicTitan(7).to(device)
     swa_model = torch.optim.swa_utils.AveragedModel(model)
     opt = torch.optim.AdamW([{"params": model.wavlm.parameters(), "lr": 1e-5}, {"params": [p for n, p in model.named_parameters() if "wavlm" not in n], "lr": 5e-4}], weight_decay=0.01)
@@ -122,27 +119,24 @@ def train_fold(fold, tr_df, va_df, audio_dir, device):
     for ep in range(1, 26):
         model.train()
         for b in tqdm(tr_loader, desc=f"Fold {fold} Ep {ep}", leave=False):
-            w, p, l = b["wav"].to(device), b["prosody"].to(device), b["label"].to(device)
+            w, l = b["wav"].to(device), b["label"].to(device); p = b["prosody"].to(device)
             with torch.cuda.amp.autocast():
                 logits, z = model(w, torch.ones_like(w).to(device), p); loss = (0.7*l_ce(logits, l) + 0.3*l_sc(z, l))
-            scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); opt.zero_grad(); sch.step()
+            opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); sch.step()
         
         if ep >= 12: swa_model.update_parameters(model)
         acc, f1 = evaluate_fast(model, va_loader, device)
-        if acc > best_acc: best_acc, best_f1 = acc, f1; torch.save(model.state_dict(), f"fold_{fold}_best.pt")
-        if ep % 5 == 0: print(f"Fold {fold} Ep {ep} | Fast Acc: {acc:.3f}")
+        print(f"Fold {fold} Ep {ep} | Acc: {acc:.3f} | F1: {f1:.3f}")
+        if acc > best_acc: best_acc, best_f1 = acc, f1
     
-    # FINAL INTELLIGENT EVAL
-    print(f"[FOLD {fold}] Phase 1 Complete. Triggering Sliding Window Evaluation...")
+    print(f"[FOLD {fold}] Calculating Final SWE Result...")
     torch.optim.swa_utils.update_bn(tr_loader, swa_model, device=device)
-    sw_acc, sw_f1 = sliding_window_eval(swa_model, va_df, audio_dir, device)
-    print(f"[RESULT] Fold {fold} Final (SWE): Acc {sw_acc:.3f} | F1 {sw_f1:.3f}")
-    torch.save(swa_model.state_dict(), f"fold_{fold}_swa.pt")
-    return {"acc": sw_acc, "f1": sw_f1}
+    swe_acc, swe_f1 = sliding_window_eval(swa_model, va_df, audio_dir, device)
+    print(f"[RESULT] Fold {fold} Final SWE: Acc {swe_acc:.3f} | F1 {swe_f1:.3f}")
+    return {"acc": swe_acc, "f1": swe_f1}
 
 def main():
-    device = "cuda"; 
-    colab_root = Path("/content/drive/MyDrive/Thesis Project")
+    device = "cuda"; colab_root = Path("/content/drive/MyDrive/Thesis Project")
     if colab_root.exists():
         csv_p = colab_root / "data/processed/splits/text_hc"
         audio_dir = "/content/dataset" if os.path.exists("/content/dataset") else "/content"
@@ -154,13 +148,11 @@ def main():
 
     dfs = [pd.read_csv(csv_p/f) for f in ["train.csv", "val.csv", "test.csv"]]
     full_df = pd.concat(dfs); lid = {l: i for i, l in enumerate(sorted(full_df["emotion_final"].unique()))}
-    for df in [full_df]: df["lid"] = df["emotion_final"].map(lid)
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    full_df["lid"] = full_df["emotion_final"].map(lid); skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     
     results = []
     for fold, (t_idx, v_idx) in enumerate(skf.split(full_df, full_df["lid"])):
-        out = train_fold(fold+1, full_df.iloc[t_idx], full_df.iloc[v_idx], audio_dir, device)
-        results.append(out)
+        out = train_fold(fold+1, full_df.iloc[t_idx], full_df.iloc[v_idx], audio_dir, device); results.append(out)
     
     df_res = pd.DataFrame(results)
     print("\n" + "="*40 + "\n      GRAND OLYMPIC SUMMARY      \n" + "="*40)
