@@ -100,9 +100,9 @@ def train_fold(fold, tr_df, va_df, audio_dir, device):
         pbar = tqdm(tr_loader, desc=f"Fold {fold} Ep {ep}")
         for b in pbar:
             w, p, l = b["wav"].to(device), b["prosody"].to(device), b["label"].to(device)
-            with autocast("cuda"):
+            with torch.cuda.amp.autocast():
                 logits, z = model(w, torch.ones_like(w).to(device), p)
-                loss = (0.7*l_ce(logits, l) + 0.3*l_sc(z, l)) / 1 # No accumulation needed for 3s
+                loss = (0.7*l_ce(logits, l) + 0.3*l_sc(z, l)) 
             scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); opt.zero_grad(); sch.step()
         
         if ep >= 10: swa_model.update_parameters(model)
@@ -116,28 +116,24 @@ def train_fold(fold, tr_df, va_df, audio_dir, device):
 
 def main():
     device = "cuda"; 
-    # Robust Path Detection
     colab_root = Path("/content/drive/MyDrive/Thesis Project")
     if colab_root.exists():
         csv_p = colab_root / "data/processed/splits/text_hc"
         audio_dir = "/content/dataset" if os.path.exists("/content/dataset") else "/content"
-        checkpoint_dir = colab_root / "checkpoints"
         print(f"[ENV] Colab Active. Data Root: {colab_root}")
     else:
         csv_p = Path("D:/Thesis Project/data/processed/splits/text_hc")
         audio_dir = Path("D:/Thesis Project/dataset")
-        checkpoint_dir = Path("D:/Thesis Project/checkpoints")
         print(f"[ENV] Local Active. Data Root: {csv_p.parent}")
 
     if not csv_p.exists(): raise FileNotFoundError(f"Missing CSV splits at {csv_p}")
-    os.makedirs(checkpoint_dir, exist_ok=True)
     
     dfs = [pd.read_csv(csv_p/f) for f in ["train.csv", "val.csv", "test.csv"]]
     full_df = pd.concat(dfs); lid = {l: i for i, l in enumerate(sorted(full_df["emotion_final"].unique()))}
     full_df["lid"] = full_df["emotion_final"].map(lid); skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     
     results = []
-    print(f"[START] OLYMPIC ENSEMBLE PRODUCTION. F1-Aware Scaling Active.")
+    print(f"[START] OLYMPIC ENSEMBLE PRODUCTION. 5-Fold Marathon Active.")
     for fold, (t_idx, v_idx) in enumerate(skf.split(full_df, full_df["lid"])):
         out = train_fold(fold+1, full_df.iloc[t_idx], full_df.iloc[v_idx], audio_dir, device)
         results.append(out)
