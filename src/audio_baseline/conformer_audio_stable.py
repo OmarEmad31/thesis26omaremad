@@ -83,11 +83,17 @@ def train():
     path_map = {f.name: f for f in colab_root.rglob("*.wav")}
     if not path_map:
         zname = "Thesis_Audio_Full.zip"
-        zpath = colab_root / zname
-        if not zpath.exists():
-            for f in colab_root.iterdir():
-                if f.suffix == ".zip": zpath = f; break
-        print(f"[INIT] Extracting {zpath.name} to /content/dataset...")
+        zpath = None
+        print(f"[INIT] Audio missing. Ultra-scanning /content/drive/MyDrive for {zname}...")
+        for root, _, files in os.walk("/content/drive/MyDrive"):
+            if zname in files:
+                zpath = os.path.join(root, zname)
+                break
+        
+        if not zpath:
+            raise FileNotFoundError(f"Fatal: Could not find {zname} anywhere on Drive.")
+            
+        print(f"[INIT] Found it at {zpath}. Extracting to /content/dataset...")
         with zipfile.ZipFile(zpath, 'r') as z: z.extractall("/content/dataset")
         path_map = {f.name: f for f in Path("/content/dataset").rglob("*.wav")}
     
@@ -109,8 +115,8 @@ def train():
     sch = get_cosine_schedule_with_warmup(opt, len(tr_loader)*2, len(tr_loader)*30)
     scaler = GradScaler(); crit = nn.CrossEntropyLoss(label_smoothing=0.1)
     
-    print(f"[START] CONFORMER STABLE TITAN. Sync verified.")
-    for ep in range(1, 41):
+    print(f"[START] CONFORMER STABLE TITAN. Ultra Search Success.")
+    for ep in range(1, 31):
         model.train(); tr_loss = 0
         for b in tqdm(tr_loader, desc=f"Ep {ep}", leave=False):
             w, p, l = b["wav"].to(device), b["prosody"].to(device), b["label"].to(device)
@@ -134,6 +140,6 @@ def train():
         tacc = accuracy_score(tts, tps)
         
         print(f"Ep {ep} | Loss: {tr_loss/len(tr_loader):.3f} | Val Acc: {acc:.3f} | Test Acc: {tacc:.3f} | F1: {f1:.3f}")
-        if acc > 0.55: torch.save(model.state_dict(), f"stable_titan_ep{ep}.pt")
+        if acc > 0.55: torch.save(model.state_dict(), f"conformer_titan_ep{ep}.pt")
 
 if __name__ == "__main__": train()
