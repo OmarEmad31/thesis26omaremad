@@ -1,16 +1,17 @@
 """
-ConformerTitan v3 — Full Production SER Script
--------------------------------------------------
-Key upgrades over previous versions:
-  1. Bug fix: no gradient_checkpointing (was silently killing gradients)
-  2. Sinusoidal positional encoding for Conformer
-  3. Richer prosodic features: 13 MFCC means + F0 mean/std + voiced fraction (16 dims)
-  4. SpecAugment: time masking on raw waveform during training
-  5. 2-phase curriculum: freeze WavLM (8 ep) → unfreeze LoRA (22 ep)
-  6. SWA from phase-2 epoch 10 onward
-  7. Sliding window inference over full audio at evaluation time
-  8. Gradient clipping + modern AMP syntax
-  9. Auto-unzip + file count diagnostic
+ConformerTitan v4 — End-to-End Training (No Freeze)
+------------------------------------------------------
+Lesson learned: freezing WavLM in Phase 1 starves the Conformer of
+emotion-specific features. LoRA must be active from epoch 1.
+
+Strategy:
+  - LoRA active from epoch 1 with very low backbone LR (2e-6)
+  - Conformer + classifier train faster (5e-5 / 2e-4)
+  - No class weights early on (destabilizes training)
+  - Sqrt-class weights applied after epoch 10 via LR scheduler swap
+  - SWA from epoch 20 onward
+  - Sliding window inference at final evaluation
+  - All v3 preprocessing upgrades kept (16-dim prosody, SpecAugment)
 """
 import os, sys, subprocess, zipfile, math
 
@@ -28,7 +29,7 @@ if "google.colab" in sys.modules or os.path.exists("/content"):
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
-from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.optim.swa_utils import AveragedModel
 import pandas as pd, numpy as np, librosa, random
 from pathlib import Path
 from tqdm import tqdm
@@ -37,22 +38,14 @@ from transformers import WavLMModel, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model
 from audiomentations import Compose, AddGaussianNoise, PitchShift, TimeStretch
 
-# ──────────────────────────────────────────────
-# CONFIG
-# ──────────────────────────────────────────────
 SR          = 16000
-MAX_LEN     = 48000          # 3 s training window (memory-safe for WavLM-Large)
-PROSODY_DIM = 16             # 13 MFCC + F0 mean/std + voiced fraction
+MAX_LEN     = 48000      # 3-second window
+PROSODY_DIM = 16         # 13 MFCC means + F0 mean/std + voiced fraction
 BATCH_SIZE  = 6
-NUM_LABELS  = 7
-PHASE1_EPS  = 8              # WavLM frozen, Conformer head warm-up
-PHASE2_EPS  = 22             # LoRA unfrozen, full fine-tune
-SWA_START   = 12             # Start SWA in phase 2 after this many epochs
+NUM_EPOCHS  = 30
+SWA_START   = 20         # Start SWA after epoch 20
 
 
-# ──────────────────────────────────────────────
-# POSITIONAL ENCODING
-# ──────────────────────────────────────────────
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model=1024, max_len=512, dropout=0.1):
         super().__init__()
@@ -68,22 +61,20 @@ class PositionalEncoding(nn.Module):
         return self.drop(x + self.pe[:, :x.size(1)])
 
 
-# ──────────────────────────────────────────────
-# MODEL
-# ──────────────────────────────────────────────
 class ConformerTitan(nn.Module):
-    def __init__(self, num_labels=NUM_LABELS, model_name="microsoft/wavlm-large"):
+    def __init__(self, num_labels, model_name="microsoft/wavlm-large"):
         super().__init__()
         base = WavLMModel.from_pretrained(model_name)
-        cfg  = LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"],
+        cfg  = LoraConfig(r=16, lora_alpha=32,
+                          target_modules=["q_proj", "v_proj"],
                           lora_dropout=0.05, bias="none")
         self.wavlm = get_peft_model(base, cfg)
         # NO gradient_checkpointing — incompatible with PEFT+Conformer
 
         self.pos_enc  = PositionalEncoding(1024, max_len=512, dropout=0.1)
-        enc_layer = nn.TransformerEncoderLayer(d_model=1024, nhead=8,
-                                               dim_feedforward=2048, dropout=0.1,
-                                               batch_first=True, norm_first=True)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=1024, nhead=8, dim_feedforward=2048,
+            dropout=0.1, batch_first=True, norm_first=True)
         self.conformer = nn.TransformerEncoder(enc_layer, num_layers=4)
 
         self.classifier = nn.Sequential(
@@ -92,60 +83,34 @@ class ConformerTitan(nn.Module):
             nn.Linear(512, num_labels)
         )
 
-    def freeze_wavlm(self):
-        for p in self.wavlm.base_model.parameters():
-            p.requires_grad = False
-
-    def unfreeze_lora(self):
-        for n, p in self.wavlm.named_parameters():
-            if "lora_" in n:
-                p.requires_grad = True
-
     def forward(self, wav, prosody):
-        # Normalize waveform
         wav = (wav - wav.mean(-1, keepdim=True)) / (wav.std(-1, keepdim=True) + 1e-6)
-        attn_mask = torch.ones(wav.shape[:2], device=wav.device)
-        hidden = self.wavlm(wav, attention_mask=attn_mask).last_hidden_state  # [B,T,1024]
+        mask   = torch.ones(wav.shape[:2], device=wav.device)
+        hidden = self.wavlm(wav, attention_mask=mask).last_hidden_state
         hidden = self.pos_enc(hidden)
-        ctx    = self.conformer(hidden)                                         # [B,T,1024]
-        pooled = ctx.mean(1)                                                    # [B,1024]
+        ctx    = self.conformer(hidden)
+        pooled = ctx.mean(1)
         return self.classifier(torch.cat([pooled, prosody], dim=-1))
 
 
-# ──────────────────────────────────────────────
-# PROSODIC FEATURE EXTRACTION  (16-dim)
-# ──────────────────────────────────────────────
-def extract_prosody(y: np.ndarray, sr: int = SR) -> np.ndarray:
-    """Returns a 16-dim vector: 13 MFCC means + F0 mean/std + voiced fraction."""
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-    mfcc_mean = mfcc.mean(axis=1) / 100.0          # rough normalization
-
-    f0 = librosa.yin(y, fmin=65, fmax=2093)
-    voiced = f0[f0 > 0]
-    f0_mean    = float(np.mean(voiced)) / 500.0  if len(voiced) else 0.0
-    f0_std     = float(np.std(voiced))  / 100.0  if len(voiced) else 0.0
-    voiced_frac = len(voiced) / max(len(f0), 1)
-
-    return np.array([*mfcc_mean, f0_mean, f0_std, voiced_frac], dtype=np.float32)
+def extract_prosody(y: np.ndarray) -> np.ndarray:
+    mfcc     = librosa.feature.mfcc(y=y, sr=SR, n_mfcc=13).mean(axis=1) / 100.0
+    f0       = librosa.yin(y, fmin=65, fmax=2093)
+    voiced   = f0[f0 > 0]
+    f0_mean  = float(np.mean(voiced)) / 500.0 if len(voiced) else 0.0
+    f0_std   = float(np.std(voiced))  / 100.0 if len(voiced) else 0.0
+    v_frac   = len(voiced) / max(len(f0), 1)
+    return np.array([*mfcc, f0_mean, f0_std, v_frac], dtype=np.float32)
 
 
-# ──────────────────────────────────────────────
-# SPECAUGMENT (time masking on raw waveform)
-# ──────────────────────────────────────────────
 def time_mask(wav: np.ndarray, max_pct: float = 0.15) -> np.ndarray:
-    T     = len(wav)
-    width = int(T * max_pct * random.random())
-    if width == 0:
-        return wav
+    T = len(wav); width = int(T * max_pct * random.random())
+    if width == 0: return wav
     start = random.randint(0, T - width)
-    wav   = wav.copy()
-    wav[start:start + width] = 0.0
+    wav = wav.copy(); wav[start:start + width] = 0.0
     return wav
 
 
-# ──────────────────────────────────────────────
-# DATASET
-# ──────────────────────────────────────────────
 class AudioDataset(Dataset):
     def __init__(self, df, path_map, augment=False):
         self.df       = df.reset_index(drop=True)
@@ -162,24 +127,18 @@ class AudioDataset(Dataset):
     def _load(self, idx):
         row   = self.df.iloc[idx]
         fname = Path(row["audio_relpath"]).name
-        if fname not in self.path_map:
-            return None
+        if fname not in self.path_map: return None
         try:
             wav, _ = librosa.load(self.path_map[fname], sr=SR)
             yt, _  = librosa.effects.trim(wav, top_db=25)
-
-            # 3-second window
             if len(yt) > MAX_LEN:
                 start = random.randint(0, len(yt) - MAX_LEN) if self.augment else 0
-                yt    = yt[start:start + MAX_LEN]
+                yt = yt[start:start + MAX_LEN]
             else:
                 yt = np.pad(yt, (0, MAX_LEN - len(yt)))
-
-            # SpecAugment (train only)
             if self.augment:
-                yt = time_mask(yt, max_pct=0.15)
+                yt = time_mask(yt)
                 yt = self.aug_pipe(samples=yt, sample_rate=SR)
-
             prosody = extract_prosody(yt)
             return {
                 "wav":     torch.tensor(yt, dtype=torch.float32),
@@ -191,50 +150,24 @@ class AudioDataset(Dataset):
 
     def __getitem__(self, idx):
         for _ in range(len(self.df)):
-            sample = self._load(idx)
-            if sample is not None:
-                return sample
+            s = self._load(idx)
+            if s is not None: return s
             idx = (idx + 1) % len(self.df)
         raise FileNotFoundError("Could not load any audio.")
 
 
-# ──────────────────────────────────────────────
-# SLIDING WINDOW INFERENCE
-# ──────────────────────────────────────────────
-def sliding_window_infer(model, df, path_map, device,
-                          chunk=MAX_LEN, stride=16000):
-    """Evaluate by averaging logits over sliding 3-s windows of each full file."""
-    model.eval()
-    preds, truths = [], []
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="SWE", leave=False):
-        fname = Path(row["audio_relpath"]).name
-        if fname not in path_map:
-            continue
-        try:
-            wav, _ = librosa.load(path_map[fname], sr=SR)
-            yt, _  = librosa.effects.trim(wav, top_db=25)
-            logits_list = []
-            for start in range(0, max(1, len(yt) - chunk + 1), stride):
-                seg = yt[start:start + chunk]
-                if len(seg) < chunk:
-                    seg = np.pad(seg, (0, chunk - len(seg)))
-                prosody = extract_prosody(seg)
-                w_t  = torch.tensor(seg).unsqueeze(0).to(device)
-                p_t  = torch.tensor(prosody).unsqueeze(0).to(device)
-                with torch.no_grad(), autocast("cuda"):
-                    logits_list.append(model(w_t, p_t))
-            if logits_list:
-                avg = torch.stack(logits_list).mean(0)
-                preds.append(avg.argmax(1).item())
-                truths.append(int(row["lid"]))
-        except Exception:
-            pass
-    return accuracy_score(truths, preds), f1_score(truths, preds, average="macro")
+def get_path_map(colab_root):
+    pm = {f.name: str(f) for f in colab_root.rglob("*.wav")}
+    if pm: return pm
+    zname = "Thesis_Audio_Full.zip"; zpath = None
+    for root, _, files in os.walk("/content/drive/MyDrive"):
+        if zname in files: zpath = os.path.join(root, zname); break
+    if not zpath: raise FileNotFoundError(f"{zname} not found on Drive.")
+    print(f"[INIT] Extracting {zname}...")
+    with zipfile.ZipFile(zpath) as z: z.extractall("/content/dataset")
+    return {f.name: str(f) for f in Path("/content/dataset").rglob("*.wav")}
 
 
-# ──────────────────────────────────────────────
-# FAST EVAL (single crop, used during training)
-# ──────────────────────────────────────────────
 def fast_eval(model, loader, device):
     model.eval(); ps, ts = [], []
     with torch.no_grad():
@@ -246,37 +179,36 @@ def fast_eval(model, loader, device):
     return accuracy_score(ts, ps), f1_score(ts, ps, average="macro")
 
 
-# ──────────────────────────────────────────────
-# DATA SETUP
-# ──────────────────────────────────────────────
-def get_path_map(colab_root):
-    pm = {f.name: str(f) for f in colab_root.rglob("*.wav")}
-    if pm:
-        return pm
-    zname = "Thesis_Audio_Full.zip"
-    zpath = None
-    for root, _, files in os.walk("/content/drive/MyDrive"):
-        if zname in files:
-            zpath = os.path.join(root, zname)
-            break
-    if not zpath:
-        raise FileNotFoundError(f"{zname} not found on Drive.")
-    print(f"[INIT] Extracting {zname}...")
-    with zipfile.ZipFile(zpath) as z:
-        z.extractall("/content/dataset")
-    return {f.name: str(f) for f in Path("/content/dataset").rglob("*.wav")}
+def sliding_window_infer(model, df, path_map, device, chunk=MAX_LEN, stride=16000):
+    model.eval(); preds, truths = [], []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="SWE", leave=False):
+        fname = Path(row["audio_relpath"]).name
+        if fname not in path_map: continue
+        try:
+            wav, _ = librosa.load(path_map[fname], sr=SR)
+            yt, _  = librosa.effects.trim(wav, top_db=25)
+            logits_list = []
+            for start in range(0, max(1, len(yt) - chunk + 1), stride):
+                seg = yt[start:start + chunk]
+                if len(seg) < chunk: seg = np.pad(seg, (0, chunk - len(seg)))
+                p   = extract_prosody(seg)
+                w_t = torch.tensor(seg).unsqueeze(0).to(device)
+                p_t = torch.tensor(p).unsqueeze(0).to(device)
+                with torch.no_grad(), autocast("cuda"):
+                    logits_list.append(model(w_t, p_t))
+            if logits_list:
+                avg = torch.stack(logits_list).mean(0)
+                preds.append(avg.argmax(1).item()); truths.append(int(row["lid"]))
+        except Exception: pass
+    return accuracy_score(truths, preds), f1_score(truths, preds, average="macro")
 
 
-# ──────────────────────────────────────────────
-# TRAINING
-# ──────────────────────────────────────────────
 def train():
     device     = "cuda"
     colab_root = Path("/content/drive/MyDrive/Thesis Project")
     csv_p      = colab_root / "data/processed/splits/text_hc"
     save_path  = colab_root / "conformer_titan_best.pt"
 
-    # ── Data ──
     path_map = get_path_map(colab_root)
     print(f"[SUCCESS] Indexed {len(path_map)} audio files.")
 
@@ -286,7 +218,6 @@ def train():
     tr_df["lid"] = tr_df["emotion_final"].map(lid)
     va_df["lid"] = va_df["emotion_final"].map(lid)
     print(f"[DATA] Train: {len(tr_df)} | Val: {len(va_df)} | Classes: {len(lid)}")
-    print(f"[DATA] Class map: {lid}")
 
     tr_loader = DataLoader(AudioDataset(tr_df, path_map, augment=True),
                            batch_size=BATCH_SIZE, shuffle=True,
@@ -294,85 +225,55 @@ def train():
     va_loader = DataLoader(AudioDataset(va_df, path_map, augment=False),
                            batch_size=BATCH_SIZE, num_workers=2, pin_memory=True)
 
-    # ── Model ──
-    model = ConformerTitan(num_labels=len(lid)).to(device)
+    model     = ConformerTitan(num_labels=len(lid)).to(device)
+    swa_model = AveragedModel(model)
 
-    # Phase 1: plain CE (no class weights — model is randomly initialized)
-    crit_p1 = nn.CrossEntropyLoss(label_smoothing=0.05)
-    # Phase 2: soft sqrt-based class weights (gentler than inverse)
-    counts  = tr_df["lid"].value_counts().sort_index().values.astype(float)
-    w_raw   = torch.tensor(1.0 / np.sqrt(counts), dtype=torch.float32).to(device)
-    w_raw   = w_raw / w_raw.sum() * len(counts)
-    crit_p2 = nn.CrossEntropyLoss(weight=w_raw, label_smoothing=0.05)
-    scaler  = GradScaler("cuda")
-
-    # ════════════════════════════════════════════
-    # PHASE 1: Conformer head warm-up (WavLM frozen)
-    # ════════════════════════════════════════════
-    model.freeze_wavlm()
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    opt1 = torch.optim.AdamW(trainable, lr=3e-4, weight_decay=0.01)
-    sch1 = get_cosine_schedule_with_warmup(opt1, len(tr_loader), len(tr_loader) * PHASE1_EPS)
-
-    print(f"\n{'='*55}")
-    print(f"  PHASE 1 — Conformer head warm-up  ({PHASE1_EPS} epochs, WavLM frozen)")
-    print(f"  Trainable params: {sum(p.numel() for p in trainable):,}")
-    print(f"{'='*55}")
-
-    for ep in range(1, PHASE1_EPS + 1):
-        model.train(); ep_loss = 0.0
-        for b in tqdm(tr_loader, desc=f"Ph1 Ep{ep:02d}", leave=False):
-            wav_b = b["wav"].to(device)
-            pro_b = b["prosody"].to(device)
-            lbl_b = b["label"].to(device)
-            with autocast("cuda"):
-                loss = crit_p1(model(wav_b, pro_b), lbl_b)
-            opt1.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt1)
-            nn.utils.clip_grad_norm_(trainable, 1.0)
-            scaler.step(opt1); scaler.update(); sch1.step()
-            ep_loss += loss.item()
-        acc, f1 = fast_eval(model, va_loader, device)
-        print(f"Ph1 Ep {ep:02d} | Loss {ep_loss/len(tr_loader):.3f} | Val Acc {acc:.3f} | F1 {f1:.3f}")
-
-    # ════════════════════════════════════════════
-    # PHASE 2: Full fine-tune (LoRA unlocked) + SWA
-    # ════════════════════════════════════════════
-    model.unfreeze_lora()
-    opt2 = torch.optim.AdamW([
-        {"params": model.wavlm.parameters(),      "lr": 5e-6},
+    # Discriminative learning rates — LoRA active from epoch 1
+    opt = torch.optim.AdamW([
+        {"params": model.wavlm.parameters(),      "lr": 2e-6},   # tiny — preserve pretrained knowledge
         {"params": model.pos_enc.parameters(),    "lr": 5e-5},
         {"params": model.conformer.parameters(),  "lr": 5e-5},
-        {"params": model.classifier.parameters(), "lr": 1e-4},
+        {"params": model.classifier.parameters(), "lr": 2e-4},
     ], weight_decay=0.01)
-    sch2 = get_cosine_schedule_with_warmup(
-        opt2, len(tr_loader) * 2, len(tr_loader) * PHASE2_EPS)
 
-    swa_model = AveragedModel(model)
-    swa_active = False
+    sch    = get_cosine_schedule_with_warmup(opt, len(tr_loader) * 2, len(tr_loader) * NUM_EPOCHS)
+    scaler = GradScaler("cuda")
+    crit   = nn.CrossEntropyLoss(label_smoothing=0.1)   # plain CE — no class weights yet
+
+    # Sqrt class weights for later epochs
+    counts  = tr_df["lid"].value_counts().sort_index().values.astype(float)
+    w_sqrt  = torch.tensor(1.0 / np.sqrt(counts), dtype=torch.float32).to(device)
+    w_sqrt  = w_sqrt / w_sqrt.sum() * len(counts)
+    crit_w  = nn.CrossEntropyLoss(weight=w_sqrt, label_smoothing=0.05)
+
     best_acc   = 0.0
+    swa_active = False
 
     print(f"\n{'='*55}")
-    print(f"  PHASE 2 — Full fine-tune  ({PHASE2_EPS} epochs, LoRA unlocked)")
-    print(f"  SWA starts at epoch {SWA_START}")
-    print(f"{'='*55}")
+    print(f"  CONFORMER TITAN v4  —  {NUM_EPOCHS} epochs end-to-end")
+    print(f"  LoRA active from epoch 1  |  SWA from epoch {SWA_START}")
+    print(f"  Class weights switch on at epoch 10")
+    print(f"{'='*55}\n")
 
-    for ep in range(1, PHASE2_EPS + 1):
+    for ep in range(1, NUM_EPOCHS + 1):
+        # Switch to class-weighted loss after model is stable
+        current_crit = crit_w if ep >= 10 else crit
+
         model.train(); ep_loss = 0.0
-        for b in tqdm(tr_loader, desc=f"Ph2 Ep{ep:02d}", leave=False):
+        for b in tqdm(tr_loader, desc=f"Ep {ep:02d}", leave=False):
             wav_b = b["wav"].to(device)
             pro_b = b["prosody"].to(device)
             lbl_b = b["label"].to(device)
             with autocast("cuda"):
-                loss = crit(model(wav_b, pro_b), lbl_b)
-            opt2.zero_grad()
+                loss = current_crit(model(wav_b, pro_b), lbl_b)
+            opt.zero_grad()
             scaler.scale(loss).backward()
-            scaler.unscale_(opt2)
+            scaler.unscale_(opt)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt2); scaler.update(); sch2.step()
+            scaler.step(opt); scaler.update(); sch.step()
             ep_loss += loss.item()
 
+        # SWA accumulation
         if ep >= SWA_START:
             swa_model.update_parameters(model)
             swa_active = True
@@ -382,30 +283,30 @@ def train():
         if acc > best_acc:
             best_acc = acc
             torch.save(model.state_dict(), save_path)
-            tag = "  *** BEST SAVED ***"
-        print(f"Ph2 Ep {ep:02d} | Loss {ep_loss/len(tr_loader):.3f} | "
+            tag = "  *** BEST ***"
+
+        print(f"Ep {ep:02d} | Loss {ep_loss/len(tr_loader):.3f} | "
               f"Val Acc {acc:.3f} | F1 {f1:.3f}{tag}")
 
-    # ── SWA final evaluation ──
+    # SWA final
     if swa_active:
-        print("\n[SWA] Updating BatchNorm statistics...")
+        print("\n[SWA] Finalizing averaged model...")
         swa_model.train()
         with torch.no_grad():
             for b in tqdm(tr_loader, desc="SWA BN", leave=False):
                 with autocast("cuda"):
                     swa_model(b["wav"].to(device), b["prosody"].to(device))
         swa_acc, swa_f1 = fast_eval(swa_model, va_loader, device)
-        print(f"[SWA] Val Acc: {swa_acc:.3f} | F1: {swa_f1:.3f}")
+        print(f"[SWA] Val Acc {swa_acc:.3f} | F1 {swa_f1:.3f}")
         if swa_acc > best_acc:
             best_acc = swa_acc
             torch.save(swa_model.state_dict(), save_path)
             print("[SWA] SWA model is the new best — saved.")
 
-    # ── Sliding Window Evaluation on best model ──
-    print("\n[SWE] Running sliding-window inference on validation set...")
+    # Final sliding window eval
+    print("\n[SWE] Sliding-window inference on full validation files...")
     model.load_state_dict(torch.load(save_path, map_location=device))
     swe_acc, swe_f1 = sliding_window_infer(model, va_df, path_map, device)
-    print(f"[SWE] Sliding Window — Val Acc: {swe_acc:.3f} | F1: {swe_f1:.3f}")
 
     print(f"\n{'='*55}")
     print(f"  FINAL RESULTS")
