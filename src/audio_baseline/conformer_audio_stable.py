@@ -14,7 +14,7 @@ if "google.colab" in sys.modules or os.path.exists("/content"):
 
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
 import pandas as pd, numpy as np, librosa, random
 from pathlib import Path
 from tqdm import tqdm
@@ -115,12 +115,12 @@ def train():
     sch = get_cosine_schedule_with_warmup(opt, len(tr_loader)*2, len(tr_loader)*30)
     scaler = GradScaler(); crit = nn.CrossEntropyLoss(label_smoothing=0.1)
     
-    print(f"[START] CONFORMER STABLE TITAN. Ultra Search Success.")
-    for ep in range(1, 31):
+    print(f"[START] CONFORMER STABLE TITAN. Ready.")
+    for ep in range(1, 41):
         model.train(); tr_loss = 0
         for b in tqdm(tr_loader, desc=f"Ep {ep}", leave=False):
             w, p, l = b["wav"].to(device), b["prosody"].to(device), b["label"].to(device)
-            with autocast("cuda"):
+            with torch.amp.autocast('cuda'):
                 logits = model(w, torch.ones_like(w).to(device), p); loss = crit(logits, l)
             opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); sch.step()
             tr_loss += loss.item()
@@ -128,14 +128,16 @@ def train():
         model.eval(); ps, ts = [], []
         with torch.no_grad():
             for b in va_loader:
-                l = model(b["wav"].to(device), torch.ones_like(b["wav"]).to(device), b["prosody"].to(device))
+                with torch.amp.autocast('cuda'):
+                    l = model(b["wav"].to(device), torch.ones_like(b["wav"]).to(device), b["prosody"].to(device))
                 ps.extend(torch.argmax(l, 1).cpu().numpy()); ts.extend(b["label"].numpy())
         acc = accuracy_score(ts, ps); f1 = f1_score(ts, ps, average="macro")
         
         tps, tts = [], []
         with torch.no_grad():
             for b in te_loader:
-                l = model(b["wav"].to(device), torch.ones_like(b["wav"]).to(device), b["prosody"].to(device))
+                with torch.amp.autocast('cuda'):
+                    l = model(b["wav"].to(device), torch.ones_like(b["wav"]).to(device), b["prosody"].to(device))
                 tps.extend(torch.argmax(l, 1).cpu().numpy()); tts.extend(b["label"].numpy())
         tacc = accuracy_score(tts, tps)
         
