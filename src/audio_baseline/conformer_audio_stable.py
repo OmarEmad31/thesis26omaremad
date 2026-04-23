@@ -297,11 +297,13 @@ def train():
     # ── Model ──
     model = ConformerTitan(num_labels=len(lid)).to(device)
 
-    # ── Class weights (inverse frequency) ──
+    # Phase 1: plain CE (no class weights — model is randomly initialized)
+    crit_p1 = nn.CrossEntropyLoss(label_smoothing=0.05)
+    # Phase 2: soft sqrt-based class weights (gentler than inverse)
     counts  = tr_df["lid"].value_counts().sort_index().values.astype(float)
-    weights = torch.tensor(1.0 / counts, dtype=torch.float32).to(device)
-    weights = weights / weights.sum() * len(counts)   # normalize to sum = num_classes
-    crit    = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.05)
+    w_raw   = torch.tensor(1.0 / np.sqrt(counts), dtype=torch.float32).to(device)
+    w_raw   = w_raw / w_raw.sum() * len(counts)
+    crit_p2 = nn.CrossEntropyLoss(weight=w_raw, label_smoothing=0.05)
     scaler  = GradScaler("cuda")
 
     # ════════════════════════════════════════════
@@ -324,7 +326,7 @@ def train():
             pro_b = b["prosody"].to(device)
             lbl_b = b["label"].to(device)
             with autocast("cuda"):
-                loss = crit(model(wav_b, pro_b), lbl_b)
+                loss = crit_p1(model(wav_b, pro_b), lbl_b)
             opt1.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(opt1)
@@ -387,7 +389,11 @@ def train():
     # ── SWA final evaluation ──
     if swa_active:
         print("\n[SWA] Updating BatchNorm statistics...")
-        torch.optim.swa_utils.update_bn(tr_loader, swa_model, device=device)
+        swa_model.train()
+        with torch.no_grad():
+            for b in tqdm(tr_loader, desc="SWA BN", leave=False):
+                with autocast("cuda"):
+                    swa_model(b["wav"].to(device), b["prosody"].to(device))
         swa_acc, swa_f1 = fast_eval(swa_model, va_loader, device)
         print(f"[SWA] Val Acc: {swa_acc:.3f} | F1: {swa_f1:.3f}")
         if swa_acc > best_acc:
