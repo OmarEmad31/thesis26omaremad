@@ -5,7 +5,7 @@ def install_deps():
     try:
         import audiomentations, peft, transformers
     except ImportError:
-        print("[INIT] Installing SOTA dependencies (audiomentations, peft, transformers)...")
+        print("[INIT] Installing SOTA dependencies...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "audiomentations", "peft", "transformers", "-q"])
         import audiomentations, peft, transformers
 
@@ -62,9 +62,8 @@ class SupConLoss(nn.Module):
         return -(mask * log_prob).sum(1).mean()
 
 class OlympicDataset(Dataset):
-    def __init__(self, df, audio_dir, augment=False):
-        self.df = df; self.audio_dir = Path(audio_dir); self.max_len = 48000; self.aug = augment
-        self.path_map = {f.name: f for f in self.audio_dir.rglob("*.wav")}
+    def __init__(self, df, path_map, augment=False):
+        self.df = df; self.path_map = path_map; self.max_len = 48000; self.aug = augment
         self.aug_pipe = Compose([AddGaussianNoise(p=0.3), PitchShift(min_semitones=-1, max_semitones=1, p=0.3)])
 
     def __len__(self): return len(self.df)
@@ -88,7 +87,7 @@ class OlympicDataset(Dataset):
                     return {"wav": torch.tensor(yt, dtype=torch.float32), "prosody": torch.tensor(prosody), "label": torch.tensor(row["lid"])}
                 except: pass
             idx = (idx + 1) % len(self.df)
-        raise FileNotFoundError("Audio sync failed")
+        raise FileNotFoundError(f"Audio sync failed even after deep scan.")
 
 def custom_update_bn(loader, model, device):
     model.train()
@@ -107,9 +106,8 @@ def evaluate_fast(model, loader, device):
             ps.extend(torch.argmax(l, 1).cpu().numpy()); ts.extend(b["label"].numpy())
     return accuracy_score(ts, ps), f1_score(ts, ps, average="macro")
 
-def sliding_window_eval(model, df, audio_dir, device, chunk_size=48000, stride=24000):
-    model.eval(); path_map = {f.name: f for f in Path(audio_dir).rglob("*.wav")}
-    all_ps, all_ts = [], []
+def sliding_window_eval(model, df, path_map, device, chunk_size=48000, stride=24000):
+    model.eval(); all_ps, all_ts = [], []
     for _, row in tqdm(df.iterrows(), total=len(df), desc="SWE", leave=False):
         fname = Path(row["audio_relpath"]).name
         if fname not in path_map: continue
@@ -130,10 +128,10 @@ def sliding_window_eval(model, df, audio_dir, device, chunk_size=48000, stride=2
         except: pass
     return accuracy_score(all_ts, all_ps), f1_score(all_ts, all_ps, average="macro")
 
-def train_fold(fold, tr_df, va_df, audio_dir, device):
+def train_fold(fold, tr_df, va_df, path_map, device):
     print(f"\n[FOLD {fold}] Training..."); 
-    tr_loader = DataLoader(OlympicDataset(tr_df, audio_dir, True), batch_size=4, shuffle=True, drop_last=True)
-    va_loader = DataLoader(OlympicDataset(va_df, audio_dir), batch_size=4)
+    tr_loader = DataLoader(OlympicDataset(tr_df, path_map, True), batch_size=4, shuffle=True, drop_last=True)
+    va_loader = DataLoader(OlympicDataset(va_df, path_map), batch_size=4)
     model = OlympicTitan(7).to(device)
     swa_model = torch.optim.swa_utils.AveragedModel(model)
     opt = torch.optim.AdamW([{"params": model.wavlm.parameters(), "lr": 1e-5}, {"params": [p for n, p in model.named_parameters() if "wavlm" not in n], "lr": 5e-4}], weight_decay=0.01)
@@ -156,7 +154,7 @@ def train_fold(fold, tr_df, va_df, audio_dir, device):
     
     print(f"[FOLD {fold}] Finalizing SWA & SWE...")
     custom_update_bn(tr_loader, swa_model, device)
-    swe_acc, swe_f1 = sliding_window_eval(swa_model, va_df, audio_dir, device)
+    swe_acc, swe_f1 = sliding_window_eval(swa_model, va_df, path_map, device)
     print(f"[RESULT] Fold {fold} Final SWE (SWA): Acc {swe_acc:.3f} | F1 {swe_f1:.3f}")
     return {"acc": swe_acc, "f1": swe_f1}
 
@@ -164,21 +162,27 @@ def main():
     device = "cuda"; colab_root = Path("/content/drive/MyDrive/Thesis Project")
     if colab_root.exists():
         csv_p = colab_root / "data/processed/splits/text_hc"
-        audio_dir = "/content/dataset" if os.path.exists("/content/dataset") else "/content"
-        print(f"[ENV] Colab Active. Data Root: {colab_root}")
+        # Intelligent Search
+        print(f"[INIT] Scanning for audio in {colab_root}...")
+        path_map = {f.name: f for f in colab_root.rglob("*.wav")}
+        if not path_map:
+            print("[WARN] No audio in project root. Scanning /content/dataset...")
+            path_map = {f.name: f for f in Path("/content/dataset").rglob("*.wav")}
     else:
         csv_p = Path("D:/Thesis Project/data/processed/splits/text_hc")
-        audio_dir = Path("D:/Thesis Project/dataset")
-        print(f"[ENV] Local Active.")
+        print(f"[INIT] Local Mode. Scanning D:/Thesis Project/dataset...")
+        path_map = {f.name: f for f in Path("D:/Thesis Project/dataset").rglob("*.wav")}
+
+    if not path_map: raise FileNotFoundError("Fatal: No audio files found in deep scan.")
+    print(f"[SUCCESS] Indexed {len(path_map)} audio files.")
 
     dfs = [pd.read_csv(csv_p/f) for f in ["train.csv", "val.csv", "test.csv"]]
     full_df = pd.concat(dfs); lid = {l: i for i, l in enumerate(sorted(full_df["emotion_final"].unique()))}
     full_df["lid"] = full_df["emotion_final"].map(lid); skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     
     results = []
-    print(f"[START] OLYMPIC ENSEMBLE PRODUCTION. Auto-Install Active.")
     for fold, (t_idx, v_idx) in enumerate(skf.split(full_df, full_df["lid"])):
-        out = train_fold(fold+1, full_df.iloc[t_idx], full_df.iloc[v_idx], audio_dir, device); results.append(out)
+        out = train_fold(fold+1, full_df.iloc[t_idx], full_df.iloc[v_idx], path_map, device); results.append(out)
     
     df_res = pd.DataFrame(results)
     print("\n" + "="*40 + "\n      GRAND OLYMPIC SUMMARY      \n" + "="*40)
