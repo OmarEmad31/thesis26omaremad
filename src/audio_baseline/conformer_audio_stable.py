@@ -27,17 +27,17 @@ class ConformerStableTitan(nn.Module):
     def __init__(self, num_labels, model_name="microsoft/wavlm-large"):
         super().__init__()
         base_model = WavLMModel.from_pretrained(model_name, output_hidden_states=True)
-        peft_config = LoraConfig(r=32, lora_alpha=64, target_modules=["q_proj", "v_proj"], lora_dropout=0.1, bias="none")
+        peft_config = LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"], lora_dropout=0.1, bias="none")
         self.wavlm = get_peft_model(base_model, peft_config)
         self.wavlm.gradient_checkpointing_enable() 
         
-        # The Conformer Brain
+        # 4-Layer Transformer Brain
         encoder_layer = nn.TransformerEncoderLayer(d_model=1024, nhead=8, dim_feedforward=2048, dropout=0.2, batch_first=True)
         self.conformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
         
         self.classifier = nn.Sequential(
-            nn.Linear(1024 + 4, 512), nn.LayerNorm(512), nn.GELU(),
-            nn.Dropout(0.3), nn.Linear(512, num_labels)
+            nn.Linear(1024 + 4, 768), nn.BatchNorm1d(768), nn.ReLU(),
+            nn.Dropout(0.3), nn.Linear(768, num_labels)
         )
 
     def forward(self, wav, mask, prosody):
@@ -84,16 +84,9 @@ def train():
     if not path_map:
         zname = "Thesis_Audio_Full.zip"
         zpath = None
-        print(f"[INIT] Audio missing. Ultra-scanning /content/drive/MyDrive for {zname}...")
+        print(f"[INIT] Audio missing. Ultra-scanning...")
         for root, _, files in os.walk("/content/drive/MyDrive"):
-            if zname in files:
-                zpath = os.path.join(root, zname)
-                break
-        
-        if not zpath:
-            raise FileNotFoundError(f"Fatal: Could not find {zname} anywhere on Drive.")
-            
-        print(f"[INIT] Found it at {zpath}. Extracting to /content/dataset...")
+            if zname in files: zpath = os.path.join(root, zname); break
         with zipfile.ZipFile(zpath, 'r') as z: z.extractall("/content/dataset")
         path_map = {f.name: f for f in Path("/content/dataset").rglob("*.wav")}
     
@@ -106,16 +99,23 @@ def train():
     te_loader = DataLoader(OlympicDataset(te_df, path_map), batch_size=4)
     
     model = ConformerStableTitan(7).to(device)
+    
+    # TURBO LEARNING RATE
     opt = torch.optim.AdamW([
-        {"params": model.wavlm.parameters(), "lr": 1e-6},
-        {"params": model.conformer.parameters(), "lr": 2e-5},
-        {"params": model.classifier.parameters(), "lr": 1e-4}
+        {"params": model.wavlm.parameters(), "lr": 1e-5},
+        {"params": model.conformer.parameters(), "lr": 1e-4},
+        {"params": model.classifier.parameters(), "lr": 5e-4}
     ], weight_decay=0.01)
     
-    sch = get_cosine_schedule_with_warmup(opt, len(tr_loader)*2, len(tr_loader)*30)
-    scaler = GradScaler(); crit = nn.CrossEntropyLoss(label_smoothing=0.1)
+    sch = get_cosine_schedule_with_warmup(opt, len(tr_loader), len(tr_loader)*30)
+    scaler = GradScaler()
     
-    print(f"[START] CONFORMER STABLE TITAN. Ready.")
+    # CLASS WEIGHTING FOR IMBALANCE
+    counts = tr_df["lid"].value_counts().sort_index().values
+    weights = torch.tensor(1.0 / counts, dtype=torch.float32).to(device)
+    crit = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
+    
+    print(f"[START] CONFORMER TURBO RUN. Focus: Loss Drop.")
     for ep in range(1, 41):
         model.train(); tr_loss = 0
         for b in tqdm(tr_loader, desc=f"Ep {ep}", leave=False):
@@ -132,16 +132,6 @@ def train():
                     l = model(b["wav"].to(device), torch.ones_like(b["wav"]).to(device), b["prosody"].to(device))
                 ps.extend(torch.argmax(l, 1).cpu().numpy()); ts.extend(b["label"].numpy())
         acc = accuracy_score(ts, ps); f1 = f1_score(ts, ps, average="macro")
-        
-        tps, tts = [], []
-        with torch.no_grad():
-            for b in te_loader:
-                with torch.amp.autocast('cuda'):
-                    l = model(b["wav"].to(device), torch.ones_like(b["wav"]).to(device), b["prosody"].to(device))
-                tps.extend(torch.argmax(l, 1).cpu().numpy()); tts.extend(b["label"].numpy())
-        tacc = accuracy_score(tts, tps)
-        
-        print(f"Ep {ep} | Loss: {tr_loss/len(tr_loader):.3f} | Val Acc: {acc:.3f} | Test Acc: {tacc:.3f} | F1: {f1:.3f}")
-        if acc > 0.55: torch.save(model.state_dict(), f"conformer_titan_ep{ep}.pt")
+        print(f"Ep {ep} | Loss: {tr_loss/len(tr_loader):.3f} | Val Acc: {acc:.3f} | F1: {f1:.3f}")
 
 if __name__ == "__main__": train()
