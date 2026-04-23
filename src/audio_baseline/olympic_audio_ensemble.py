@@ -56,23 +56,34 @@ class OlympicDataset(Dataset):
     def __len__(self): return len(self.df)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]; fname = Path(row["audio_relpath"]).name
-        if fname in self.path_map:
-            try:
-                p = self.path_map[fname]
-                wav, _ = librosa.load(p, sr=16000)
-                yt, _ = librosa.effects.trim(wav, top_db=20)
-                yt = (yt - np.mean(yt)) / (np.std(yt) + 1e-6)
-                if len(yt) > self.max_len:
-                    start = random.randint(0, len(yt)-self.max_len) if self.aug else 0
-                    yt = yt[start:start+self.max_len]
-                else: yt = np.pad(yt, (0, self.max_len - len(yt)))
-                f0 = librosa.yin(yt, fmin=65, fmax=2093); rms = np.mean(librosa.feature.rms(y=yt))
-                prosody = np.array([rms, np.mean(librosa.feature.zero_crossing_rate(y=yt)), np.nanmean(f0)/500, np.nanstd(f0)/100], dtype=np.float32)
-                if self.aug: yt = self.aug_pipe(samples=yt, sample_rate=16000)
-                return {"wav": torch.tensor(yt), "prosody": torch.tensor(prosody), "label": torch.tensor(row["lid"])}
-            except: pass
-        return self.__getitem__((idx + 1) % len(self.df))
+        for _ in range(len(self.df)):
+            row = self.df.iloc[idx]; fname = Path(row["audio_relpath"]).name
+            if fname in self.path_map:
+                try:
+                    p = self.path_map[fname]
+                    wav, _ = librosa.load(p, sr=16000)
+                    yt, _ = librosa.effects.trim(wav, top_db=20)
+                    yt = (yt - np.mean(yt)) / (np.std(yt) + 1e-6)
+                    if len(yt) > self.max_len:
+                        start = random.randint(0, len(yt)-self.max_len) if self.aug else 0
+                        yt = yt[start:start+self.max_len]
+                    else: yt = np.pad(yt, (0, self.max_len - len(yt)))
+                    f0 = librosa.yin(yt, fmin=65, fmax=2093); rms = np.mean(librosa.feature.rms(y=yt))
+                    prosody = np.array([rms, np.mean(librosa.feature.zero_crossing_rate(y=yt)), np.nanmean(f0)/500, np.nanstd(f0)/100], dtype=np.float32)
+                    if self.aug: yt = self.aug_pipe(samples=yt, sample_rate=16000)
+                    return {"wav": torch.tensor(yt, dtype=torch.float32), "prosody": torch.tensor(prosody), "label": torch.tensor(row["lid"])}
+                except: pass
+            idx = (idx + 1) % len(self.df)
+        raise FileNotFoundError("Audio sync failed")
+
+def custom_update_bn(loader, model, device):
+    model.train()
+    with torch.no_grad():
+        for b in tqdm(loader, desc="UpdateBN", leave=False):
+            w, p = b["wav"].to(device), b["prosody"].to(device)
+            m = torch.ones_like(w).to(device)
+            with torch.cuda.amp.autocast():
+                model(w, m, p)
 
 def evaluate_fast(model, loader, device):
     model.eval(); ps, ts = [], []
@@ -106,7 +117,7 @@ def sliding_window_eval(model, df, audio_dir, device, chunk_size=48000, stride=2
     return accuracy_score(all_ts, all_ps), f1_score(all_ts, all_ps, average="macro")
 
 def train_fold(fold, tr_df, va_df, audio_dir, device):
-    print(f"\n[FOLD {fold}] Monitoring Active..."); 
+    print(f"\n[FOLD {fold}] Training..."); 
     tr_loader = DataLoader(OlympicDataset(tr_df, audio_dir, True), batch_size=4, shuffle=True, drop_last=True)
     va_loader = DataLoader(OlympicDataset(va_df, audio_dir), batch_size=4)
     model = OlympicTitan(7).to(device)
@@ -119,9 +130,9 @@ def train_fold(fold, tr_df, va_df, audio_dir, device):
     for ep in range(1, 26):
         model.train()
         for b in tqdm(tr_loader, desc=f"Fold {fold} Ep {ep}", leave=False):
-            w, l = b["wav"].to(device), b["label"].to(device); p = b["prosody"].to(device)
+            w, p, l = b["wav"].to(device), b["prosody"].to(device), b["label"].to(device)
             with torch.cuda.amp.autocast():
-                logits, z = model(w, torch.ones_like(w).to(device), p); loss = (0.7*l_ce(logits, l) + 0.3*l_sc(z, l))
+                logits, z = model(w, torch.ones_like(w).to(device), p); loss = (0.9*l_ce(logits, l) + 0.1*l_sc(z, l))
             opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); sch.step()
         
         if ep >= 12: swa_model.update_parameters(model)
@@ -129,10 +140,10 @@ def train_fold(fold, tr_df, va_df, audio_dir, device):
         print(f"Fold {fold} Ep {ep} | Acc: {acc:.3f} | F1: {f1:.3f}")
         if acc > best_acc: best_acc, best_f1 = acc, f1
     
-    print(f"[FOLD {fold}] Calculating Final SWE Result...")
-    torch.optim.swa_utils.update_bn(tr_loader, swa_model, device=device)
+    print(f"[FOLD {fold}] Finalizing SWA & SWE...")
+    custom_update_bn(tr_loader, swa_model, device)
     swe_acc, swe_f1 = sliding_window_eval(swa_model, va_df, audio_dir, device)
-    print(f"[RESULT] Fold {fold} Final SWE: Acc {swe_acc:.3f} | F1 {swe_f1:.3f}")
+    print(f"[RESULT] Fold {fold} Final SWE (SWA): Acc {swe_acc:.3f} | F1 {swe_f1:.3f}")
     return {"acc": swe_acc, "f1": swe_f1}
 
 def main():
@@ -151,6 +162,7 @@ def main():
     full_df["lid"] = full_df["emotion_final"].map(lid); skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     
     results = []
+    print(f"[START] OLYMPIC ENSEMBLE PRODUCTION. Bug Fix Deploy.")
     for fold, (t_idx, v_idx) in enumerate(skf.split(full_df, full_df["lid"])):
         out = train_fold(fold+1, full_df.iloc[t_idx], full_df.iloc[v_idx], audio_dir, device); results.append(out)
     
