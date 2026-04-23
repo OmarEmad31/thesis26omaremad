@@ -31,7 +31,7 @@ class ConformerStableTitan(nn.Module):
         self.wavlm = get_peft_model(base_model, peft_config)
         self.wavlm.gradient_checkpointing_enable() 
         
-        # 4-Layer Transformer Brain
+        # 4-Layer Global-Attention Brain
         encoder_layer = nn.TransformerEncoderLayer(d_model=1024, nhead=8, dim_feedforward=2048, dropout=0.2, batch_first=True)
         self.conformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
         
@@ -79,16 +79,17 @@ def train():
     device = "cuda"; colab_root = Path("/content/drive/MyDrive/Thesis Project")
     csv_p = colab_root / "data/processed/splits/text_hc"
     
-    print("[INIT] Scanning audio...")
+    print("[INIT] Scanning audio for sync...")
     path_map = {f.name: f for f in colab_root.rglob("*.wav")}
     if not path_map:
-        zname = "Thesis_Audio_Full.zip"
-        zpath = None
-        print(f"[INIT] Audio missing. Ultra-scanning...")
+        zname = "Thesis_Audio_Full.zip"; zpath = None
         for root, _, files in os.walk("/content/drive/MyDrive"):
             if zname in files: zpath = os.path.join(root, zname); break
+        print(f"[INIT] Extracting {zname} to /content/dataset...")
         with zipfile.ZipFile(zpath, 'r') as z: z.extractall("/content/dataset")
         path_map = {f.name: f for f in Path("/content/dataset").rglob("*.wav")}
+    
+    print(f"[SUCCESS] Sync verified. Indexed {len(path_map)} audio files.")
     
     tr_df = pd.read_csv(csv_p/"train.csv"); va_df = pd.read_csv(csv_p/"val.csv"); te_df = pd.read_csv(csv_p/"test.csv")
     lid = {l: i for i, l in enumerate(sorted(tr_df["emotion_final"].unique()))}
@@ -103,19 +104,19 @@ def train():
     # TURBO LEARNING RATE
     opt = torch.optim.AdamW([
         {"params": model.wavlm.parameters(), "lr": 1e-5},
-        {"params": model.conformer.parameters(), "lr": 1e-4},
+        {"params": model.conformer.parameters(), "lr": 2e-4},
         {"params": model.classifier.parameters(), "lr": 5e-4}
     ], weight_decay=0.01)
     
-    sch = get_cosine_schedule_with_warmup(opt, len(tr_loader), len(tr_loader)*30)
+    sch = get_cosine_schedule_with_warmup(opt, len(tr_loader)*2, len(tr_loader)*30)
     scaler = GradScaler()
     
-    # CLASS WEIGHTING FOR IMBALANCE
+    # CLASS WEIGHTING
     counts = tr_df["lid"].value_counts().sort_index().values
     weights = torch.tensor(1.0 / counts, dtype=torch.float32).to(device)
     crit = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
     
-    print(f"[START] CONFORMER TURBO RUN. Focus: Loss Drop.")
+    print(f"[START] CONFORMER TURBO TITAN. Target: 57%.")
     for ep in range(1, 41):
         model.train(); tr_loss = 0
         for b in tqdm(tr_loader, desc=f"Ep {ep}", leave=False):
@@ -132,6 +133,8 @@ def train():
                     l = model(b["wav"].to(device), torch.ones_like(b["wav"]).to(device), b["prosody"].to(device))
                 ps.extend(torch.argmax(l, 1).cpu().numpy()); ts.extend(b["label"].numpy())
         acc = accuracy_score(ts, ps); f1 = f1_score(ts, ps, average="macro")
+        
         print(f"Ep {ep} | Loss: {tr_loss/len(tr_loader):.3f} | Val Acc: {acc:.3f} | F1: {f1:.3f}")
+        if acc > 0.55: torch.save(model.state_dict(), f"conformer_titan_ep{ep}.pt")
 
 if __name__ == "__main__": train()
