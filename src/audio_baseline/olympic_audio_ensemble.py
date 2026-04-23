@@ -87,7 +87,7 @@ class OlympicDataset(Dataset):
                     return {"wav": torch.tensor(yt, dtype=torch.float32), "prosody": torch.tensor(prosody), "label": torch.tensor(row["lid"])}
                 except: pass
             idx = (idx + 1) % len(self.df)
-        raise FileNotFoundError(f"Audio sync failed even after deep scan.")
+        raise FileNotFoundError(f"Audio sync failed even after sledgehammer scan.")
 
 def custom_update_bn(loader, model, device):
     model.train()
@@ -158,29 +158,35 @@ def train_fold(fold, tr_df, va_df, path_map, device):
     print(f"[RESULT] Fold {fold} Final SWE (SWA): Acc {swe_acc:.3f} | F1 {swe_f1:.3f}")
     return {"acc": swe_acc, "f1": swe_f1}
 
+def sledgehammer_scan(root_dir):
+    pm = {}
+    print(f"[SCAN] Sledgehammer scan starting at {root_dir}...")
+    for root, _, files in os.walk(root_dir):
+        for f in files:
+            if f.lower().endswith(".wav"): pm[f] = os.path.join(root, f)
+    return pm
+
 def main():
     device = "cuda"; colab_root = Path("/content/drive/MyDrive/Thesis Project")
     if colab_root.exists():
         csv_p = colab_root / "data/processed/splits/text_hc"
-        # Intelligent Search
-        print(f"[INIT] Scanning for audio in {colab_root}...")
-        path_map = {f.name: f for f in colab_root.rglob("*.wav")}
+        path_map = sledgehammer_scan(str(colab_root))
         if not path_map:
-            print("[WARN] No audio in project root. Scanning /content/dataset...")
-            path_map = {f.name: f for f in Path("/content/dataset").rglob("*.wav")}
+            print("[WARN] Still nothing. Scanning /content/drive/MyDrive...")
+            path_map = sledgehammer_scan("/content/drive/MyDrive")
     else:
         csv_p = Path("D:/Thesis Project/data/processed/splits/text_hc")
-        print(f"[INIT] Local Mode. Scanning D:/Thesis Project/dataset...")
-        path_map = {f.name: f for f in Path("D:/Thesis Project/dataset").rglob("*.wav")}
+        path_map = sledgehammer_scan("D:/Thesis Project/dataset")
 
-    if not path_map: raise FileNotFoundError("Fatal: No audio files found in deep scan.")
-    print(f"[SUCCESS] Indexed {len(path_map)} audio files.")
+    if not path_map: raise FileNotFoundError("Fatal: Sledgehammer could not find any audio.")
+    print(f"[SUCCESS] Sledgehammer found {len(path_map)} audio files.")
 
     dfs = [pd.read_csv(csv_p/f) for f in ["train.csv", "val.csv", "test.csv"]]
     full_df = pd.concat(dfs); lid = {l: i for i, l in enumerate(sorted(full_df["emotion_final"].unique()))}
     full_df["lid"] = full_df["emotion_final"].map(lid); skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     
     results = []
+    print(f"[START] OLYMPIC ENSEMBLE PRODUCTION. Deep Scan Verified.")
     for fold, (t_idx, v_idx) in enumerate(skf.split(full_df, full_df["lid"])):
         out = train_fold(fold+1, full_df.iloc[t_idx], full_df.iloc[v_idx], path_map, device); results.append(out)
     
