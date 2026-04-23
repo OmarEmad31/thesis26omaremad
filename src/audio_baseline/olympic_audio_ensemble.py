@@ -1,4 +1,18 @@
-import os, torch, torch.nn as nn, torch.nn.functional as F
+import os, sys, subprocess
+
+# Auto-Install for Colab
+def install_deps():
+    try:
+        import audiomentations, peft, transformers
+    except ImportError:
+        print("[INIT] Installing SOTA dependencies (audiomentations, peft, transformers)...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "audiomentations", "peft", "transformers", "-q"])
+        import audiomentations, peft, transformers
+
+if "google.colab" in sys.modules or os.path.exists("/content"):
+    install_deps()
+
+import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 import pandas as pd, numpy as np, librosa, random
@@ -162,7 +176,7 @@ def main():
     full_df["lid"] = full_df["emotion_final"].map(lid); skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     
     results = []
-    print(f"[START] OLYMPIC ENSEMBLE PRODUCTION. Bug Fix Deploy.")
+    print(f"[START] OLYMPIC ENSEMBLE PRODUCTION. Auto-Install Active.")
     for fold, (t_idx, v_idx) in enumerate(skf.split(full_df, full_df["lid"])):
         out = train_fold(fold+1, full_df.iloc[t_idx], full_df.iloc[v_idx], audio_dir, device); results.append(out)
     
