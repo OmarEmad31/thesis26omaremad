@@ -13,7 +13,8 @@ Why this beats WavLM fine-tuning for our small dataset:
 
 Expected: 45-58% (vs WavLM ceiling ~40%)
 """
-import os, sys, subprocess, zipfile, random
+import os, sys, subprocess, zipfile, random, io
+from contextlib import redirect_stdout, redirect_stderr
 from collections import defaultdict
 from pathlib import Path
 
@@ -114,13 +115,15 @@ def load_emotion2vec(cache_dir: str):
 
 
 def extract_e2v_embedding(e2v_model, audio_path: str) -> np.ndarray | None:
-    """Extract utterance-level emotion embedding from emotion2vec."""
+    """Extract utterance-level emotion embedding from emotion2vec (silent)."""
     try:
-        # Temporarily silence any remaining per-file logs
-        logging.disable(logging.INFO)
-        res = e2v_model.generate(str(audio_path), output_dir=None,
-                                 granularity="utterance", extract_embedding=True)
-        logging.disable(logging.NOTSET)
+        # Redirect stdout+stderr to suppress FunASR's internal tqdm/RTF output
+        buf = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(buf):
+            logging.disable(logging.INFO)
+            res = e2v_model.generate(str(audio_path), output_dir=None,
+                                     granularity="utterance", extract_embedding=True)
+            logging.disable(logging.NOTSET)
         if not res: return None
         r = res[0]
         for key in ["feats", "embedding", "hidden_states", "features"]:
