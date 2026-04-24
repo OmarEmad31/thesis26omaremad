@@ -41,11 +41,11 @@ from audiomentations import Compose, AddGaussianNoise, PitchShift
 # CONFIG
 # ─────────────────────────────────────────────────────────
 SR             = 16000
-MAX_LEN        = 80000        # 5-second window
+MAX_LEN        = 48000        # 3-second window (standard SER, T²-safe for WavLM-Large on T4)
 K_PER_CLASS    = 2            # samples per class per batch
 NUM_CLASSES    = 7
 BATCH_SIZE     = K_PER_CLASS * NUM_CLASSES   # = 14
-BATCH_FROZEN   = 28           # Phase 1 frozen (double, no gradient through backbone)
+BATCH_FROZEN   = 8            # Phase 1: small to avoid OOM with WavLM-Large 24-layer attention
 PHASE1_EPOCHS  = 4
 PHASE2_EPOCHS  = 26
 SWA_START      = 18
@@ -230,7 +230,7 @@ def fast_eval(model, loader, device):
 
 
 def smart_eval(model, df, path_map, device, chunk=MAX_LEN, stride=SR,
-               min_len_for_slide=8 * SR):
+               min_len_for_slide=5 * SR):
     """
     Fixed SWE: only slide if audio > 8 seconds.
     Short clips (<=8s) use single crop — avoids averaging near-identical windows.
