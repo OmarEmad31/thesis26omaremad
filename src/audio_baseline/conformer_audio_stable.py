@@ -17,11 +17,19 @@ import os, sys, subprocess, zipfile, random
 from collections import defaultdict
 
 def install_deps():
-    try:
-        import audiomentations, peft, transformers
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install",
-                               "audiomentations", "peft", "transformers", "-q"])
+    pkgs = []
+    try: import audiomentations
+    except ImportError: pkgs.append("audiomentations")
+    try: import peft
+    except ImportError: pkgs.append("peft")
+    try: import transformers
+    except ImportError: pkgs.append("transformers")
+    try: import noisereduce
+    except ImportError: pkgs.append("noisereduce")
+    try: import pyloudnorm
+    except ImportError: pkgs.append("pyloudnorm")
+    if pkgs:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *pkgs, "-q"])
 
 if "google.colab" in sys.modules or os.path.exists("/content"):
     install_deps()
@@ -37,6 +45,8 @@ from sklearn.metrics import accuracy_score, f1_score
 from transformers import WavLMModel, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model
 from audiomentations import Compose, AddGaussianNoise, PitchShift
+import noisereduce as nr
+import pyloudnorm as pyln
 
 # ─────────────────────────────────────────────────────────
 # CONFIG
@@ -183,7 +193,62 @@ def safe_speed_perturb(y: np.ndarray, factor: float) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────
-# DATASET — identical to backup + speed perturbation
+# ELITE PREPROCESSING PIPELINE
+# Applied once per file, cached in memory. Cleans audio before
+# WavLM sees it — WavLM was trained on LibriSpeech clean.
+# ─────────────────────────────────────────────────────────
+def elite_preprocess(y: np.ndarray, sr: int = SR) -> np.ndarray:
+    """
+    1. Loudness normalize (-23 LUFS): standardizes amplitude across all clips
+    2. Spectral noise reduction: removes stationary background noise
+    3. Pre-emphasis (γ=0.97): enhances emotion-carrying formants 300-8000 Hz
+    4. Trim silence (top_db=25): tighter than default 30, removes more silence
+    5. Smart crop: picks the MAX_LEN window with highest RMS energy
+    """
+    # 1. Loudness normalization
+    try:
+        meter    = pyln.Meter(sr)
+        loudness = meter.integrated_loudness(y.astype(np.float64))
+        if np.isfinite(loudness) and -80 < loudness < 0:
+            y = pyln.normalize.loudness(
+                y.astype(np.float64), loudness, -23.0).astype(np.float32)
+    except Exception:
+        pass
+
+    # 2. Spectral noise reduction (prop_decrease=0.75: aggressive but not over-filtered)
+    try:
+        y = nr.reduce_noise(y=y, sr=sr, stationary=True,
+                            prop_decrease=0.75).astype(np.float32)
+    except Exception:
+        pass
+
+    # 3. Pre-emphasis filter
+    y = np.append(y[0], y[1:] - 0.97 * y[:-1]).astype(np.float32)
+
+    # 4. Trim silence (tighter threshold)
+    yt, _ = librosa.effects.trim(y, top_db=25)
+    if len(yt) < sr // 4:
+        yt = y  # fallback: don't over-trim
+
+    # 5. Smart crop: find MAX_LEN window with highest mean RMS energy
+    if len(yt) > MAX_LEN:
+        step       = sr // 4  # 250ms steps
+        best_start = 0
+        best_rms   = -1.0
+        for s in range(0, len(yt) - MAX_LEN + 1, step):
+            rms = float(np.mean(yt[s:s + MAX_LEN] ** 2))
+            if rms > best_rms:
+                best_rms   = rms
+                best_start = s
+        yt = yt[best_start:best_start + MAX_LEN]
+    else:
+        yt = np.pad(yt, (0, MAX_LEN - len(yt)))
+
+    return np.clip(yt, -1.0, 1.0).astype(np.float32)
+
+
+# ─────────────────────────────────────────────────────────
+# DATASET — elite preprocessing + in-memory cache
 # ─────────────────────────────────────────────────────────
 class AudioDataset(Dataset):
     def __init__(self, df, path_map, augment=False, rare_classes=None):
@@ -195,6 +260,8 @@ class AudioDataset(Dataset):
         self.class_idx    = defaultdict(list)
         for i, row in self.df.iterrows():
             self.class_idx[int(row["lid"])].append(i)
+        # In-memory preprocessing cache: runs once per file, reused every epoch
+        self._cache: dict = {}  # fname → preprocessed np.float32 [MAX_LEN]
 
     def __len__(self): return len(self.df)
 
@@ -202,16 +269,14 @@ class AudioDataset(Dataset):
         row   = self.df.iloc[idx]
         fname = Path(row["audio_relpath"]).name
         if fname not in self.path_map: return None, None
+        # Return cached preprocessed audio if available
+        if fname in self._cache:
+            return self._cache[fname].copy(), int(row["lid"])
         try:
-            wav, _ = librosa.load(self.path_map[fname], sr=SR)
-            yt, _  = librosa.effects.trim(wav, top_db=30)
-            if len(yt) < SR // 2: return None, None
-            if len(yt) > MAX_LEN:
-                s  = random.randint(0, len(yt) - MAX_LEN) if self.augment else 0
-                yt = yt[s:s + MAX_LEN]
-            else:
-                yt = np.pad(yt, (0, MAX_LEN - len(yt)))
-            return yt, int(row["lid"])
+            raw, _ = librosa.load(self.path_map[fname], sr=SR)
+            yt     = elite_preprocess(raw, SR)   # full elite pipeline
+            self._cache[fname] = yt              # cache for all future epochs
+            return yt.copy(), int(row["lid"])
         except Exception:
             return None, None
 
