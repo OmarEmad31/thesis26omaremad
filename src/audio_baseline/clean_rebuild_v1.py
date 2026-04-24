@@ -140,6 +140,34 @@ def build_audio_manifest(colab_root, train_csv, val_csv, output_path):
     return df
 
 # ─────────────────────────────────────────────────────────
+# STAGE 1.5: SPEAKER-INDEPENDENT SPLIT
+# ─────────────────────────────────────────────────────────
+
+def create_speaker_independent_split(df, test_size=0.2):
+    print("\n⚖️ [STAGE 1.5] Creating Speaker-Independent Split...")
+    
+    # Use 'speaker' if 'speaker_identity' is NaN
+    df['speaker_id_clean'] = df['speaker_identity']
+    df.loc[df['speaker_id_clean'].isna(), 'speaker_id_clean'] = df['speaker']
+    df['speaker_id_clean'] = df['speaker_id_clean'].astype(str)
+    
+    speakers = sorted(df['speaker_id_clean'].unique())
+    random.shuffle(speakers)
+    
+    # Simple split: 20% of speakers go to VAL
+    split_idx = int(len(speakers) * (1 - test_size))
+    train_speakers = set(speakers[:split_idx])
+    val_speakers = set(speakers[split_idx:])
+    
+    df['split'] = df['speaker_id_clean'].apply(lambda s: 'train' if s in train_speakers else 'val')
+    
+    print(f"  Total Speakers: {len(speakers)}")
+    print(f"  Train: {len(train_speakers)} speakers, {len(df[df['split']=='train'])} samples")
+    print(f"  Val: {len(val_speakers)} speakers, {len(df[df['split']=='val'])} samples")
+    
+    return df
+
+# ─────────────────────────────────────────────────────────
 # STAGE 2: AUDIO AUDIT
 # ─────────────────────────────────────────────────────────
 
