@@ -1,218 +1,428 @@
 """
-HArnESS-Colab-Titan-SOTA.
-Implementation: WavLM-Large-Robust + WLP + SupCon.
-This script is designed to be LOCAL in your project but 100% compatible with Google Colab.
+Colab Titan SOTA — The Top-Layer Execution
+============================================================
+This script executes the User's explicit intuition:
+The phonetic/lexical boundary layers heavily bias WavLM towards English, 
+causing Catastrophic Forgetting when fine-tuning Egyptian Arabic.
+
+This script completely permanently freezes Layers 0-7 (Feature Extraction),
+and exclusively unlocks Semantic Layers 8, 9, 10, and 11.
 """
+import os, sys, subprocess, zipfile, math, random
+from collections import defaultdict
 
-import os, sys, random, subprocess
-from pathlib import Path
+def install_deps():
+    try:
+        import audiomentations, peft, transformers
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install",
+                               "audiomentations", "peft", "transformers", "-q"])
 
-# --- STEP 1: ENVIRONMENT & AUTO-INSTALL ---
-IS_COLAB = 'google.colab' in sys.modules or os.path.exists('/content')
+if "google.colab" in sys.modules or os.path.exists("/content"):
+    install_deps()
 
-if IS_COLAB:
-    print("[INIT] Colab Detected. Installing SOTA dependencies...")
-    subprocess.run(["pip", "install", "-q", "transformers==4.48.3", "audiomentations", "librosa", "accelerate", "pyloudnorm", "peft"])
-    DRIVE_ZIP = "/content/drive/MyDrive/Thesis Project/Thesis_Audio_Full.zip"
-    if os.path.exists(DRIVE_ZIP) and not os.path.exists("/content/dataset"):
-        print(f"[INIT] Extracting {DRIVE_ZIP}...")
-        import zipfile
-        with zipfile.ZipFile(DRIVE_ZIP, 'r') as z: z.extractall('/content/')
-
-# --- STEP 2: HEAVY IMPORTS ---
-import pandas as pd
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import librosa
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from transformers import WavLMModel, get_cosine_schedule_with_warmup
-from sklearn.metrics import accuracy_score, f1_score
-from tqdm import tqdm
-from audiomentations import Compose, AddGaussianNoise, PitchShift, TimeStretch
+import torch, torch.nn as nn, torch.nn.functional as F
 from torch.amp import GradScaler, autocast
-
-# --- STEP 3: TITAN ARCHITECTURE ---
+from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.optim.swa_utils import AveragedModel
+import pandas as pd, numpy as np, librosa
+from pathlib import Path
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, f1_score
+from transformers import WavLMModel, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model
+from audiomentations import Compose, AddGaussianNoise, PitchShift
 
-class TitanAudioSER(nn.Module):
-    def __init__(self, num_labels, model_name="microsoft/wavlm-large"):
+# ─────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────
+SR             = 16000
+MAX_LEN        = 80000        
+K_PER_CLASS    = 2            
+NUM_CLASSES    = 7
+BATCH_SIZE     = K_PER_CLASS * NUM_CLASSES   # 14
+BATCH_FROZEN   = 32           
+PHASE1_EPOCHS  = 4
+PHASE2_EPOCHS  = 26
+SWA_START      = 18
+FOCAL_GAMMA    = 2.0
+SUPCON_TEMP    = 0.07
+SUPCON_WEIGHT  = 0.4          
+RARE_THRESHOLD = 50           
+MODEL_NAME     = "microsoft/wavlm-base-plus" 
+
+# ─────────────────────────────────────────────────────────
+# BALANCED BATCH SAMPLER
+# ─────────────────────────────────────────────────────────
+class BalancedBatchSampler(Sampler):
+    def __init__(self, labels, k=K_PER_CLASS):
+        self.k = k
+        self.class_indices = defaultdict(list)
+        for i, lbl in enumerate(labels):
+            self.class_indices[int(lbl)].append(i)
+        self.classes   = sorted(self.class_indices.keys())
+        self.n_batches = min(len(v) for v in self.class_indices.values()) // k
+
+    def __iter__(self):
+        pools = {c: random.sample(idxs, len(idxs))
+                 for c, idxs in self.class_indices.items()}
+        ptrs  = {c: 0 for c in self.classes}
+        for _ in range(self.n_batches):
+            batch = []
+            for c in self.classes:
+                batch.extend(pools[c][ptrs[c]: ptrs[c] + self.k])
+                ptrs[c] += self.k
+            random.shuffle(batch)
+            yield batch
+    def __len__(self): return self.n_batches
+
+# ─────────────────────────────────────────────────────────
+# LOSSES
+# ─────────────────────────────────────────────────────────
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0):
         super().__init__()
-        base_model = WavLMModel.from_pretrained(model_name, output_hidden_states=True)
-        
-        # LoRA Configuration for SER
-        peft_config = LoraConfig(
-            r=16, lora_alpha=32,
+        self.gamma = gamma
+
+    def forward(self, logits, labels):
+        ce  = F.cross_entropy(logits, labels, reduction="none")
+        p_t = torch.exp(-ce)
+        return (((1 - p_t) ** self.gamma) * ce).mean()
+
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=SUPCON_TEMP):
+        super().__init__()
+        self.temp = temperature
+
+    def forward(self, features, labels):
+        device = features.device
+        B = features.shape[0]
+        labels = labels.contiguous().view(-1, 1)
+        mask   = torch.eq(labels, labels.T).float().to(device)
+
+        sim = torch.matmul(features, features.T) / self.temp
+        sim_max, _ = torch.max(sim, dim=1, keepdim=True)
+        sim = sim - sim_max.detach()
+
+        self_mask = torch.scatter(torch.ones_like(mask), 1,
+                                  torch.arange(B).view(-1, 1).to(device), 0)
+        mask = mask * self_mask
+        exp_sim = torch.exp(sim) * self_mask
+        log_prob = sim - torch.log(exp_sim.sum(1, keepdim=True) + 1e-6)
+        mean_log_pos = (mask * log_prob).sum(1) / (mask.sum(1).clamp(min=1))
+        loss = -mean_log_pos.mean()
+        return loss if not torch.isnan(loss) else torch.tensor(0.0, device=device)
+
+class AttentionPool(nn.Module):
+    def __init__(self, d=768):
+        super().__init__()
+        self.attn = nn.Linear(d, 1)
+
+    def forward(self, x):                   
+        w = F.softmax(self.attn(x), dim=1)  
+        return (x * w).sum(dim=1)           
+
+# ─────────────────────────────────────────────────────────
+# MODEL (Top-Layer Specific Architecture)
+# ─────────────────────────────────────────────────────────
+class ColabTitanSER(nn.Module):
+    def __init__(self, num_labels):
+        super().__init__()
+        base = WavLMModel.from_pretrained(MODEL_NAME, output_hidden_states=True)
+        cfg  = LoraConfig(
+            r=8, lora_alpha=16,
             target_modules=["q_proj", "v_proj"],
             lora_dropout=0.05, bias="none"
         )
-        self.wavlm = get_peft_model(base_model, peft_config)
-        self.wavlm.gradient_checkpointing_enable() 
-        
-        self.layer_weights = nn.Parameter(torch.ones(25)) 
+        self.wavlm = get_peft_model(base, cfg)
+
+        self.layer_weights = nn.Parameter(torch.ones(6))
+        self.attn_pool = AttentionPool(768)
+        nn.init.zeros_(self.attn_pool.attn.weight)
+        nn.init.zeros_(self.attn_pool.attn.bias)
+
+        self.proj_head = nn.Sequential(nn.Linear(768, 256), nn.ReLU(), nn.Linear(256, 128))
         self.classifier = nn.Sequential(
-            nn.Linear(1024, 768), nn.BatchNorm1d(768), nn.ReLU(), nn.Dropout(0.4),
-            nn.Linear(768, 512), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(768 + 4, 512),
+            nn.LayerNorm(512), nn.GELU(), nn.Dropout(0.3),
             nn.Linear(512, num_labels)
         )
-        self.projector = nn.Sequential(nn.Linear(1024, 512), nn.ReLU(), nn.Linear(512, 256))
 
-    def spec_augment(self, x):
-        if not self.training: return x
-        # x: (batch, seq, 1024)
-        b, s, f = x.shape
-        # Frequency masking (1-2 bands)
-        for _ in range(random.randint(1, 2)):
-            w = random.randint(20, 50)
-            st = random.randint(0, f - w)
-            x[:, :, st:st+w] = 0
-        # Time masking (1 segment)
-        w = random.randint(20, 40)
-        st = random.randint(0, s - w)
-        x[:, st:st+w, :] = 0
-        return x
+    def freeze_all(self):
+        for p in self.wavlm.parameters(): p.requires_grad = False
 
-    def forward(self, wav, mask):
-        wav = (wav - wav.mean(dim=-1, keepdim=True)) / (wav.std(dim=-1, keepdim=True) + 1e-6)
-        outputs = self.wavlm(wav, attention_mask=mask)
-        hidden_states = torch.stack(outputs.hidden_states, dim=0)
-        w = F.softmax(self.layer_weights, dim=0).view(-1, 1, 1, 1)
-        weighted_hidden = (hidden_states * w).sum(dim=0)
+    def unfreeze_top_layers(self, layer_indices=[8, 9, 10, 11]):
+        """Mathematically enforces the vault on Layers 0-7, and only unfreezes semantic Top Layers."""
+        for n, p in self.wavlm.named_parameters():
+            if "lora_" in n and ".layers." in n:
+                try:
+                    parts = n.split('.')
+                    layer_idx = int(parts[parts.index('layers') + 1])
+                    if layer_idx in layer_indices:
+                        p.requires_grad = True
+                except: pass
+
+    def forward(self, wav, prosody, mode="both"):
+        wav  = (wav - wav.mean(-1, keepdim=True)) / (wav.std(-1, keepdim=True) + 1e-6)
+        mask = torch.ones(wav.shape[:2], device=wav.device)
+        out  = self.wavlm(wav, attention_mask=mask, output_hidden_states=True)
+
+        hidden_states = out.hidden_states[-6:]               
+        w = F.softmax(self.layer_weights, dim=0)
+        weighted = sum(w[i] * hidden_states[i] for i in range(6))  
+
+        pooled = self.attn_pool(weighted)
+        proj = F.normalize(self.proj_head(pooled), dim=-1)
+        logits = self.classifier(torch.cat([pooled, prosody], dim=-1))
         
-        # Apply SOTA SpecAugment on hidden features
-        weighted_hidden = self.spec_augment(weighted_hidden)
-        
-        mask_exp = mask[:, ::320][:, :weighted_hidden.shape[1]].unsqueeze(-1).expand(weighted_hidden.size()).float()
-        pooled = torch.sum(weighted_hidden * mask_exp, 1) / torch.clamp(mask_exp.sum(1), min=1e-9)
-        return self.classifier(pooled), F.normalize(self.projector(pooled), p=2, dim=1)
+        if mode == "both": return logits, proj
+        if mode == "classify": return logits
+        return logits, proj
 
-class SupConLoss(nn.Module):
-    def __init__(self, t=0.15): # Warmed up temperature for stability
-        super().__init__(); self.t = t
-    def forward(self, z, l):
-        mask = torch.eq(l.view(-1,1), l.view(-1,1).T).float().to(z.device)
-        logits = torch.div(torch.matmul(z, z.T), self.t)
-        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
-        logits = logits - logits_max.detach()
-        exp = torch.exp(logits) * (1 - torch.eye(z.shape[0]).to(z.device))
-        log_prob = logits - torch.log(exp.sum(1, keepdim=True) + 1e-6)
-        return -(mask * log_prob).sum(1).mean()
+# ─────────────────────────────────────────────────────────
+# DATASET
+# ─────────────────────────────────────────────────────────
+def extract_prosody(y: np.ndarray) -> np.ndarray:
+    rms = float(np.mean(librosa.feature.rms(y=y)))
+    zcr = float(np.mean(librosa.feature.zero_crossing_rate(y=y)))
+    f0  = librosa.yin(y, fmin=65, fmax=2093)
+    f0m = float(np.nanmean(f0)) / 500.0
+    f0s = float(np.nanstd(f0))  / 100.0
+    vec = np.array([rms, zcr, f0m, f0s], dtype=np.float32)
+    return np.clip(np.nan_to_num(vec, nan=0.0, posinf=1.0, neginf=-1.0), -10, 10)
 
-class TitanDataset(Dataset):
-    def __init__(self, df, audio_dir, augment=False):
-        self.df = df
-        self.audio_dir = Path(audio_dir)
-        self.max_len = 160000 
-        self.aug = Compose([
-            AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.3),
-            PitchShift(min_semitones=-1, max_semitones=1, p=0.4),
-            TimeStretch(min_rate=0.92, max_rate=1.08, p=0.3)
-        ]) if augment else None
-        
-        print(f"[INIT] Scanning {audio_dir} for audio files...")
-        self.path_map = {f.name: f for f in self.audio_dir.rglob("*.wav")}
-        print(f"[INIT] Found {len(self.path_map)} valid audio files.")
+class AudioDataset(Dataset):
+    def __init__(self, df, path_map, augment=False, rare_classes=None):
+        self.df          = df.reset_index(drop=True)
+        self.path_map    = path_map
+        self.augment     = augment
+        self.rare_classes = set(rare_classes or [])
+        self.aug_pipe    = Compose([AddGaussianNoise(p=0.35), PitchShift(p=0.35)])
+        self.class_idx   = defaultdict(list)
+        for i, row in self.df.iterrows():
+            self.class_idx[int(row["lid"])].append(i)
 
     def __len__(self): return len(self.df)
 
+    def _load_audio(self, idx):
+        row   = self.df.iloc[idx]
+        fname = Path(row["audio_relpath"]).name
+        if fname not in self.path_map: return None, None
+        try:
+            wav, _ = librosa.load(self.path_map[fname], sr=SR)
+            # Safe Pre-processing
+            yt, _  = librosa.effects.trim(wav, top_db=30)
+            if len(yt) < SR // 2: return None, None
+            if len(yt) > MAX_LEN:
+                s  = random.randint(0, len(yt) - MAX_LEN) if self.augment else 0
+                yt = yt[s:s + MAX_LEN]
+            else:
+                yt = np.pad(yt, (0, MAX_LEN - len(yt)))
+            return yt, int(row["lid"])
+        except Exception:
+            return None, None
+
+    def _load(self, idx):
+        yt, lid = self._load_audio(idx)
+        if yt is None: return None
+        try:
+            if self.augment and lid in self.rare_classes and random.random() < 0.5:
+                peer_idx = random.choice(self.class_idx[lid])
+                yt2, _   = self._load_audio(peer_idx)
+                if yt2 is not None:
+                    alpha = np.random.beta(0.4, 0.4)
+                    yt    = alpha * yt + (1 - alpha) * yt2
+
+            if self.augment:
+                T = len(yt); w = int(T * 0.15 * random.random())
+                if w > 0:
+                    s = random.randint(0, T - w)
+                    yt = yt.copy(); yt[s:s + w] = 0.0
+                yt = self.aug_pipe(samples=yt, sample_rate=SR)
+
+            return {
+                "wav":     torch.tensor(yt,                  dtype=torch.float32),
+                "prosody": torch.tensor(extract_prosody(yt), dtype=torch.float32),
+                "label":   torch.tensor(lid,                 dtype=torch.long),
+            }
+        except Exception: return None
+
     def __getitem__(self, idx):
         for _ in range(len(self.df)):
-            row = self.df.iloc[idx]
-            fname = Path(row["audio_relpath"]).name
-            if fname in self.path_map:
-                p = self.path_map[fname]
-                try:
-                    wav, _ = librosa.load(p, sr=16000)
-                    if self.aug: wav = self.aug(samples=wav, sample_rate=16000)
-                    mask = np.zeros(self.max_len, dtype=np.float32)
-                    if len(wav) > self.max_len: 
-                        wav = wav[:self.max_len]; mask[:] = 1.0
-                    else: 
-                        mask[:len(wav)] = 1.0; wav = np.pad(wav, (0, self.max_len - len(wav)))
-                    return {"wav": torch.tensor(wav), "mask": torch.tensor(mask), "label": torch.tensor(row["lid"])}
-                except Exception as e: pass
+            s = self._load(idx)
+            if s is not None: return s
             idx = (idx + 1) % len(self.df)
-        raise FileNotFoundError(f"Could not find any valid audio files in {self.audio_dir}")
+        raise FileNotFoundError("Could not load audio.")
 
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if IS_COLAB:
-        default_csv = Path("/content/drive/MyDrive/Thesis Project/data/processed/splits/text_hc")
-        if (default_csv / "train.csv").exists(): csv_dir = default_csv
-        else:
-            csv_dir = None
-            for root, dirs, files in os.walk('/content/drive/MyDrive'):
-                if "train.csv" in files and "text_hc" in root: csv_dir = Path(root); break
-            if not csv_dir: csv_dir = Path("/content")
-        print("[DEBUG] Locating audio dataset directory root...")
-        if os.path.exists("/content/dataset"): audio_dir = "/content/dataset"
-        elif os.path.exists("/content/Thesis Project/dataset"): audio_dir = "/content/Thesis Project/dataset"
-        else:
-            audio_dir = "/content"
-            for item in os.listdir('/content'):
-                item_path = os.path.join('/content', item)
-                if os.path.isdir(item_path) and item != 'drive' and item != 'sample_data':
-                    contains_wavs = False
-                    for root, dirs, files in os.walk(item_path):
-                        if any(f.endswith('.wav') for f in files): contains_wavs = True; break
-                    if contains_wavs: audio_dir = item_path; break
-    else:
-        csv_dir = Path("D:/Thesis Project/data/processed/splits/audio_eligible"); audio_dir = "D:/Thesis Project/dataset"
+def get_path_map(colab_root):
+    pm = {f.name: str(f) for f in colab_root.rglob("*.wav")}
+    if pm: return pm
+    zname = "Thesis_Audio_Full.zip"; zpath = None
+    for root, _, files in os.walk("/content/drive/MyDrive"):
+        if zname in files: zpath = os.path.join(root, zname); break
+    if not zpath: raise FileNotFoundError(f"{zname} not found.")
+    with zipfile.ZipFile(zpath) as z: z.extractall("/content/dataset")
+    pm = {f.name: str(f) for f in Path("/content/dataset").rglob("*.wav")}
+    return pm
 
-    if not (csv_dir / "train.csv").exists(): return
-
-    tr_df = pd.read_csv(csv_dir / "train.csv")
-    va_df = pd.read_csv(csv_dir / "val.csv")
-    te_df = pd.read_csv(csv_dir / "test.csv")
-    classes = sorted(tr_df["emotion_final"].unique()); lid = {l: i for i, l in enumerate(classes)}
-    for df in [tr_df, va_df, te_df]: df["lid"] = df["emotion_final"].map(lid)
-    
-    BATCH = 2; ACCUM = 8; EPOCHS = 20; ALPHA = 0.3
-    tr_loader = DataLoader(TitanDataset(tr_df, audio_dir, True), shuffle=True, batch_size=BATCH, num_workers=2, pin_memory=True)
-    va_loader = DataLoader(TitanDataset(va_df, audio_dir), batch_size=BATCH, num_workers=2)
-    te_loader = DataLoader(TitanDataset(te_df, audio_dir), batch_size=BATCH, num_workers=2)
-    
-    model = TitanAudioSER(len(classes)).to(device)
-    optimizer = torch.optim.AdamW([
-        {"params": model.wavlm.parameters(), "lr": 1e-5}, # Decelerated Backbone
-        {"params": [p for n, p in model.named_parameters() if "wavlm" not in n], "lr": 5e-4} # Decelerated Head
-    ], weight_decay=0.01)
-    
-    scheduler = get_cosine_schedule_with_warmup(optimizer, len(tr_loader), len(tr_loader)*EPOCHS)
-    l_ce = nn.CrossEntropyLoss(label_smoothing=0.15); l_sc = SupConLoss(); scaler = GradScaler('cuda')
-
-    print(f"[START] Training Stability Shield Titan. Temp=0.15, Augs=Active")
-    best_acc = 0
-    for ep in range(1, EPOCHS + 1):
-        model.train(); t_loss = 0; optimizer.zero_grad()
-        pbar = tqdm(tr_loader, desc=f"Epoch {ep}")
-        for b in pbar:
-            w, m, l = b["wav"].to(device), b["mask"].to(device), b["label"].to(device)
-            with autocast('cuda'):
-                logits, z = model(w, m)
-                loss = ((1-ALPHA)*l_ce(logits, l) + ALPHA*l_sc(z, l)) / ACCUM
-            scaler.scale(loss).backward()
-            if (pbar.n + 1) % ACCUM == 0:
-                scaler.step(optimizer); scaler.update(); scheduler.step(); optimizer.zero_grad()
-            t_loss += loss.item() * ACCUM
-            pbar.set_postfix({"loss": f"{t_loss/(pbar.n+1):.4f}"})
-        
-        va_acc, _ = evaluate(model, va_loader, device)
-        te_acc, _ = evaluate(model, te_loader, device)
-        print(f"Epoch {ep} | Val: {va_acc:.3f} | Test: {te_acc:.3f}")
-        if va_acc > best_acc:
-            best_acc = va_acc
-            torch.save(model.state_dict(), "titan_stability_shield.pt")
-            print("New Best Saved.")
-
-def evaluate(model, loader, device):
+def fast_eval(model, loader, device):
     model.eval(); ps, ts = [], []
     with torch.no_grad():
         for b in loader:
-            l, _ = model(b["wav"].to(device), b["mask"].to(device))
-            ps.extend(torch.argmax(l, 1).cpu().numpy()); ts.extend(b["label"].numpy())
-    return accuracy_score(ts, ps), f1_score(ts, ps, average="macro")
+            with autocast("cuda"):
+                logits = model(b["wav"].to(device), b["prosody"].to(device), mode="classify")
+            ps.extend(logits.argmax(1).cpu().numpy())
+            ts.extend(b["label"].numpy())
+    return accuracy_score(ts, ps), f1_score(ts, ps, average="macro", zero_division=0)
 
-if __name__ == "__main__":
-    main()
+def smart_eval(model, df, path_map, device, chunk=MAX_LEN, stride=SR, min_slide=5 * SR):
+    model.eval(); preds, truths = [], []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Eval", leave=False):
+        fname = Path(row["audio_relpath"]).name
+        if fname not in path_map: continue
+        try:
+            wav, _ = librosa.load(path_map[fname], sr=SR)
+            yt, _  = librosa.effects.trim(wav, top_db=30)
+            if len(yt) < SR // 2: continue
+            if len(yt) > min_slide:
+                logits_list = []
+                for start in range(0, len(yt) - chunk + 1, stride):
+                    seg = yt[start:start + chunk]
+                    p   = extract_prosody(seg)
+                    with torch.no_grad(), autocast("cuda"):
+                        l = model(torch.tensor(seg).unsqueeze(0).to(device),
+                                  torch.tensor(p).unsqueeze(0).to(device), mode="classify")
+                    logits_list.append(F.softmax(l, dim=-1))
+                pred = torch.stack(logits_list).mean(0).argmax(1).item()
+            else:
+                seg  = yt[:chunk] if len(yt) >= chunk else np.pad(yt, (0, chunk - len(yt)))
+                p    = extract_prosody(seg)
+                with torch.no_grad(), autocast("cuda"):
+                    l = model(torch.tensor(seg).unsqueeze(0).to(device),
+                                  torch.tensor(p).unsqueeze(0).to(device), mode="classify")
+                pred = l.argmax(1).item()
+            preds.append(pred); truths.append(int(row["lid"]))
+        except Exception: pass
+    return accuracy_score(truths, preds), f1_score(truths, preds, average="macro", zero_division=0)
+
+# ─────────────────────────────────────────────────────────
+# TRAINING
+# ─────────────────────────────────────────────────────────
+def train():
+    device     = "cuda"
+    colab_root = Path("/content/drive/MyDrive/Thesis Project")
+    csv_p      = colab_root / "data/processed/splits/audio_hc"
+    save_path  = colab_root / "colab_titan_best.pt"
+
+    path_map = get_path_map(colab_root)
+    tr_df = pd.read_csv(csv_p / "train.csv")
+    va_df = pd.read_csv(csv_p / "val.csv")
+    lid   = {l: i for i, l in enumerate(sorted(tr_df["emotion_final"].unique()))}
+    tr_df["lid"] = tr_df["emotion_final"].map(lid)
+    va_df["lid"] = va_df["emotion_final"].map(lid)
+
+    class_counts = tr_df["emotion_final"].value_counts()
+    rare_label_names = set(class_counts[class_counts < RARE_THRESHOLD].index)
+    rare_lids = {lid[l] for l in rare_label_names if l in lid}
+
+    print("\n🧠 INITIALIZING COLAB TITAN ARCHITECTURE (Top-Layer Strategy)")
+    tr_ds = AudioDataset(tr_df, path_map, augment=True,  rare_classes=rare_lids)
+    va_ds = AudioDataset(va_df, path_map, augment=False, rare_classes=None)
+
+    def make_sampler(): return BalancedBatchSampler(tr_df["lid"].values, k=K_PER_CLASS)
+    bal_sampler = make_sampler()
+
+    tr_loader = DataLoader(tr_ds, batch_sampler=bal_sampler, num_workers=0)
+    va_loader = DataLoader(va_ds, batch_size=16, num_workers=0)
+    tr_frozen = DataLoader(tr_ds, batch_size=BATCH_FROZEN, shuffle=True, drop_last=True, num_workers=0)
+
+    model     = ColabTitanSER(num_labels=len(lid)).to(device)
+    swa_model = AveragedModel(model)
+    focal     = FocalLoss(gamma=FOCAL_GAMMA)
+    supcon    = SupConLoss(temperature=SUPCON_TEMP)
+    scaler    = GradScaler("cuda")
+    best_acc  = 0.0; swa_active = False
+
+    # PHASE 1 — FROZEN
+    print(f"\n🧊 PHASE 1 — Head Warmup (Completely Locked Backbone)")
+    model.freeze_all()
+    p1_params = [p for p in model.parameters() if p.requires_grad]
+    opt1 = torch.optim.AdamW(p1_params, lr=1e-3, weight_decay=0.01)
+    sch1 = get_cosine_schedule_with_warmup(opt1, 0, len(tr_frozen) * PHASE1_EPOCHS)
+
+    for ep in range(1, PHASE1_EPOCHS + 1):
+        model.train(); ep_loss = 0.0
+        for b in tqdm(tr_frozen, desc=f"Ph1 Ep{ep:02d}", leave=False):
+            with autocast("cuda"):
+                logits, _ = model(b["wav"].to(device), b["prosody"].to(device))
+                loss = focal(logits, b["label"].to(device))
+            opt1.zero_grad(); scaler.scale(loss).backward()
+            scaler.unscale_(opt1); nn.utils.clip_grad_norm_(p1_params, 1.0)
+            scaler.step(opt1); scaler.update(); sch1.step()
+            ep_loss += loss.item()
+        acc, f1 = fast_eval(model, va_loader, device)
+        print(f"Ph1 Ep {ep:02d} | Loss {ep_loss/len(tr_frozen):.3f} | Val Acc {acc:.3f} | Macro F1 {f1:.3f}")
+
+    # PHASE 2 — TOP LAYER EXCLUSIVE
+    print(f"\n🔥 PHASE 2 — Top-Layer Execution (Layers 0-7 Vaulted forever)")
+    # ONLY top layers are opened.
+    model.unfreeze_top_layers([8, 9, 10, 11])
+    
+    lora_top = [p for n, p in model.wavlm.named_parameters() if "lora_" in n and ".layers." in n and int(n.split('.')[n.split('.').index('layers')+1]) >= 8]
+
+    opt2 = torch.optim.AdamW([
+        {"params": lora_top, "lr": 5e-4},
+        {"params": [model.layer_weights], "lr": 1e-3},
+        {"params": list(model.attn_pool.parameters()) + list(model.proj_head.parameters()) + list(model.classifier.parameters()), "lr": 2e-5},
+    ], weight_decay=0.01)
+    
+    sch2 = get_cosine_schedule_with_warmup(opt2, len(bal_sampler) * 2, len(bal_sampler) * PHASE2_EPOCHS)
+
+    for ep in range(1, PHASE2_EPOCHS + 1):
+        bal_sampler = make_sampler()
+        tr_loader   = DataLoader(tr_ds, batch_sampler=bal_sampler, num_workers=0)
+        model.train(); ep_loss = 0.0
+        
+        for b in tqdm(tr_loader, desc=f"Ph2 Ep{ep:02d}", leave=False):
+            w = b["wav"].to(device); p = b["prosody"].to(device)
+            l = b["label"].to(device)
+            with autocast("cuda"):
+                logits, proj = model(w, p, mode="both")
+                loss = (1 - SUPCON_WEIGHT) * focal(logits, l) + SUPCON_WEIGHT * supcon(proj, l)
+            opt2.zero_grad(); scaler.scale(loss).backward()
+            scaler.unscale_(opt2); nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt2); scaler.update(); sch2.step()
+            ep_loss += loss.item()
+
+        if ep >= SWA_START:
+            swa_model.update_parameters(model); swa_active = True
+
+        acc, f1 = fast_eval(model, va_loader, device)
+        tag = ""
+        # Tracking F1 for stability, but we use Acc for benchmark legacy
+        if acc > best_acc:
+            best_acc = acc
+            torch.save(model.state_dict(), save_path); tag = "  *** BEST ACC ***"
+        print(f"Ph2 Ep {ep:02d} | Loss {ep_loss/len(bal_sampler):.3f} | Val Acc {acc:.3f} | F1 {f1:.3f}{tag}")
+
+    if swa_active:
+        swa_model.train()
+        with torch.no_grad():
+            for b in tqdm(tr_loader, desc="SWA BN", leave=False):
+                with autocast("cuda"): swa_model(b["wav"].to(device), b["prosody"].to(device), mode="both")
+        swa_acc, swa_f1 = fast_eval(swa_model, va_loader, device)
+        if swa_acc > best_acc:
+            best_acc = swa_acc; torch.save(swa_model.state_dict(), save_path)
+    
+    print("\n[EVAL] Smart sliding-window evaluation on Top-Layer Model...")
+    model.load_state_dict(torch.load(save_path, map_location=device))
+    swe_acc, swe_f1 = smart_eval(model, va_df, path_map, device)
+
+    print(f"\n=======================================================")
+    print(f"  FINAL COLAB TITAN RESULTS (Top-Layer Vault)")
+    print(f"  Best Single-Crop Val Acc : {best_acc:.3f}")
+    print(f"  Smart Eval Val Acc       : {swe_acc:.3f}")
+    print(f"  Smart Eval  Val F1       : {swe_f1:.3f}")
+    print(f"=======================================================")
+
+if __name__ == "__main__": train()
