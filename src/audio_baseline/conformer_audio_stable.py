@@ -41,16 +41,16 @@ from audiomentations import Compose, AddGaussianNoise, PitchShift
 # CONFIG
 # ─────────────────────────────────────────────────────────
 SR             = 16000
-MAX_LEN        = 48000        # 3-second window (standard SER, T²-safe for WavLM-Large on T4)
+MAX_LEN        = 80000        # 5-second window (safe for Base-Plus on T4)
 K_PER_CLASS    = 2            # samples per class per batch
 NUM_CLASSES    = 7
 BATCH_SIZE     = K_PER_CLASS * NUM_CLASSES   # = 14
-BATCH_FROZEN   = 8            # Phase 1: small to avoid OOM with WavLM-Large 24-layer attention
+BATCH_FROZEN   = 32           # Phase 1: Base-Plus is small enough
 PHASE1_EPOCHS  = 4
 PHASE2_EPOCHS  = 26
 SWA_START      = 18
 FOCAL_GAMMA    = 2.0
-MODEL_NAME     = "microsoft/wavlm-large"     # 1024-dim, 24 layers
+MODEL_NAME     = "microsoft/wavlm-base-plus"  # 94M params, 768-dim, 12 layers — fits T4
 
 
 # ─────────────────────────────────────────────────────────
@@ -114,7 +114,7 @@ class WavLMLargeSER(nn.Module):
         # NO gradient_checkpointing
 
         self.classifier = nn.Sequential(
-            nn.Linear(1024 + 4, 512),
+            nn.Linear(768 + 4, 512),
             nn.LayerNorm(512), nn.GELU(), nn.Dropout(0.3),
             nn.Linear(512, num_labels)
         )
