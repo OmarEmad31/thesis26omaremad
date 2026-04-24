@@ -274,13 +274,13 @@ class MaskedPooling(nn.Module):
             
         elif self.mode == "attention":
             logits = self.attn(x) # [B, T, 1]
-            logits = logits.masked_fill(mask == 0, -1e9)
+            logits = logits.masked_fill(mask == 0, -30000)
             weights = F.softmax(logits, dim=1)
             return (x * weights).sum(dim=1)
             
         elif self.mode == "attentive_stats":
             logits = self.attn(x)
-            logits = logits.masked_fill(mask == 0, -1e9)
+            logits = logits.masked_fill(mask == 0, -30000)
             weights = F.softmax(logits, dim=1)
             mu = (x * weights).sum(dim=1)
             var = (((x - mu.unsqueeze(1))**2) * weights).sum(dim=1)
