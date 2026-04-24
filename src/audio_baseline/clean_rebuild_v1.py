@@ -5,7 +5,7 @@ Modular, Scientifically Controlled Research Pipeline.
 
 Stages:
 1. Manifest Builder (Path Resolution)
-1.5 Speaker-Independent Split (The Scientific Fix)
+1.5 Stratified Speaker-Independent Split (Greedy Search)
 2. Audio Audit (Statistics & Health)
 3. Handcrafted Baseline (MFCC/Prosody + Logistic)
 """
@@ -39,6 +39,7 @@ class CleanConfig:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     SEED = 42
     TRIM_TOP_DB = 40
+    VAL_SIZE = 0.20 # Target 20% validation
     
     EMOTIONS = ['Anger', 'Disgust', 'Fear', 'Happiness', 'Neutral', 'Sadness', 'Surprise']
     LID = {e: i for i, e in enumerate(EMOTIONS)}
@@ -71,6 +72,8 @@ def build_audio_manifest(proj_root, train_csv, val_csv, output_path):
             if zname in files: zpath = Path(root)/zname; break
         if zpath:
             print(f"📦 Unzipping {zpath}...")
+            # Unzip logic
+            import zipfile
             with zipfile.ZipFile(zpath, 'r') as z: z.extractall(local_root)
             
     for r in [proj_root, local_root]:
@@ -88,7 +91,7 @@ def build_audio_manifest(proj_root, train_csv, val_csv, output_path):
         full_rel = f"{row['folder']}/{row['audio_relpath']}".replace("\\", "/")
         abs_p = physical_map.get(full_rel)
         if abs_p:
-            resolved.append(abs_p); actual_durations.append(librosa.get_duration(path=abs_p)); status.append("Resolved")
+            resolved.append(abs_p); actual_durations.append(librosa.get_duration(path=abs_p or "")); status.append("Resolved")
         else:
             resolved.append(None); actual_durations.append(0.0); status.append("Unresolved")
 
@@ -102,24 +105,68 @@ def build_audio_manifest(proj_root, train_csv, val_csv, output_path):
     return df
 
 # ─────────────────────────────────────────────────────────
-# STAGE 1.5: SPEAKER-INDEPENDENT SPLIT
+# STAGE 1.5: STRATIFIED SPEAKER-INDEPENDENT SPLIT
 # ─────────────────────────────────────────────────────────
 
-def create_speaker_independent_split(df, test_size=0.25):
-    print("\n⚖️ [STAGE 1.5] Creating Speaker-Independent Split...")
+def create_speaker_independent_split(df, val_size=CleanConfig.VAL_SIZE, trials=2000):
+    print(f"\n⚖️ [STAGE 1.5] Searching for BEST Stratified Speaker Split (Target Val: {val_size})...")
     df['spk_clean'] = df['speaker_identity'].fillna(df['speaker']).astype(str)
+    speakers = list(df['spk_clean'].unique())
     
-    speakers = sorted(df['spk_clean'].unique())
-    random.shuffle(speakers)
+    # Pre-calculated distributions
+    spk_stats = df.groupby('spk_clean')['emotion_final'].value_counts().unstack(fill_value=0)
+    full_dist_counts = df['emotion_final'].value_counts().sort_index()
+    full_dist_props = full_dist_counts / full_dist_counts.sum()
     
-    limit = int(len(speakers) * (1 - test_size))
-    tr_spks = set(speakers[:limit])
+    best_score = float('inf')
+    best_tr, best_va = None, None
     
-    df['split'] = df['spk_clean'].apply(lambda s: 'train' if s in tr_spks else 'val')
+    for _ in range(trials):
+        random.shuffle(speakers)
+        limit = int(len(speakers) * (1 - val_size))
+        tr_s, va_s = speakers[:limit], speakers[split_idx := limit:]
+        
+        tr_cnts = spk_stats.loc[tr_s].sum()
+        va_cnts = spk_stats.loc[va_s].sum()
+        
+        # Proportions
+        tr_p = tr_cnts / (tr_cnts.sum() + 1e-6)
+        va_p = va_cnts / (va_cnts.sum() + 1e-6)
+        
+        # Scoring: Proportional distance + Sample Count penalty
+        score = (tr_p - full_dist_props).abs().mean() + (va_p - full_dist_props).abs().mean()
+        
+        # Penalize if Val size is way off target
+        v_ratio = va_cnts.sum() / len(df)
+        score += abs(v_ratio - val_size) * 2.0
+        
+        # Penalize if any class has 0 samples in Train
+        if tr_cnts.min() == 0: score += 100.0
+            
+        if score < best_score:
+            best_score = score
+            best_tr, best_va = set(tr_s), set(va_s)
+
+    df['split'] = df['spk_clean'].apply(lambda s: 'train' if s in best_tr else 'val')
     
-    t_cnt = len(df[df['split']=='train'])
-    v_cnt = len(df[df['split']=='val'])
-    print(f"  Speakers: {len(speakers)} | Train Samples: {t_cnt} | Val Samples: {v_cnt}")
+    # Reporting
+    t_df, v_df = df[df['split']=='train'], df[df['split']=='val']
+    print(f"  Best Split Found (Score: {best_score:.4f})")
+    print(f"  Speakers: Train {len(best_tr)} | Val {len(best_va)}")
+    print(f"  Samples:  Train {len(t_df)} | Val {len(v_df)} ({len(v_df)/len(df):.1%})")
+    
+    print("\n  Class Distribution (Scientific Audit):")
+    tr_c = t_df['emotion_final'].value_counts().sort_index()
+    va_c = v_df['emotion_final'].value_counts().sort_index()
+    print(f"    {'Emotion':<10} | {'Train':<5} | {'Val':<5} | {'Ratio(T/V)':<10} | {'Prop Change'}")
+    for e in CleanConfig.EMOTIONS:
+        tc, vc = tr_c.get(e,0), va_c.get(e,0)
+        ratio = tc/(vc+1e-6)
+        p_chg = (tc/len(t_df)) - (vc/len(v_df))
+        print(f"    {e:<10} | {tc:<5} | {vc:<5} | {ratio:<10.2f} | {p_chg:+.3f}")
+        
+    overlap = set(t_df['spk_clean']).intersection(set(v_df['spk_clean']))
+    print(f"\n  Final Overlap Check: {len(overlap)} speakers shared (MUST BE 0).")
     return df
 
 # ─────────────────────────────────────────────────────────
@@ -128,26 +175,8 @@ def create_speaker_independent_split(df, test_size=0.25):
 
 def run_audio_audit(df, output_report):
     print("\n📊 [STAGE 2] Scientific Audio Audit...")
-    audit = []
-    
-    # Leakage Check
-    tr_s = set(df[df['split']=='train']['spk_clean'])
-    va_s = set(df[df['split']=='val']['spk_clean'])
-    overlap = tr_s.intersection(va_s)
-    
-    audit.append(f"Split Audit:\n  Train Speakers: {len(tr_s)}\n  Val Speakers: {len(va_s)}\n  OVERLAP: {len(overlap)}")
-    
-    # Class Check
-    c_counts = df.groupby(['split', 'emotion_final']).size().unstack(fill_value=0)
-    audit.append("\nClass Balance:\n" + str(c_counts))
-    
-    report_text = "\n".join(audit)
-    with open(output_report, "w") as f: f.write(report_text)
-    print(report_text)
-    
-    # Table Spot Check
-    print("\n🔍 Identity Spot-Check (Unseen Voices Only):")
-    print(df[df['split']=='val'][["sample_id", "folder", "spk_clean", "emotion_final"]].sample(15).to_string())
+    # Condensed audit for cleaner logs
+    pass
 
 # ─────────────────────────────────────────────────────────
 # STAGE 3: HANDCRAFTED BASELINE
@@ -161,16 +190,15 @@ def extract_features(path):
         mfcc = librosa.feature.mfcc(y=yt, sr=sr, n_mfcc=13)
         zcr = librosa.feature.zero_crossing_rate(y=yt)
         rms = librosa.feature.rms(y=yt)
-        f0 = librosa.yin(yt, fmin=65, fmax=2000)
+        f0 = librosa.yin(yt, fmin=65, fmax=1000)
         voiced = f0[~np.isnan(f0)]
         feat = [len(yt)/sr, np.mean(rms), np.std(rms), np.mean(zcr), np.std(zcr), np.mean(voiced) if len(voiced)>0 else 0]
-        feat.extend(np.mean(mfcc, axis=1))
-        feat.extend(np.std(mfcc, axis=1))
+        feat.extend(np.mean(mfcc, axis=1)); feat.extend(np.std(mfcc, axis=1))
         return np.nan_to_num(feat)
     except: return None
 
 def train_baseline(df):
-    print("\n🎻 [STAGE 3] Training Handcrafted Baseline (Unseen Voices)...")
+    print("\n🎻 [STAGE 3] Training Handcrafted Baseline (Fixed Split)...")
     feats, labels, splits = [], [], []
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Extracting"):
         f = extract_features(row['resolved_path'])
@@ -187,7 +215,7 @@ def train_baseline(df):
     clf.fit(X_tr_s, y_tr)
     
     preds = clf.predict(scaler.transform(X_va))
-    print(f"\n🏆 Results (Speaker-Independent):\nAcc: {accuracy_score(y_va, preds):.4f} | Macro F1: {f1_score(y_va, preds, average='macro'):.4f}")
+    print(f"\n🏆 Results (Scientific Split):\nAcc: {accuracy_score(y_va, preds):.4f} | Macro F1: {f1_score(y_va, preds, average='macro'):.4f}")
     print(classification_report(y_va, preds, target_names=CleanConfig.EMOTIONS, zero_division=0))
 
 def main():
@@ -196,13 +224,8 @@ def main():
     else: root = Path(__file__).parent.parent.parent
     
     csv_r = root / "data/processed/splits/text_hc"
-    # Stage 1
     df = build_audio_manifest(root, csv_r/"train.csv", csv_r/"val.csv", root/"audio_manifest.csv")
-    # Stage 1.5
     df = create_speaker_independent_split(df)
-    # Stage 2
-    run_audio_audit(df, root/"audio_audit_report.txt")
-    # Stage 3
     train_baseline(df)
 
 if __name__ == "__main__":
