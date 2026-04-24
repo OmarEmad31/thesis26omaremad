@@ -1,8 +1,7 @@
 """
-Egyptian Arabic SER — TRACK A BEST VERSION (v64)
+Egyptian Arabic SER — TRACK A BEST VERSION (v65)
 ===============================================
-Reverted to the high-performance 59.6% configuration.
-Modality: Handcrafted + Multi-Layer WavLM Fusion.
+FIX: Returning to the exact 768-dim feature space that got 59.6%.
 """
 
 import os, sys, random, shutil
@@ -35,29 +34,30 @@ def extract_handcrafted(p):
     try:
         y, sr = librosa.load(p, sr=16000)
         yt, _ = librosa.effects.trim(y, top_db=40)
-        if len(yt)<100: return np.zeros(32)
+        if len(yt)<100: return np.zeros(35)
         mfcc = librosa.feature.mfcc(y=yt, sr=sr, n_mfcc=13)
         feat = [len(yt)/sr, np.mean(librosa.feature.rms(y=yt)), np.std(librosa.feature.rms(y=yt)), 
                 np.mean(librosa.feature.zero_crossing_rate(y=yt)), np.std(librosa.feature.zero_crossing_rate(y=yt)), 0]
         feat.extend(np.mean(mfcc, axis=1)); feat.extend(np.std(mfcc, axis=1))
         return np.nan_to_num(feat)
-    except: return np.zeros(32)
+    except: return np.zeros(35)
 
 @torch.no_grad()
-def extract_multilayer_wavlm(paths, model):
+def extract_lean_wavlm(paths, model):
     model.eval()
     embs = []
-    for p in tqdm(paths, desc="Extracting WavLM"):
+    for p in tqdm(paths, desc="Extracting Lean WavLM"):
         try:
             y, _ = librosa.load(p, sr=16000)
             if len(y)>80000: y = y[(len(y)-80000)//2 : (len(y)-80000)//2+80000]
             inp = torch.from_numpy(y).float().unsqueeze(0).to(TrackAConfig.DEVICE)
             out = model(inp, output_hidden_states=True).hidden_states
-            # Average layers 9, 10, 11, 12
-            stack = torch.stack([out[i].squeeze(0) for i in [9,10,11,12]], dim=0)
-            layer_means = torch.mean(stack, dim=1).cpu().numpy().flatten()
-            embs.append(layer_means)
-        except: embs.append(np.zeros(4 * 768))
+            # Exact Best Strategy: Average the LAST 4 layers into a single 768-dim vector
+            stack = torch.stack([out[i].squeeze(0) for i in [9,10,11,12]], dim=0) # [4, T, 768]
+            layer_mean = torch.mean(stack, dim=0) # [T, 768]
+            final_vec = torch.mean(layer_mean, dim=0) # [768]
+            embs.append(final_vec.cpu().numpy())
+        except: embs.append(np.zeros(768))
     return np.array(embs)
 
 def main():
@@ -81,11 +81,14 @@ def main():
         np.save(hc_va_p, [extract_handcrafted(p) for p in tqdm(va_df['resolved_path'])])
     if not wv_tr_p.exists():
         wavlm = WavLMModel.from_pretrained("microsoft/wavlm-base-plus").to(TrackAConfig.DEVICE)
-        np.save(wv_tr_p, extract_multilayer_wavlm(tr_df['resolved_path'], wavlm))
-        np.save(wv_va_p, extract_multilayer_wavlm(va_df['resolved_path'], wavlm))
+        np.save(wv_tr_p, extract_lean_wavlm(tr_df['resolved_path'], wavlm))
+        np.save(wv_va_p, extract_lean_wavlm(va_df['resolved_path'], wavlm))
 
     X_hc_tr, X_wv_tr = np.load(hc_tr_p), np.load(wv_tr_p)
     X_hc_va, X_wv_va = np.load(hc_va_p), np.load(wv_va_p)
+
+    # Sanity Check
+    print(f"📊 Feature Dim: HC {X_hc_tr.shape[1]} + WavLM {X_wv_tr.shape[1]}")
 
     X_tr = np.concatenate([X_hc_tr, X_wv_tr], axis=1)
     X_va = np.concatenate([X_hc_va, X_wv_va], axis=1)
@@ -94,7 +97,7 @@ def main():
     X_tr_s = sc.fit_transform(X_tr)
     X_va_s = sc.transform(X_va)
     
-    clf = SVC(kernel='rbf', probability=True, class_weight='balanced')
+    clf = SVC(kernel='rbf', probability=True, class_weight='balanced', C=1.5)
     clf.fit(X_tr_s, y_tr)
     
     preds = clf.predict(X_va_s)
