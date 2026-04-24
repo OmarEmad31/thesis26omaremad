@@ -132,20 +132,37 @@ def main():
     X_hc_tr, X_wv_tr, X_ev_tr = np.load(hc_tr_p), np.load(wv_tr_p), np.load(ev_tr_p)
     X_hc_va, X_wv_va, X_ev_va = np.load(hc_va_p), np.load(wv_va_p), np.load(ev_va_p)
 
-    # 3. Triple Fusion
-    print("\n🎻 [TRIPLE FUSION] Handcrafted + WavLM + emotion2vec...")
-    X_tr = np.concatenate([X_hc_tr, X_wv_tr, X_ev_tr], axis=1)
-    X_va = np.concatenate([X_hc_va, X_wv_va, X_ev_va], axis=1)
+    # 3. Late Fusion (Specialized Experts)
+    print("\n🎻 [LATE FUSION] Initializing Experts...")
     
-    sc = StandardScaler()
-    X_tr_s = sc.fit_transform(X_tr)
-    X_va_s = sc.transform(X_va)
+    # Expert 1: Prosody + WavLM
+    X_exp1_tr = np.concatenate([X_hc_tr, X_wv_tr], axis=1)
+    X_exp1_va = np.concatenate([X_hc_va, X_wv_va], axis=1)
+    sc1 = StandardScaler()
+    X1_tr_s = sc1.fit_transform(X_exp1_tr)
+    X1_va_s = sc1.transform(X_exp1_va)
     
-    clf = SVC(kernel='rbf', probability=True, class_weight='balanced')
-    clf.fit(X_tr_s, y_tr)
+    m1 = SVC(kernel='rbf', probability=True, class_weight='balanced', C=1.5)
+    m1.fit(X1_tr_s, y_tr)
     
-    preds = clf.predict(X_va_s)
-    print(f"\nFinal Triple-Fusion Accuracy: {accuracy_score(y_va, preds):.4f}")
+    # Expert 2: Pure emotion2vec
+    sc2 = StandardScaler()
+    X2_tr_s = sc2.fit_transform(X_ev_tr)
+    X2_va_s = sc2.transform(X_ev_va)
+    
+    m2 = SVC(kernel='rbf', probability=True, class_weight='balanced', C=1.0)
+    m2.fit(X2_tr_s, y_tr)
+    
+    # --- ENSEMBLE VOTING ---
+    print("🚀 Computing Late Fusion Ensemble...")
+    p1 = m1.predict_proba(X1_va_s)
+    p2 = m2.predict_proba(X2_va_s)
+    
+    # We give slightly more weight to the WavLM expert (0.6 / 0.4)
+    p_final = (0.6 * p1) + (0.4 * p2)
+    preds = np.argmax(p_final, axis=1)
+    
+    print(f"\nFinal Late-Fusion Accuracy: {accuracy_score(y_va, preds):.4f}")
     print(f"Macro F1: {f1_score(y_va, preds, average='macro'):.4f}")
     print(classification_report(y_va, preds, target_names=TrackAConfig.EMOTIONS, zero_division=0))
 
