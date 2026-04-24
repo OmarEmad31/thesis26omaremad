@@ -116,12 +116,13 @@ class ThesisLegacyArchitecture(nn.Module):
         )
 
     def forward(self, wav, mode="classify"):
-        # Normalizing
-        wav  = (wav - wav.mean(-1, keepdim=True)) / (wav.std(-1, keepdim=True) + 1e-6)
+        # 1. First, detect the EXACT location of the padded zeros before any manipulation
+        raw_mask = (wav != 0.0).long()
         
-        # Construct Exact Masking (Locating the Zero Silence)
-        # 160000 length boolean mask where True = Audio and False = Zero Padding
-        raw_mask = (wav.abs() > 1e-5).long()
+        # 2. We explicitly REMOVED the catastrophic naive normalization here.
+        # Librosa already loads audio bound between [-1, 1]. The naive normalization 
+        # was turning the 0.0 padded silences into non-zero static noise, 
+        # destroying both the audio and the mask simultaneously.
         
         out = self.wav2vec2(wav, attention_mask=raw_mask)
         hidden_states = out.last_hidden_state  # 768-D sequence
