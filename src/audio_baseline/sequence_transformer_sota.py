@@ -34,7 +34,7 @@ from pathlib import Path
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.utils.class_weight import compute_class_weight
-from transformers import AutoProcessor, AutoModel
+from transformers import AutoFeatureExtractor, AutoModel
 
 # ─────────────────────────────────────────────────────────
 # CONFIG
@@ -214,7 +214,7 @@ def train():
     va_df["lid"] = va_df["emotion_final"].map(lid)
 
     print("\n🧠 LOADING EMOTION BACKBONE (superb/wav2vec2-base-superb-er)...")
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
+    processor = AutoFeatureExtractor.from_pretrained(MODEL_NAME)
     model = AutoModel.from_pretrained(MODEL_NAME).to(device)
 
     print("\n🚀 PHASE 1: FULL AUDIO SEQUENCE EXTRACTION (Bypassing Crop Corruption)")
