@@ -89,7 +89,7 @@ def extract_expanded_prosody(y, sr=16000):
     Implements Phase A2 & A3: Multi-dimensional, discipline-safe prosody.
     Only extract from valid audio segment (no padding).
     """
-    if len(y) < 100: return np.zeros(35) # Fallback
+    if len(y) < 100: return np.zeros(33) # Fallback
     
     try:
         # Time Domain
@@ -130,7 +130,7 @@ def extract_expanded_prosody(y, sr=16000):
         ]
         return np.nan_to_num(np.array(features, dtype=np.float32), nan=0.0, posinf=1.0, neginf=-1.0)
     except Exception:
-        return np.zeros(35)
+        return np.zeros(33)
 
 # ─────────────────────────────────────────────────────────
 # 3. DATASET & SAMPLER
@@ -316,7 +316,7 @@ class FlagshipModel(nn.Module):
         
         # Prosody Encoder (Phase A4)
         if cfg.PROSODY_MODE == "expanded":
-            d_prosody_in = 35
+            d_prosody_in = 33
             self.prosody_mlp = nn.Sequential(
                 nn.Linear(d_prosody_in, 128),
                 nn.LayerNorm(128), nn.GELU(), nn.Dropout(0.2)
