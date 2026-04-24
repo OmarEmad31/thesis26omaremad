@@ -107,16 +107,19 @@ def main():
     va = pd.read_csv(split_dir / "val.csv")
     te = pd.read_csv(split_dir / "test.csv")
     
+    LID = {'Anger':0, 'Disgust':1, 'Fear':2, 'Happiness':3, 'Neutral':4, 'Sadness':5, 'Surprise':6}
+    id2label = {v: k for k, v in LID.items()}
+    
     tokenizer = AutoTokenizer.from_pretrained("UBC-NLP/MARBERT")
-    id2label = {i: e for e, i in trainer.LID.items()}
     model = MARBERTWithMultiSampleDropout(
         "UBC-NLP/MARBERT", 
         num_labels=7, 
         id2label=id2label, 
-        label2id=trainer.LID
+        label2id=LID
     ).to("cuda")
     
     trainer = TrainerV3(model, tr, va, te, tokenizer)
+    trainer.LID = LID # Ensure it's synced
     trainer.train()
 
 if __name__ == "__main__": main()
