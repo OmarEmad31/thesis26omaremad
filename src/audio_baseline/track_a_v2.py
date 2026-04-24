@@ -1,13 +1,11 @@
 """
-Egyptian Arabic SER — Triple-Threat Fusion (Track A)
-===================================================
-1. Handcrafted Features
-2. Multi-Layer WavLM Fusion
-3. emotion2vec (Alibaba Damo)
-NO EPOCHS / NO FINE-TUNING / NO SSL
+Egyptian Arabic SER — TRACK A BEST VERSION (v64)
+===============================================
+Reverted to the high-performance 59.6% configuration.
+Modality: Handcrafted + Multi-Layer WavLM Fusion.
 """
 
-import os, sys, time, random, shutil
+import os, sys, random, shutil
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -18,12 +16,6 @@ from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 from transformers import WavLMModel
-# Required for emotion2vec via modelscope if available, else fallback
-try:
-    from modelscope.pipelines import pipeline
-    from modelscope.utils.constant import Tasks
-except:
-    pass
 
 class TrackAConfig:
     SR = 16000
@@ -39,15 +31,11 @@ def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-# ─────────────────────────────────────────────────────────
-# FEATURE EXTRACTION ENGINE
-# ─────────────────────────────────────────────────────────
-
 def extract_handcrafted(p):
     try:
         y, sr = librosa.load(p, sr=16000)
         yt, _ = librosa.effects.trim(y, top_db=40)
-        if len(yt)<100: return np.zeros(35)
+        if len(yt)<100: return np.zeros(32)
         mfcc = librosa.feature.mfcc(y=yt, sr=sr, n_mfcc=13)
         feat = [len(yt)/sr, np.mean(librosa.feature.rms(y=yt)), np.std(librosa.feature.rms(y=yt)), 
                 np.mean(librosa.feature.zero_crossing_rate(y=yt)), np.std(librosa.feature.zero_crossing_rate(y=yt)), 0]
@@ -65,37 +53,12 @@ def extract_multilayer_wavlm(paths, model):
             if len(y)>80000: y = y[(len(y)-80000)//2 : (len(y)-80000)//2+80000]
             inp = torch.from_numpy(y).float().unsqueeze(0).to(TrackAConfig.DEVICE)
             out = model(inp, output_hidden_states=True).hidden_states
-            # Mean over time for layers 9, 10, 11, 12 (best for emotion)
-            stack = torch.stack([out[i].squeeze(0) for i in [9,10,11,12]], dim=0) # [4, T, 768]
-            layer_means = torch.mean(stack, dim=1).cpu().numpy().flatten() # [4 * 768]
+            # Average layers 9, 10, 11, 12
+            stack = torch.stack([out[i].squeeze(0) for i in [9,10,11,12]], dim=0)
+            layer_means = torch.mean(stack, dim=1).cpu().numpy().flatten()
             embs.append(layer_means)
         except: embs.append(np.zeros(4 * 768))
     return np.array(embs)
-
-def extract_e2v(paths):
-    print("🚀 Initializing emotion2vec (this might download weights)...")
-    try:
-        inference_pipeline = pipeline(
-            task=Tasks.emotion_recognition,
-            model='damo/speech_emotion2vec_base_v2'
-        )
-        embs = []
-        for p in tqdm(paths, desc="Extracting emotion2vec"):
-            try:
-                rec_result = inference_pipeline(p)
-                # emotion2vec V2 returns scores and features
-                # We want the hidden embedding
-                embs.append(rec_result[0]['feats'])
-            except:
-                embs.append(np.zeros(768))
-        return np.array(embs)
-    except Exception as e:
-        print(f"❌ emotion2vec failed to load: {e}. Skipping.")
-        return np.zeros((len(paths), 768))
-
-# ─────────────────────────────────────────────────────────
-# MAIN PIPELINE
-# ─────────────────────────────────────────────────────────
 
 def main():
     seed_everything(TrackAConfig.SEED)
@@ -110,59 +73,32 @@ def main():
     tr_df, va_df = df[df['split'] == 'train'], df[df['split'] == 'val']
     y_tr, y_va = tr_df['label_id'].values, va_df['label_id'].values
 
-    # 1. Feature Caching Check
     hc_tr_p, hc_va_p = TrackAConfig.CACHE_DIR/"hc_tr.npy", TrackAConfig.CACHE_DIR/"hc_va.npy"
     wv_tr_p, wv_va_p = TrackAConfig.CACHE_DIR/"mwv_tr.npy", TrackAConfig.CACHE_DIR/"mwv_va.npy"
-    ev_tr_p, ev_va_p = TrackAConfig.CACHE_DIR/"ev_tr.npy", TrackAConfig.CACHE_DIR/"ev_va.npy"
 
     if not hc_tr_p.exists():
         np.save(hc_tr_p, [extract_handcrafted(p) for p in tqdm(tr_df['resolved_path'])])
         np.save(hc_va_p, [extract_handcrafted(p) for p in tqdm(va_df['resolved_path'])])
-    
     if not wv_tr_p.exists():
         wavlm = WavLMModel.from_pretrained("microsoft/wavlm-base-plus").to(TrackAConfig.DEVICE)
         np.save(wv_tr_p, extract_multilayer_wavlm(tr_df['resolved_path'], wavlm))
         np.save(wv_va_p, extract_multilayer_wavlm(va_df['resolved_path'], wavlm))
-        
-    if not ev_tr_p.exists():
-        np.save(ev_tr_p, extract_e2v(tr_df['resolved_path']))
-        np.save(ev_va_p, extract_e2v(va_df['resolved_path']))
 
-    # 2. Loading
-    X_hc_tr, X_wv_tr, X_ev_tr = np.load(hc_tr_p), np.load(wv_tr_p), np.load(ev_tr_p)
-    X_hc_va, X_wv_va, X_ev_va = np.load(hc_va_p), np.load(wv_va_p), np.load(ev_va_p)
+    X_hc_tr, X_wv_tr = np.load(hc_tr_p), np.load(wv_tr_p)
+    X_hc_va, X_wv_va = np.load(hc_va_p), np.load(wv_va_p)
 
-    # 3. Late Fusion (Specialized Experts)
-    print("\n🎻 [LATE FUSION] Initializing Experts...")
+    X_tr = np.concatenate([X_hc_tr, X_wv_tr], axis=1)
+    X_va = np.concatenate([X_hc_va, X_wv_va], axis=1)
     
-    # Expert 1: Prosody + WavLM
-    X_exp1_tr = np.concatenate([X_hc_tr, X_wv_tr], axis=1)
-    X_exp1_va = np.concatenate([X_hc_va, X_wv_va], axis=1)
-    sc1 = StandardScaler()
-    X1_tr_s = sc1.fit_transform(X_exp1_tr)
-    X1_va_s = sc1.transform(X_exp1_va)
+    sc = StandardScaler()
+    X_tr_s = sc.fit_transform(X_tr)
+    X_va_s = sc.transform(X_va)
     
-    m1 = SVC(kernel='rbf', probability=True, class_weight='balanced', C=1.5)
-    m1.fit(X1_tr_s, y_tr)
+    clf = SVC(kernel='rbf', probability=True, class_weight='balanced')
+    clf.fit(X_tr_s, y_tr)
     
-    # Expert 2: Pure emotion2vec
-    sc2 = StandardScaler()
-    X2_tr_s = sc2.fit_transform(X_ev_tr)
-    X2_va_s = sc2.transform(X_ev_va)
-    
-    m2 = SVC(kernel='rbf', probability=True, class_weight='balanced', C=1.0)
-    m2.fit(X2_tr_s, y_tr)
-    
-    # --- ENSEMBLE VOTING ---
-    print("🚀 Computing Late Fusion Ensemble...")
-    p1 = m1.predict_proba(X1_va_s)
-    p2 = m2.predict_proba(X2_va_s)
-    
-    # We give slightly more weight to the WavLM expert (0.6 / 0.4)
-    p_final = (0.6 * p1) + (0.4 * p2)
-    preds = np.argmax(p_final, axis=1)
-    
-    print(f"\nFinal Late-Fusion Accuracy: {accuracy_score(y_va, preds):.4f}")
+    preds = clf.predict(X_va_s)
+    print(f"\nFinal Accuracy (Track A): {accuracy_score(y_va, preds):.4f}")
     print(f"Macro F1: {f1_score(y_va, preds, average='macro'):.4f}")
     print(classification_report(y_va, preds, target_names=TrackAConfig.EMOTIONS, zero_division=0))
 
