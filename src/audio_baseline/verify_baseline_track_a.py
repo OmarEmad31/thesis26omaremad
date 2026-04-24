@@ -40,8 +40,17 @@ def main():
     orig_val_ids = set(pd.read_csv(csv_r/"val.csv")['sample_id'])
     df['split'] = df['sample_id'].apply(lambda x: 'val' if x in orig_val_ids else 'train')
     
-    # 2. Extract Features
-    print(f"📦 Extracting Handcrafted for {len(df)} samples...")
+    print(f"   Split Distribution: {df['split'].value_counts().to_dict()}")
+
+    # 2. Path Sanity Check
+    print(f"\n🕵️ Path Sanity (First 5):")
+    for i, row in df.head(5).iterrows():
+        path = str(row['resolved_path'])
+        exists = os.path.exists(path)
+        print(f"   Sample {row['sample_id'][:20]}... | Exists? {exists} | Path: {path}")
+
+    # 3. Extract Features
+    print(f"\n📦 Extracting Handcrafted for {len(df)} samples...")
     feats, labels, splits = [], [], []
     for _, row in tqdm(df.iterrows(), total=len(df)):
         f = extract_features(row['resolved_path'])
