@@ -155,27 +155,34 @@ def resolve_exact_paths(df, colab_root, extracted_root=Path("/content/dataset"))
     df["resolved_path"] = resolved
     
     print(f"✅ Resolved Unique Paths: {len(df) - len(unresolved) - len(ambiguous)}")
-    print(f"❌ Unresolved: {len(unresolved)}")
-    print(f"⚠️ Ambiguous (Multiple matches): {len(ambiguous)}")
     
-    if unresolved:
-        print("\nFirst 10 Unresolved Examples:")
-        for u in unresolved[:10]: print(f"  {u}")
-    if ambiguous:
-        print("\nFirst 10 Ambiguous Examples (Collisions):")
-        for u_rel, u_matches in ambiguous[:10]:
-            print(f"  Rel Path from CSV: {u_rel}")
-            print(f"  Potential Collisions: {u_matches}")
+    if unresolved or ambiguous:
+        print(f"❌ Unresolved: {len(unresolved)}")
+        print(f"⚠️ Ambiguous (Multiple matches): {len(ambiguous)}")
+        raise FileNotFoundError("CRITICAL: Not all audio paths could be resolved uniquely or folders are ambiguous.")
 
-    if None in resolved:
-        print("\n[ERROR] Path resolution failed. You have audio_relpaths in your CSV that do not exist or are ambiguous.")
-        raise FileNotFoundError("CRITICAL: Not all audio paths could be resolved uniquely. Clean your dataset or fix relative paths.")
+    # 4. Organized Identity Verification (User Request)
+    print(f"\n🛡️ IDENTITY SPOT-CHECK (20 Random Samples)")
+    samples = df.sample(min(20, len(df)))
     
-    # 6. Random Samples for user
-    print("\n💎 10 Random Resolved Samples (Spot Check):")
-    samples = df.sample(min(10, len(df)))
-    for _, r in samples.iterrows():
-        print(f"  Label: {r['emotion_final']} | Rel: {r['audio_relpath']} -> Abs: {r['resolved_path']}")
+    col_w = {"id": 8, "fld": 20, "emo": 10, "rel": 40, "stat": 10}
+    header = f"{'ID':<{col_w['id']}} | {'Folder':<{col_w['fld']}} | {'Emotion':<{col_w['emo']}} | {'Rel Path (CSV)':<{col_w['rel']}} | {'Identity'}"
+    print(header)
+    print("-" * len(header))
+    
+    for _, row in samples.iterrows():
+        folder_id = str(row["folder"])
+        resolved = str(row["resolved_path"])
+        
+        # CRITICAL ASSERTION
+        if folder_id not in resolved:
+            print(f"\n[!!!] MISMATCH DETECTED at ID {row['sample_id']}")
+            print(f"    Expected Folder Identity: {folder_id}")
+            print(f"    Physically Resolved at:   {resolved}")
+            raise AssertionError(f"Logical error! Media at {resolved} does not belong to {folder_id}.")
+            
+        rel_disp = (row['audio_relpath'][:37] + '...') if len(row['audio_relpath']) > 40 else row['audio_relpath']
+        print(f"{str(row['sample_id']):<{col_w['id']}} | {folder_id:<{col_w['fld']}} | {row['emotion_final']:<{col_w['emo']}} | {rel_disp:<{col_w['rel']}} | ✅ OK")
         
     return df
 

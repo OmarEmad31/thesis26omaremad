@@ -92,7 +92,7 @@ class MasterPoolDataset(Dataset):
 # ---------------------------------------------------------------------------
 def main():
     torch.manual_seed(42); np.random.seed(42); device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    print("🏗️ Initializing Omega-5Fold Champion (Ensemble IQ Mode)...")
+    print("[INIT] Initializing Omega-5Fold Champion (Ensemble IQ Mode)...")
     
     # 1. LOAD MASTER POOL (857 SAMPLES)
     df_list = [pd.read_csv(config.SPLIT_CSV_DIR / f) for f in ["train.csv", "val.csv", "test.csv"]]
@@ -107,14 +107,14 @@ def main():
     for ext in ["*.wav", "*.WAV", "*.Wav"]:
         for f in p_root.rglob(ext): audio_map[f.name] = f
 
-    skf = StratifiedKFold(n_components=5, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     fold_results = []
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(full_df, full_df["lid"])):
-        print(f"\n🚀 STARTING FOLD {fold+1}/5")
+        print(f"\n[FOLD] STARTING FOLD {fold+1}/5")
         tr_df = full_df.iloc[train_idx]; va_df = full_df.iloc[val_idx]
-        tr_loader = DataLoader(MasterPoolDataset(tr_df, audio_map, augment=True), batch_size=16, shuffle=True)
-        va_loader = DataLoader(MasterPoolDataset(va_df, audio_map), batch_size=16)
+        tr_loader = DataLoader(MasterPoolDataset(tr_df, audio_map, augment=True), batch_size=4, shuffle=True)
+        va_loader = DataLoader(MasterPoolDataset(va_df, audio_map), batch_size=4)
         
         model = OmegaWLPWavLM(len(classes)).to(device)
         total_steps = len(tr_loader) * 20 # 20 Epochs per fold
@@ -146,13 +146,11 @@ def main():
             
             if epoch % 5 == 0: print(f"Fold {fold+1} | Ep {epoch} | Val Acc: {acc:.3f}")
         
-        print(f"✅ Fold {fold+1} Complete. Best Val: {best_fold_acc:.3f}")
+        print(f"[DONE] Fold {fold+1} Complete. Best Val: {best_fold_acc:.3f}")
         fold_results.append(best_fold_acc)
 
     print("\n" + "="*30)
-    print(f"🏁 OMEGA ENSEMBLE COMPLETE")
-    print(f"📊 Folds: {fold_results}")
-    print(f"🏆 FINAL ENSEMBLE MEAN: {np.mean(fold_results):.3f}")
+    print(f"[FINAL] FINAL ENSEMBLE MEAN: {np.mean(fold_results):.3f}")
     print("="*30)
 
 if __name__ == "__main__": main()
