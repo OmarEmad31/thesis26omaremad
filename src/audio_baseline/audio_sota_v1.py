@@ -205,15 +205,20 @@ def main():
     print("\n⚖️ [STAGE 1] Generating Speaker-Independent Split...")
     splits = generate_n_stable_splits(df, n=10)
     
-    # Correctly apply the map (Ensure index alignment)
-    df['split'] = pd.Series(splits[0]['map'], index=df.index)
+    # Direct list assignment (Ignores index alignment issues)
+    df['split'] = list(splits[0]['map'])
     
-    print(f"📊 Split result: {df['split'].value_counts().to_dict()}")
+    print(f"   First 5 assignments: {df['split'].values[:5]}")
+    print(f"📊 Split Counts: {df['split'].value_counts().to_dict()}")
     
     if len(df[df['split']=='train']) == 0:
-        print("❌ CRITICAL ERROR: Train set is empty. Diagnostics:")
+        print("❌ CRITICAL ERROR: Train set is empty.")
         print(f"   Unique Speakers: {df['spk_clean'].nunique()}")
         return
+
+    tr_spks = df[df['split']=='train']['spk_clean'].nunique()
+    va_spks = df[df['split']=='val']['spk_clean'].nunique()
+    print(f"   Speakers: {tr_spks} in Train | {va_spks} in Val")
 
     metrics = train_sota(df, fold_idx=1)
     print("\n🏆 SOTA GENERALIZATION RESULTS:")
