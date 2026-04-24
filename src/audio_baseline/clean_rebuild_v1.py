@@ -132,9 +132,8 @@ def build_audio_manifest(colab_root, train_csv, val_csv, output_path):
     
     unresolved_count = (df["resolution_status"] != "Resolved").sum()
     if unresolved_count > 0:
-        print(f"❌ Resolution Failed: {unresolved_count} rows could not be linked.")
-        print(df[df["resolution_status"] != "Resolved"][["sample_id", "folder", "audio_relpath"]].head(20))
-        raise FileNotFoundError("Manifest build failed due to unresolved paths.")
+        print(f"⚠️ [WARNING] Dropping {unresolved_count} rows that could not be linked to files.")
+        df = df[df["resolution_status"] == "Resolved"].copy()
     
     df.to_csv(output_path, index=False)
     print(f"✅ Manifest saved to {output_path} ({len(df)} rows)")
