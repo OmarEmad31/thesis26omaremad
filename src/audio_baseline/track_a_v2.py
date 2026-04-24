@@ -66,11 +66,28 @@ def main():
     if os.path.exists("/content/drive/MyDrive"): root = Path("/content/drive/MyDrive/Thesis Project")
     else: root = Path(__file__).parent.parent.parent
     
-    csv_r = root / "data/processed/splits/text_hc"
-    df = pd.read_csv(root / "audio_manifest.csv")
-    orig_val_ids = set(pd.read_csv(csv_r/"val.csv")['sample_id'])
-    df['split'] = df['sample_id'].apply(lambda x: 'val' if x in orig_val_ids else 'train')
-    tr_df, va_df = df[df['split'] == 'train'], df[df['split'] == 'val']
+    clean_p = root / "data" / "processed" / "splits" / "trackA_cleaned"
+    csv_r = root / "data" / "processed" / "splits" / "text_hc"
+    
+    if (clean_p / "trackA_val_clean.csv").exists():
+        print("✨ Using CLEANED (No Leakage) Track A Split...")
+        tr_df = pd.read_csv(clean_p / "trackA_train_clean.csv")
+        va_df = pd.read_csv(clean_p / "trackA_val_clean.csv")
+    else:
+        print("⚠️ Using Original Split (Audit Recommended)...")
+        manifest = pd.read_csv(root / "audio_manifest.csv")
+        man_map = manifest.set_index('sample_id')['resolved_path'].to_dict()
+        lab_map = manifest.set_index('sample_id')['label_id'].to_dict()
+        
+        tr_df = pd.read_csv(csv_r / "train.csv")
+        va_df = pd.read_csv(csv_r / "val.csv")
+        tr_df['resolved_path'] = tr_df['sample_id'].map(man_map)
+        va_df['resolved_path'] = va_df['sample_id'].map(man_map)
+        tr_df['label_id'] = tr_df['sample_id'].map(lab_map)
+        va_df['label_id'] = va_df['sample_id'].map(lab_map)
+        tr_df = tr_df.dropna(subset=['resolved_path'])
+        va_df = va_df.dropna(subset=['resolved_path'])
+
     y_tr, y_va = tr_df['label_id'].values, va_df['label_id'].values
 
     hc_tr_p, hc_va_p = TrackAConfig.CACHE_DIR/"hc_tr.npy", TrackAConfig.CACHE_DIR/"hc_va.npy"
