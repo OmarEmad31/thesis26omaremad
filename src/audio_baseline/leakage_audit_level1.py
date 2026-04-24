@@ -34,6 +34,7 @@ def main():
 
     # 1. Load Data
     print("⏳ Loading Split Data...")
+    df_man = pd.read_csv(man_p)
     clean_tr = output_dir / "trackA_train_clean.csv"
     clean_va = output_dir / "trackA_val_clean.csv"
     
