@@ -164,6 +164,7 @@ def main():
     for epoch in range(1, 20):
         model.train()
         train_loss = 0.0
+        tr_p, tr_t = [], []
         
         for batch_data, batch_labels in tqdm(train_loader, desc=f"Epoch {epoch}", leave=False):
             input_ids = batch_data['input_ids'].to(device)
@@ -178,6 +179,9 @@ def main():
             optimizer.step()
             train_loss += loss.item()
             
+            tr_p.extend(torch.argmax(logits, 1).cpu().numpy())
+            tr_t.extend(targets.cpu().numpy())
+            
         model.eval()
         p, t = [], []
         with torch.no_grad():
@@ -191,8 +195,9 @@ def main():
         v_acc = accuracy_score(t, p)
         v_f1 = f1_score(t, p, average='macro')
         avg_loss = train_loss / len(train_loader)
+        tr_acc = accuracy_score(tr_t, tr_p)
         
-        print(f"📈 Epoch {epoch} | Train Loss: {avg_loss:.4f} | Val Acc: {v_acc:.4f} | Val F1: {v_f1:.4f}")
+        print(f"📈 Epoch {epoch} | Train Loss: {avg_loss:.4f} | Train Acc: {tr_acc:.4f} | Val Acc: {v_acc:.4f} | Val F1: {v_f1:.4f}")
         
         if v_f1 > best_f1:
             best_f1 = v_f1
