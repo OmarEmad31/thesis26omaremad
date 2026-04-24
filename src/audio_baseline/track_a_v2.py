@@ -1,10 +1,10 @@
 """
-Egyptian Arabic SER — Supervised Audio Powerhouse (Track A)
-==========================================================
-1. Handcrafted + Multi-Layer WavLM Fusion
-2. Attentive Statistics Pooling
-3. Learned Weighted Layer Sum (12+1 Layers)
-NO SSL / NO SUPCON (Reserved for Multimodal Stage)
+Egyptian Arabic SER — Triple-Threat Fusion (Track A)
+===================================================
+1. Handcrafted Features
+2. Multi-Layer WavLM Fusion
+3. emotion2vec (Alibaba Damo)
+NO EPOCHS / NO FINE-TUNING / NO SSL
 """
 
 import os, sys, time, random, shutil
@@ -13,15 +13,17 @@ import numpy as np
 import pandas as pd
 import librosa
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 from transformers import WavLMModel
+# Required for emotion2vec via modelscope if available, else fallback
+try:
+    from modelscope.pipelines import pipeline
+    from modelscope.utils.constant import Tasks
+except:
+    pass
 
 class TrackAConfig:
     SR = 16000
@@ -38,7 +40,7 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
 
 # ─────────────────────────────────────────────────────────
-# ARCHITECTURE: LAYER FUSION & ATTENTIVE POOLING
+# FEATURE EXTRACTION ENGINE
 # ─────────────────────────────────────────────────────────
 
 def extract_handcrafted(p):
@@ -57,23 +59,39 @@ def extract_handcrafted(p):
 def extract_multilayer_wavlm(paths, model):
     model.eval()
     embs = []
-    for p in tqdm(paths, desc="Extracting Multi-Layer WavLM"):
+    for p in tqdm(paths, desc="Extracting WavLM"):
         try:
             y, _ = librosa.load(p, sr=16000)
-            if len(y)>80000: y=y[(len(y)-80000)//2 : (len(y)-80000)//2 + 80000]
+            if len(y)>80000: y = y[(len(y)-80000)//2 : (len(y)-80000)//2+80000]
             inp = torch.from_numpy(y).float().unsqueeze(0).to(TrackAConfig.DEVICE)
-            # We take ALL hidden states
             out = model(inp, output_hidden_states=True).hidden_states
-            # out is a tuple of 13 layers: [1, T, 768]
-            # We stack them: [13, T, 768]
-            stack = torch.stack([layer.squeeze(0) for layer in out], dim=0) # [13, T, 768]
-            # Simple average of layers for the frozen caching phase
-            # (We will do learned fusion in the actual model but for caching we save the stack or a reasonable summary)
-            # To save space, we'll save the MEAN over time for each layer
-            layer_means = torch.mean(stack, dim=1).cpu().numpy() # [13, 768]
-            embs.append(layer_means.flatten())
-        except: embs.append(np.zeros(13 * 768))
+            # Mean over time for layers 9, 10, 11, 12 (best for emotion)
+            stack = torch.stack([out[i].squeeze(0) for i in [9,10,11,12]], dim=0) # [4, T, 768]
+            layer_means = torch.mean(stack, dim=1).cpu().numpy().flatten() # [4 * 768]
+            embs.append(layer_means)
+        except: embs.append(np.zeros(4 * 768))
     return np.array(embs)
+
+def extract_e2v(paths):
+    print("🚀 Initializing emotion2vec (this might download weights)...")
+    try:
+        inference_pipeline = pipeline(
+            task=Tasks.emotion_recognition,
+            model='damo/speech_emotion2vec_base_v2'
+        )
+        embs = []
+        for p in tqdm(paths, desc="Extracting emotion2vec"):
+            try:
+                rec_result = inference_pipeline(p)
+                # emotion2vec V2 returns scores and features
+                # We want the hidden embedding
+                embs.append(rec_result[0]['feats'])
+            except:
+                embs.append(np.zeros(768))
+        return np.array(embs)
+    except Exception as e:
+        print(f"❌ emotion2vec failed to load: {e}. Skipping.")
+        return np.zeros((len(paths), 768))
 
 # ─────────────────────────────────────────────────────────
 # MAIN PIPELINE
@@ -92,9 +110,10 @@ def main():
     tr_df, va_df = df[df['split'] == 'train'], df[df['split'] == 'val']
     y_tr, y_va = tr_df['label_id'].values, va_df['label_id'].values
 
-    # 1. Feature Retrieval
+    # 1. Feature Caching Check
     hc_tr_p, hc_va_p = TrackAConfig.CACHE_DIR/"hc_tr.npy", TrackAConfig.CACHE_DIR/"hc_va.npy"
-    wv_tr_p, wv_va_p = TrackAConfig.CACHE_DIR/"mwv_tr.npy", TrackAConfig.CACHE_DIR/"mwv_va.npy" # Multi-layer cache
+    wv_tr_p, wv_va_p = TrackAConfig.CACHE_DIR/"mwv_tr.npy", TrackAConfig.CACHE_DIR/"mwv_va.npy"
+    ev_tr_p, ev_va_p = TrackAConfig.CACHE_DIR/"ev_tr.npy", TrackAConfig.CACHE_DIR/"ev_va.npy"
 
     if not hc_tr_p.exists():
         np.save(hc_tr_p, [extract_handcrafted(p) for p in tqdm(tr_df['resolved_path'])])
@@ -104,36 +123,29 @@ def main():
         wavlm = WavLMModel.from_pretrained("microsoft/wavlm-base-plus").to(TrackAConfig.DEVICE)
         np.save(wv_tr_p, extract_multilayer_wavlm(tr_df['resolved_path'], wavlm))
         np.save(wv_va_p, extract_multilayer_wavlm(va_df['resolved_path'], wavlm))
+        
+    if not ev_tr_p.exists():
+        np.save(ev_tr_p, extract_e2v(tr_df['resolved_path']))
+        np.save(ev_va_p, extract_e2v(va_df['resolved_path']))
 
-    X_hc_tr, X_mwv_tr = np.load(hc_tr_p), np.load(wv_tr_p)
-    X_hc_va, X_mwv_va = np.load(hc_va_p), np.load(wv_va_p)
-    
-    # 2. Experiment with Layer Selection (Supervised)
-    # Different layers capture different things. Layers 7-12 are usually best for EMOTION.
-    # We will try a weighted sum of the last 4 layers.
-    def get_layer_fusion(X_mwv, layers=[-4, -3, -2, -1]):
-        # X_mwv is [N, 13 * 768]
-        X = X_mwv.reshape(-1, 13, 768)
-        selected = X[:, layers, :]
-        return np.mean(selected, axis=1) # [N, 768]
+    # 2. Loading
+    X_hc_tr, X_wv_tr, X_ev_tr = np.load(hc_tr_p), np.load(wv_tr_p), np.load(ev_tr_p)
+    X_hc_va, X_wv_va, X_ev_va = np.load(hc_va_p), np.load(wv_va_p), np.load(ev_va_p)
 
-    X_wv_tr = get_layer_fusion(X_mwv_tr)
-    X_wv_va = get_layer_fusion(X_mwv_va)
-
-    # 3. Tuning Suite
-    print("\n🎻 [SUPERVISED FUSION] 手 Tuning Handcrafted + Layer-Fused WavLM...")
-    X_f_tr = np.concatenate([X_hc_tr, X_wv_tr], axis=1)
-    X_f_va = np.concatenate([X_hc_va, X_wv_va], axis=1)
+    # 3. Triple Fusion
+    print("\n🎻 [TRIPLE FUSION] Handcrafted + WavLM + emotion2vec...")
+    X_tr = np.concatenate([X_hc_tr, X_wv_tr, X_ev_tr], axis=1)
+    X_va = np.concatenate([X_hc_va, X_wv_va, X_ev_va], axis=1)
     
     sc = StandardScaler()
-    X_tr_s = sc.fit_transform(X_f_tr)
-    X_va_s = sc.transform(X_f_va)
+    X_tr_s = sc.fit_transform(X_tr)
+    X_va_s = sc.transform(X_va)
     
-    clf = SVC(kernel='rbf', probability=True, class_weight='balanced', C=1.0)
+    clf = SVC(kernel='rbf', probability=True, class_weight='balanced')
     clf.fit(X_tr_s, y_tr)
     
     preds = clf.predict(X_va_s)
-    print(f"\nFinal Accuracy (Supervised): {accuracy_score(y_va, preds):.4f}")
+    print(f"\nFinal Triple-Fusion Accuracy: {accuracy_score(y_va, preds):.4f}")
     print(f"Macro F1: {f1_score(y_va, preds, average='macro'):.4f}")
     print(classification_report(y_va, preds, target_names=TrackAConfig.EMOTIONS, zero_division=0))
 
