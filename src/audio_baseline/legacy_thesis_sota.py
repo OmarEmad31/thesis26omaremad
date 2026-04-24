@@ -115,26 +115,22 @@ class ThesisLegacyArchitecture(nn.Module):
             nn.Linear(128, num_labels)
         )
 
-    def forward(self, wav, mode="classify"):
-        # 1. First, detect the EXACT location of the padded zeros before any manipulation
-        raw_mask = (wav != 0.0).long()
-        
-        # 2. We explicitly REMOVED the catastrophic naive normalization here.
-        # Librosa already loads audio bound between [-1, 1]. The naive normalization 
-        # was turning the 0.0 padded silences into non-zero static noise, 
-        # destroying both the audio and the mask simultaneously.
+    def forward(self, wav, true_lens, mode="classify"):
+        # 1. Exact boolean mask mapped perfectly from the DataLoader's true lengths
+        B, T_raw = wav.shape
+        raw_mask = torch.arange(T_raw, device=wav.device)[None, :] < true_lens[:, None]
+        raw_mask = raw_mask.long()
         
         out = self.wav2vec2(wav, attention_mask=raw_mask)
         hidden_states = out.last_hidden_state  # 768-D sequence
         
-        # Calculate exactly how many frames CNN extracted for the non-silent audio
-        input_lengths = raw_mask.sum(dim=-1)
-        feat_lengths = self.wav2vec2.base_model.model._get_feat_extract_output_lengths(input_lengths)
+        # Calculate exactly how many frames CNN extracted for the true length
+        feat_lengths = self.wav2vec2.base_model.model._get_feat_extract_output_lengths(true_lens)
         
         B, T, _ = hidden_states.shape
         
         # Build strict Frame-Level attention block
-        # "The masking is important: it ensures that zero padded regions don’t contribute to the mean"
+        # "The masking is important: it ensures that zero padded regions don't contribute to the mean"
         frame_mask = torch.arange(T, device=wav.device)[None, :] < feat_lengths[:, None]
         frame_mask = frame_mask.float().unsqueeze(-1)  # [B, T, 1]
 
@@ -170,37 +166,34 @@ class LegacyDataset(Dataset):
     def _load_audio(self, idx):
         row = self.df.iloc[idx]
         fname = Path(row["audio_relpath"]).name
-        if fname not in self.path_map: return None, None
+        if fname not in self.path_map: return None, None, None
         try:
             wav, _ = librosa.load(self.path_map[fname], sr=SR)
             # Safe Pre-processing
             yt, _ = librosa.effects.trim(wav, top_db=30)
-            if len(yt) < SR//2: return None, None
+            if len(yt) < SR//2: return None, None, None
             
-            # 10 SECOND WINDOW (Strict Center Cropping or PADDING with exact 0.0s)
-            if len(yt) > MAX_LEN:
-                s = random.randint(0, len(yt) - MAX_LEN) if self.augment else (len(yt) - MAX_LEN)//2
+            true_len = len(yt)
+            # 10 SECOND WINDOW
+            if true_len > MAX_LEN:
+                s = random.randint(0, true_len - MAX_LEN) if self.augment else (true_len - MAX_LEN)//2
                 yt = yt[s:s + MAX_LEN]
+                true_len = MAX_LEN
             else:
-                # Essential logic: padded explicitly with ZERO to trigger frame-mask
-                yt = np.pad(yt, (0, MAX_LEN - len(yt)), constant_values=0.0)
-            return yt, int(row["lid"])
-        except Exception: return None, None
+                yt = np.pad(yt, (0, MAX_LEN - true_len), constant_values=0.0)
+            return yt, int(row["lid"]), true_len
+        except Exception: return None, None, None
 
     def _load(self, idx):
-        yt, lid = self._load_audio(idx)
+        yt, lid, tlen = self._load_audio(idx)
         if yt is None: return None
         try:
-            if self.augment and lid in self.rare_classes and random.random() < 0.5:
-                # CutMix inside the valid frame region only
-                peer_idx = random.choice(self.class_idx[lid])
-                yt2, _   = self._load_audio(peer_idx)
-                if yt2 is not None:
-                    alpha = np.random.beta(0.4, 0.4)
-                    yt    = alpha * yt + (1 - alpha) * yt2
-
             if self.augment: yt = self.aug_pipe(samples=yt.copy(), sample_rate=SR)
-            return {"wav": torch.tensor(yt, dtype=torch.float32), "label": torch.tensor(lid, dtype=torch.long)}
+            return {
+                "wav": torch.tensor(yt, dtype=torch.float32), 
+                "label": torch.tensor(lid, dtype=torch.long),
+                "true_len": torch.tensor(tlen, dtype=torch.long)
+            }
         except Exception: return None
 
     def __getitem__(self, idx):
@@ -224,7 +217,7 @@ def fast_eval(model, loader, device):
     with torch.no_grad():
         for b in loader:
             with autocast("cuda"):
-                logits = model(b["wav"].to(device))
+                logits = model(b["wav"].to(device), b["true_len"].to(device))
             ps.extend(logits.argmax(1).cpu().numpy())
             ts.extend(b["label"].numpy())
     return accuracy_score(ts, ps), f1_score(ts, ps, average="macro", zero_division=0)
@@ -269,9 +262,9 @@ def train():
         model.train(); ep_loss = 0.0
         
         for b in tqdm(tr_loader, desc=f"Legacy Ep{ep:02d}", leave=False):
-            w = b["wav"].to(device); l = b["label"].to(device)
+            w = b["wav"].to(device); l = b["label"].to(device); t_len = b["true_len"].to(device)
             with autocast("cuda"):
-                logits = model(w)
+                logits = model(w, t_len)
                 loss = focal(logits, l)
             opt.zero_grad(); scaler.scale(loss).backward()
             scaler.unscale_(opt); nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -293,7 +286,7 @@ def train():
         swa_model.train()
         with torch.no_grad():
             for b in tqdm(tr_loader, desc="SWA BN", leave=False):
-                with autocast("cuda"): swa_model(b["wav"].to(device))
+                with autocast("cuda"): swa_model(b["wav"].to(device), b["true_len"].to(device))
         swa_acc, swa_f1 = fast_eval(swa_model, val_loader, device)
         if swa_acc > best_acc:
             best_acc = swa_acc; torch.save(swa_model.state_dict(), save_path)
