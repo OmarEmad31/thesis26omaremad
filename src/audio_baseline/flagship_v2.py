@@ -232,6 +232,19 @@ class BalancedBatchSampler(Sampler):
             yield batch
     def __len__(self): return self.n_batches
 
+def get_path_map(colab_root):
+    pm = {f.name: str(f) for f in colab_root.rglob("*.wav")}
+    if pm: return pm
+    zname = "Thesis_Audio_Full.zip"; zpath = None
+    for root, _, files in os.walk("/content/drive/MyDrive"):
+        if zname in files: zpath = os.path.join(root, zname); break
+    if not zpath: raise FileNotFoundError(f"{zname} not found in drive.")
+    print(f"📦 Unzipping {zname} to local runtime...")
+    import zipfile
+    with zipfile.ZipFile(zpath, 'r') as zip_ref:
+        zip_ref.extractall("/content/dataset")
+    return {f.name: str(f) for f in Path("/content/dataset").rglob("*.wav")}
+
 # ─────────────────────────────────────────────────────────
 # 4. MODEL COMPONENTS (POOLING & FUSION)
 # ─────────────────────────────────────────────────────────
