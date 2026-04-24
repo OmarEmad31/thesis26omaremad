@@ -31,9 +31,10 @@ class TrainerV3:
         self.test_df = test_df
         self.tokenizer = tokenizer
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.lid = {e: i for i, e in enumerate(config.EMOTIONS) if hasattr(config, 'EMOTIONS') else i}
-        # Fallback for LID if config doesn't have it
-        self.LID = {'Anger':0, 'Disgust':1, 'Fear':2, 'Happiness':3, 'Neutral':4, 'Sadness':5, 'Surprise':6}
+        if hasattr(config, 'EMOTIONS'):
+            self.LID = {e: i for i, e in enumerate(config.EMOTIONS)}
+        else:
+            self.LID = {'Anger':0, 'Disgust':1, 'Fear':2, 'Happiness':3, 'Neutral':4, 'Sadness':5, 'Surprise':6}
 
     def tokenize(self, texts):
         return self.tokenizer(list(texts), truncation=True, padding=True, max_length=64, return_tensors="pt").to(self.device)
