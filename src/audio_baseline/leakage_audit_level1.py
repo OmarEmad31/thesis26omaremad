@@ -34,9 +34,17 @@ def main():
 
     # 1. Load Data
     print("⏳ Loading Split Data...")
-    df_man = pd.read_csv(man_p)
-    tr_orig = pd.read_csv(csv_r / "train.csv")
-    va_orig = pd.read_csv(csv_r / "val.csv")
+    clean_tr = output_dir / "trackA_train_clean.csv"
+    clean_va = output_dir / "trackA_val_clean.csv"
+    
+    if clean_tr.exists() and clean_va.exists():
+        print("✨ Found Cleaned Files. Auditing the CLEANED split...")
+        tr_orig = pd.read_csv(clean_tr)
+        va_orig = pd.read_csv(clean_va)
+    else:
+        print("⚠️ No cleaned files found. Auditing the ORIGINAL split...")
+        tr_orig = pd.read_csv(csv_r / "train.csv")
+        va_orig = pd.read_csv(csv_r / "val.csv")
     
     man_map = df_man.set_index('sample_id')['resolved_path'].to_dict()
     tr_orig['resolved_path'] = tr_orig['sample_id'].map(man_map)
