@@ -102,6 +102,7 @@ def main():
     
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     rolling_probs = []
+    best_val_f1s = []
 
     print("\n" + "="*50 + "\n🚀 V22: VALIDATION EXPERT (BREAKING THE 50% LOG)\n" + "="*50)
     
@@ -114,7 +115,7 @@ def main():
         model = ValidationExpertModel().to(device)
         optimizer = torch.optim.AdamW([
             {'params': [p for n, p in model.named_parameters() if "bert" in n], 'lr': 1e-5},
-            {'params': [p for n, p in model.named_parameters() if "bert" not in n], 'lr': 5e-4} # FASTER HEAD
+            {'params': [p for n, p in model.named_parameters() if "bert" not in n], 'lr': 5e-4}
         ], weight_decay=0.01)
         
         criterion = nn.CrossEntropyLoss(label_smoothing=0.07)
@@ -123,7 +124,7 @@ def main():
         patience, patience_counter = 7, 0
         path = f"best_v22_fold_{fold}.pt"
         
-        for epoch in range(1, 40): # Extended epoch limit
+        for epoch in range(1, 40):
             model.train()
             tr_acc_sum, total = 0, 0
             for batch_data, batch_labels in tqdm(t_loader, desc=f"   E{epoch}", leave=False):
@@ -159,6 +160,7 @@ def main():
                     print(f"   🛑 Early stop triggered. Best Val F1: {best_f1:.4f}")
                     break
         
+        best_val_f1s.append(best_f1)
         print(f"\n🔍 Evaluating Fold {fold} on UNSEEN 44 Test Samples...")
         model.load_state_dict(torch.load(path))
         model.eval()
@@ -171,7 +173,26 @@ def main():
         rolling_probs.append(np.vstack(fold_probs))
         ens_preds = np.argmax(np.mean(rolling_probs, axis=0), axis=1)
         print(f"   🔥 ROLLING TEST ACC: {accuracy_score(te_labels, ens_preds):.4f}")
-        if accuracy_score(te_labels, ens_preds) >= 0.50:
-            print(classification_report(te_labels, ens_preds, target_names=list(LID.keys()), zero_division=0))
+
+    # ─────────────────────────────────────────────────────────
+    # 🏁 FINAL THESIS REPORT
+    # ─────────────────────────────────────────────────────────
+    print("\n\n" + "="*60)
+    print("🏁 FINAL PHOSPHOROUS THESIS REPORT (5-FOLD ENSEMBLE)")
+    print("="*60)
+    
+    avg_probs = np.mean(rolling_probs, axis=0)
+    final_preds = np.argmax(avg_probs, axis=1)
+    
+    mean_val_f1 = np.mean(best_val_f1s)
+    final_test_acc = accuracy_score(te_labels, final_preds)
+    final_test_f1 = f1_score(te_labels, final_preds, average='macro')
+    
+    print(f"📈 MEAN CV VAL F1      : {mean_val_f1:.4f}")
+    print(f"🎯 FINAL ENSEMBLE TEST ACC : {final_test_acc:.4f}")
+    print(f"🧪 FINAL ENSEMBLE MACRO F1: {final_test_f1:.4f}")
+    print("-" * 60)
+    print(classification_report(te_labels, final_preds, target_names=list(LID.keys()), zero_division=0))
+    print("="*60)
 
 if __name__ == "__main__": main()
