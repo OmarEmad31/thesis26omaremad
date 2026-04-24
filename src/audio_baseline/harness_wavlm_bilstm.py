@@ -258,7 +258,7 @@ def print_confusion_matrix(cm, classes):
 def train():
     device = "cuda"
     colab_root = Path("/content/drive/MyDrive/Thesis Project")
-    csv_p = colab_root / "data/processed/splits/text_hc"
+    csv_p = colab_root / "data/processed/splits/audio_hc"
     
     path_map = get_path_map(colab_root)
     tr_df, va_df = pd.read_csv(csv_p / "train.csv"), pd.read_csv(csv_p / "val.csv")
