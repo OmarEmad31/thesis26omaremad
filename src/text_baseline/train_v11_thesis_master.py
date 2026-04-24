@@ -153,7 +153,9 @@ def main():
                     p.extend(torch.argmax(model(**batch).logits, 1).cpu().numpy())
                     t.extend(batch_labels.numpy())
             
+            acc = accuracy_score(t, p)
             f1 = f1_score(t, p, average='macro')
+            print(f"📈 Epoch {epoch} | Val Acc: {acc:.4f} | F1: {f1:.4f}")
             if f1 > best_f1:
                 best_f1 = f1
                 torch.save(model.state_dict(), path)
