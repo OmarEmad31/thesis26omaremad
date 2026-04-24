@@ -124,7 +124,7 @@ def create_speaker_independent_split(df, val_size=CleanConfig.VAL_SIZE, trials=2
     for _ in range(trials):
         random.shuffle(speakers)
         limit = int(len(speakers) * (1 - val_size))
-        tr_s, va_s = speakers[:limit], speakers[split_idx := limit:]
+        tr_s, va_s = speakers[:limit], speakers[limit:]
         
         tr_cnts = spk_stats.loc[tr_s].sum()
         va_cnts = spk_stats.loc[va_s].sum()
