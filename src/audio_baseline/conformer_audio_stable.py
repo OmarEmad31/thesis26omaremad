@@ -166,11 +166,14 @@ class WavLMEliteSER(nn.Module):
         self.wavlm = get_peft_model(base, cfg)
         # NO gradient_checkpointing (breaks PEFT)
 
-        # Learnable weights for all 12 WavLM hidden layers
-        self.layer_weights = nn.Parameter(torch.ones(12))
+        # Learnable weights for last 6 WavLM layers (high-level semantic, layers 7-12)
+        # Early layers = phonetics/noise, not relevant for emotion
+        self.layer_weights = nn.Parameter(torch.ones(6))
 
-        # Attention pooling over time
+        # Attention pooling — zero-init so it starts as mean pool, then learns
         self.attn_pool = AttentionPool(768)
+        nn.init.zeros_(self.attn_pool.attn.weight)
+        nn.init.zeros_(self.attn_pool.attn.bias)
 
         # SupCon projection head (L2-normalized output)
         self.proj_head = nn.Sequential(
@@ -197,11 +200,10 @@ class WavLMEliteSER(nn.Module):
         mask = torch.ones(wav.shape[:2], device=wav.device)
         out  = self.wavlm(wav, attention_mask=mask, output_hidden_states=True)
 
-        # Weighted sum of all 12 hidden layers
-        # Emotion is distributed across layers: phonetics (early) + prosody (mid) + semantics (late)
-        hidden_states = out.hidden_states[-12:]                # 12 × [B, T, 768]
+        # Weighted sum of last 6 hidden layers only (high-level semantic)
+        hidden_states = out.hidden_states[-6:]                # 6 × [B, T, 768]
         w = F.softmax(self.layer_weights, dim=0)
-        weighted = sum(w[i] * hidden_states[i] for i in range(12))  # [B, T, 768]
+        weighted = sum(w[i] * hidden_states[i] for i in range(6))  # [B, T, 768]
 
         # Attention pooling → [B, 768]
         pooled = self.attn_pool(weighted)
