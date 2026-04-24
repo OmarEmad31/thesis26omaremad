@@ -91,13 +91,19 @@ def generate_n_stable_splits(df, n=5):
         if not (0.22 <= v_size <= 0.35): attempts += 1; continue
         
         # If valid, save split map
-        split_map = {s: 'train' for s in tr_s}
-        split_map.update({s: 'val' for s in va_s})
+        spk_to_split = {s: 'train' for s in tr_s}
+        spk_to_split.update({s: 'val' for s in va_s})
         
         # Avoid duplicate splits
         sig = "".join(sorted(va_s))
         if sig not in [s['sig'] for s in valid_splits]:
-            valid_splits.append({'map': split_map, 'sig': sig, 'tr_c': tr_cnts, 'va_c': va_cnts})
+            valid_splits.append({
+                'map': [spk_to_split[s] for s in df['spk_clean']],
+                'spk_map': spk_to_split,
+                'sig': sig,
+                'tr_c': tr_cnts,
+                'va_c': va_cnts
+            })
             
     print(f"  Found {len(valid_splits)} candidate splits after {attempts} attempts.")
     return valid_splits

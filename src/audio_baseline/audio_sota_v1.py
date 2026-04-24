@@ -205,8 +205,9 @@ def main():
     print("\n⚖️ [STAGE 1] Generating Speaker-Independent Split...")
     splits = generate_n_stable_splits(df, n=10)
     
-    # Direct list assignment (Ignores index alignment issues)
-    df['split'] = list(splits[0]['map'])
+    # Correct broadcasting: Speaker -> Split (Fixing the 58 vs 620 mismatch)
+    spk_map = splits[0]['spk_map']
+    df['split'] = df['spk_clean'].map(spk_map)
     
     print(f"   First 5 assignments: {df['split'].values[:5]}")
     print(f"📊 Split Counts: {df['split'].value_counts().to_dict()}")
