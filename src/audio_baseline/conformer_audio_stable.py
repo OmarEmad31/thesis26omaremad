@@ -40,6 +40,11 @@ from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score
 import noisereduce as nr
 import pyloudnorm as pyln
+import logging
+# Silence FunASR / ModelScope verbose INFO output
+for _log in ["funasr", "modelscope", "modelscope.utils",
+             "modelscope.hub", "urllib3", "asyncio"]:
+    logging.getLogger(_log).setLevel(logging.ERROR)
 
 # ─────────────────────────────────────────────────────────
 # CONFIG
@@ -53,7 +58,6 @@ FOCAL_GAMMA    = 2.0
 RARE_THRESHOLD = 50
 K_PER_CLASS    = 2
 E2V_MODEL      = "iic/emotion2vec_base_finetuned"
-E2V_REVISION   = "v2.0.4"
 
 
 # ─────────────────────────────────────────────────────────
@@ -104,8 +108,7 @@ def extract_prosody(y: np.ndarray) -> np.ndarray:
 def load_emotion2vec(cache_dir: str):
     from funasr import AutoModel
     print(f"[E2V] Loading {E2V_MODEL} ...")
-    m = AutoModel(model=E2V_MODEL, model_revision=E2V_REVISION,
-                  cache_dir=cache_dir, disable_update=True)
+    m = AutoModel(model=E2V_MODEL, cache_dir=cache_dir, disable_update=True)
     print("[E2V] Model loaded.")
     return m
 
@@ -113,16 +116,19 @@ def load_emotion2vec(cache_dir: str):
 def extract_e2v_embedding(e2v_model, audio_path: str) -> np.ndarray | None:
     """Extract utterance-level emotion embedding from emotion2vec."""
     try:
+        # Temporarily silence any remaining per-file logs
+        logging.disable(logging.INFO)
         res = e2v_model.generate(str(audio_path), output_dir=None,
                                  granularity="utterance", extract_embedding=True)
+        logging.disable(logging.NOTSET)
         if not res: return None
         r = res[0]
-        # Try multiple possible key names robustly
         for key in ["feats", "embedding", "hidden_states", "features"]:
             if key in r:
                 e = np.array(r[key], dtype=np.float32)
                 return e.mean(0) if e.ndim == 2 else e
     except Exception as ex:
+        logging.disable(logging.NOTSET)
         print(f"  [WARN] {Path(audio_path).name}: {ex}")
     return None
 
@@ -206,8 +212,7 @@ class FocalLoss(nn.Module):
 # ─────────────────────────────────────────────────────────
 class EmbDataset(Dataset):
     def __init__(self, cache: dict, lids: list, augment=False, rare_lids=None):
-        self.items     = [(fname, cache[fname]) for fname in cache
-                          if cache[fname]["lid"] in lids or True]
+        self.items     = [(fname, cache[fname]) for fname in cache]
         # Filter to only the subset we need (by lid match from dataframe)
         self.augment   = augment
         self.rare_lids = set(rare_lids or [])
