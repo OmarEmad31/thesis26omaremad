@@ -4,12 +4,12 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-SPLITS_DIR = PROJECT_ROOT / "data" / "processed" / "splits" / "text_hc"
-TRAIN_CSV = SPLITS_DIR / "train.csv"
-VAL_CSV = SPLITS_DIR / "val.csv"
-TEST_CSV = SPLITS_DIR / "test.csv"
+SPLITS_DIR = PROJECT_ROOT / "data" / "processed" / "splits" / "trackA_cleaned"
+TRAIN_CSV = SPLITS_DIR / "trackA_train_clean.csv"
+VAL_CSV = SPLITS_DIR / "trackA_val_clean.csv"
+TEST_CSV = SPLITS_DIR / "trackA_val_clean.csv" # We pool these for K-Fold in train.py
 
-CHECKPOINT_DIR = Path("D:/thesis_checkpoints/text_baseline_marbert")
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "text_sanitized_ensemble"
 
 MODEL_NAME = "UBC-NLP/MARBERT"
 
