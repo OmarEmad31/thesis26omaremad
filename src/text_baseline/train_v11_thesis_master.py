@@ -127,23 +127,27 @@ def main():
         
         for epoch in range(1, 13):
             model.train()
-            for batch_data, batch_labels in tqdm(t_loader, desc=f"Epoch {epoch}", leave=False):
+            train_loss = 0.0
+            tr_p, tr_t = [], []
+            
+            for batch_data, batch_labels in tqdm(t_loader, desc=f"Epoch {epoch}"):
                 batch = {k: v.to(device) for k, v in batch_data.items()}
                 targets = batch_labels.to(device)
                 optimizer.zero_grad()
                 
                 out = model(**batch)
                 
-                # Classical SCL Integration
                 ce_loss = criterion(out.logits, targets)
-                hidden = out.hidden_states[-1][:, 0, :] # Extract CLS token
+                hidden = out.hidden_states[-1][:, 0, :]
                 con_loss = scl_loss(hidden, targets)
                 
-                # Weight SCL heavily as per previous successful runs
-                loss = ce_loss + (0.1 * con_loss) 
-                
+                loss = ce_loss + (0.1 * con_loss)
                 loss.backward()
                 optimizer.step()
+                
+                train_loss += loss.item()
+                tr_p.extend(torch.argmax(out.logits, 1).cpu().numpy())
+                tr_t.extend(targets.cpu().numpy())
                 
             model.eval()
             p, t = [], []
@@ -155,7 +159,10 @@ def main():
             
             acc = accuracy_score(t, p)
             f1 = f1_score(t, p, average='macro')
-            print(f"📈 Epoch {epoch} | Val Acc: {acc:.4f} | F1: {f1:.4f}")
+            tr_acc = accuracy_score(tr_t, tr_p)
+            avg_loss = train_loss / len(t_loader)
+            
+            print(f"📈 Epoch {epoch} | Train Loss: {avg_loss:.4f} | Train Acc: {tr_acc:.4f} | Val Acc: {acc:.4f} | Val F1: {f1:.4f}")
             if f1 > best_f1:
                 best_f1 = f1
                 torch.save(model.state_dict(), path)
