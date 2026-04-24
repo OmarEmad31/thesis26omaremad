@@ -259,14 +259,22 @@ def train_handcrafted_baseline(df):
 
 def main():
     seed_everything(CleanConfig.SEED)
-    colab_root = Path("/content/drive/MyDrive/Thesis Project")
-    csv_root = colab_root / "data/processed/splits/text_hc"
     
-    manifest_p = colab_root / "audio_manifest.csv"
-    report_p = colab_root / "audio_audit_report.txt"
+    # Environment detection
+    if os.path.exists("/content/drive/MyDrive"):
+        proj_root = Path("/content/drive/MyDrive/Thesis Project")
+    else:
+        # Local Windows fallback
+        proj_root = Path(__file__).parent.parent.parent
+    
+    csv_root = proj_root / "data/processed/splits/text_hc"
+    manifest_p = proj_root / "audio_manifest.csv"
+    report_p = proj_root / "audio_audit_report.txt"
+    
+    print(f"🏠 Project Root: {proj_root}")
     
     # 1. Build Manifest
-    df = build_audio_manifest(colab_root, csv_root/"train.csv", csv_root/"val.csv", manifest_p)
+    df = build_audio_manifest(proj_root, csv_root/"train.csv", csv_root/"val.csv", manifest_p)
     
     # 2. Run Audit
     run_audio_audit(df, report_p)
