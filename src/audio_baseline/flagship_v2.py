@@ -184,33 +184,33 @@ class FlagshipDataset(Dataset):
         except Exception: return None, None, None
 
     def __getitem__(self, idx):
-        yt, lid, actual_len = self._load_audio(idx)
-        if yt is None: return self.__getitem__((idx + 1) % len(self.df))
-        
-        # A2: Extract prosody from VALID portion only
-        valid_wav = yt[:actual_len]
-        if self.cfg.PROSODY_MODE == "expanded":
-            prosody = extract_expanded_prosody(valid_wav, self.cfg.SR)
-            if self.stats is not None:
-                prosody = (prosody - self.stats['mean']) / (self.stats['std'] + 1e-6)
-        else:
-            prosody = np.zeros(1) # Stub
-            
-        if self.augment:
-            # Waveform masked augmentation
-            yt = self.aug_pipe(samples=yt, sample_rate=self.cfg.SR)
-            
-        # Create mask
-        mask = torch.zeros(self.cfg.MAX_LEN, dtype=torch.float32)
-        mask[:actual_len] = 1.0
-        
-        return {
-            "wav": torch.tensor(yt, dtype=torch.float32),
-            "mask": mask,
-            "true_len": torch.tensor(actual_len, dtype=torch.long),
-            "prosody": torch.tensor(prosody, dtype=torch.float32),
-            "label": torch.tensor(lid, dtype=torch.long)
-        }
+        for _ in range(len(self.df)):
+            yt, lid, actual_len = self._load_audio(idx)
+            if yt is not None:
+                # A2: Extract prosody from VALID portion only
+                valid_wav = yt[:actual_len]
+                if self.cfg.PROSODY_MODE == "expanded":
+                    prosody = extract_expanded_prosody(valid_wav, self.cfg.SR)
+                    if self.stats is not None:
+                        prosody = (prosody - self.stats['mean']) / (self.stats['std'] + 1e-6)
+                else:
+                    prosody = np.zeros(1) 
+                    
+                if self.augment:
+                    yt = self.aug_pipe(samples=yt, sample_rate=self.cfg.SR)
+                    
+                mask = torch.zeros(self.cfg.MAX_LEN, dtype=torch.float32)
+                mask[:actual_len] = 1.0
+                
+                return {
+                    "wav": torch.tensor(yt, dtype=torch.float32),
+                    "mask": mask,
+                    "true_len": torch.tensor(actual_len, dtype=torch.long),
+                    "prosody": torch.tensor(prosody, dtype=torch.float32),
+                    "label": torch.tensor(lid, dtype=torch.long)
+                }
+            idx = (idx + 1) % len(self.df)
+        raise FileNotFoundError("Zero valid audio files found in dataset path map.")
 
 class BalancedBatchSampler(Sampler):
     def __init__(self, labels, k=2):
@@ -434,7 +434,7 @@ def run_experiment(config_updates={}):
     va_df["lid"] = va_df["emotion_final"].map(lid)
     
     # Path map
-    pm = {f.name: str(f) for f in colab_root.rglob("*.wav")}
+    pm = get_path_map(colab_root)
     
     # A2: Standardize prosody using TRAIN set only
     stats = get_prosody_stats(tr_df, pm, cfg)
