@@ -355,8 +355,8 @@ def train():
         {"params": [p for n, p in model.wavlm.named_parameters()
                     if "lora_" not in n and p.requires_grad], "lr": 5e-7},
         {"params": [p for n, p in model.wavlm.named_parameters()
-                    if "lora_" in n],                         "lr": 1e-5},
-        {"params": model.classifier.parameters(),             "lr": 5e-5},
+                    if "lora_" in n],                         "lr": 5e-6},
+        {"params": model.classifier.parameters(),             "lr": 2e-5},
     ], weight_decay=0.01)
     sch2 = get_cosine_schedule_with_warmup(
         opt2, len(bal_sampler), len(bal_sampler) * PHASE2_EPOCHS)
