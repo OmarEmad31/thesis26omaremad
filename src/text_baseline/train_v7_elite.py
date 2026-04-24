@@ -93,16 +93,23 @@ class EliteTrainer:
         va_loader = DataLoader(TextDataset(self.va_df, self.tokenizer, self.LID), batch_size=16)
         te_loader = DataLoader(TextDataset(self.te_df, self.tokenizer, self.LID), batch_size=16)
 
-        opt = torch.optim.AdamW(self.model.parameters(), lr=2e-5, weight_decay=0.01)
+        # Differential LRs (Crucial for frozen-ish backbones)
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in self.model.named_parameters() if "bert" not in n], 'lr': 5e-4},
+            {'params': [p for n, p in self.model.named_parameters() if "bert" in n], 'lr': 2e-5, 'weight_decay': 0.01}
+        ]
+        opt = torch.optim.AdamW(optimizer_grouped_parameters)
         sched = get_cosine_schedule_with_warmup(opt, num_warmup_steps=100, num_training_steps=len(tr_loader)*25)
         
-        # Focal Loss for rare classes
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
         best_f1 = 0
         for epoch in range(1, 26):
+            # Dynamic Alpha Warmup (0 -> 4.0 over 5 epochs)
+            current_alpha = min(4.0, (epoch / 5.0) * 4.0)
+            
             self.model.train()
-            for batch in tqdm(tr_loader, desc=f"Epoch {epoch}"):
+            for batch in tqdm(tr_loader, desc=f"Epoch {epoch} (A={current_alpha:.1f})"):
                 batch = {k: v.to("cuda") for k, v in batch.items()}
                 opt.zero_grad()
                 
@@ -113,7 +120,7 @@ class EliteTrainer:
                 loss_ce = (criterion(out1.logits, batch['labels']) + criterion(out2.logits, batch['labels'])) / 2
                 loss_kl = kl_loss(out1.logits, out2.logits)
                 
-                loss = loss_ce + (4.0 * loss_kl) # Alpha=4.0 for R-Drop
+                loss = loss_ce + (current_alpha * loss_kl) # Use Dynamic Alpha
                 loss.backward()
                 opt.step()
                 sched.step()
