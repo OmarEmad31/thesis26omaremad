@@ -103,13 +103,12 @@ class UltimateTextTrainer:
                 batch = {k: v.to("cuda") for k, v in batch.items()}
                 opt.zero_grad()
                 
-                # SCL Hidden State extraction
-                out = self.model.bert(batch['input_ids'], attention_mask=batch['attention_mask'], output_hidden_states=True)
-                logits = self.model.head(out.pooler_output)
+                outputs = self.model(batch['input_ids'], attention_mask=batch['attention_mask'])
+                logits = outputs.logits
                 loss = criterion(logits, batch['labels'])
                 
                 # ADD SCL LOSS (Contrastive)
-                hidden = out.hidden_states[-1][:, 0, :]
+                hidden = outputs.hidden_states[-1][:, 0, :]
                 features = F.normalize(hidden, p=2, dim=1)
                 sim = torch.matmul(features, features.T) / 0.1
                 mask = torch.eq(batch['labels'].unsqueeze(1), batch['labels'].unsqueeze(0)).float()
@@ -117,6 +116,7 @@ class UltimateTextTrainer:
                 mask *= diag_mask
                 valid = mask.sum(1) > 0
                 if valid.any():
+                    # Optimized numerically stable log_softmax
                     log_p = (sim - torch.max(sim, 1, True)[0].detach()) - torch.log(torch.exp(sim-torch.max(sim,1,True)[0].detach()).sum(1, True)*diag_mask + 1e-8)
                     scl = - (mask[valid] * log_p[valid]).sum(1) / (mask[valid].sum(1) + 1e-8)
                     loss += 0.1 * scl.mean()
