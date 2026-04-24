@@ -189,7 +189,13 @@ def train_sota(df, fold_idx):
 def main():
     seed_everything(SOTAConfig.SEED)
     root = Path("/content/drive/MyDrive/Thesis Project")
-    df = pd.read_csv(root / "audio_manifest.csv")
+    man_p = root / "audio_manifest.csv"
+    if not man_p.exists():
+        print(f"❌ Manifest not found at {man_p}")
+        return
+        
+    df = pd.read_csv(man_p)
+    print(f"📊 Loaded manifest: {len(df)} samples.")
     
     # Ensure speaker identity column exists for the splitter
     df['spk_clean'] = df['speaker_identity'].fillna(df['speaker']).astype(str)
@@ -197,15 +203,16 @@ def main():
     # We use the Scientific Split (Track B) for this experiment
     from clean_rebuild_v1 import generate_n_stable_splits
     print("\n⚖️ [STAGE 1] Generating Speaker-Independent Split...")
-    splits = generate_n_stable_splits(df, n=10) # 10 attempts to ensure we get a valid split
+    splits = generate_n_stable_splits(df, n=10)
     
-    # Correctly apply the map
-    df['split'] = splits[0]['map']
+    # Correctly apply the map (Ensure index alignment)
+    df['split'] = pd.Series(splits[0]['map'], index=df.index)
     
     print(f"📊 Split result: {df['split'].value_counts().to_dict()}")
     
     if len(df[df['split']=='train']) == 0:
-        print("❌ CRITICAL ERROR: Train set is empty. Check speaker distribution.")
+        print("❌ CRITICAL ERROR: Train set is empty. Diagnostics:")
+        print(f"   Unique Speakers: {df['spk_clean'].nunique()}")
         return
 
     metrics = train_sota(df, fold_idx=1)
