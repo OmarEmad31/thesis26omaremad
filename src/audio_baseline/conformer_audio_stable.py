@@ -147,6 +147,15 @@ class WavLMSER_v8(nn.Module):
             dropout=0.1, batch_first=True
         )
         self.transformer_head = nn.TransformerEncoder(enc_layer, num_layers=2)
+        # Identity initialization: zero out output projections so each layer
+        # starts as an identity function (x + 0 = x via residuals).
+        # This ensures Ep1 starts at ~28% not 22% (random scramble).
+        for layer in self.transformer_head.layers:
+            nn.init.zeros_(layer.self_attn.out_proj.weight)
+            nn.init.zeros_(layer.self_attn.out_proj.bias)
+            nn.init.zeros_(layer.linear2.weight)
+            nn.init.zeros_(layer.linear2.bias)
+
 
         # Attention pooling (zero-init = mean pool at start)
         self.attn_pool = AttentionPool(768)
