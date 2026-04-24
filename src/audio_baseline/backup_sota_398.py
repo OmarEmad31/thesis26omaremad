@@ -419,9 +419,18 @@ def train():
     pm = defaultdict(list)
     for p in colab_root.rglob("*.wav"): pm[p.name].append(str(p))
     if not pm: 
-        print("Extracting Audio Zip...")
+        print("Searching for Thesis_Audio_Full.zip recursively on Drive...")
+        zname = "Thesis_Audio_Full.zip"
+        zpath = None
+        for root, _, files in os.walk("/content/drive/MyDrive"):
+            if zname in files:
+                zpath = os.path.join(root, zname)
+                break
+        if not zpath: raise FileNotFoundError(f"CRITICAL: {zname} not found anywhere on Google Drive.")
+        
+        print(f"📦 Extracting {zpath} to local runtime...")
         import zipfile
-        with zipfile.ZipFile(colab_root/"Thesis_Audio_Full.zip", 'r') as z: z.extractall("/content/dataset")
+        with zipfile.ZipFile(zpath, 'r') as z: z.extractall("/content/dataset")
         for p in Path("/content/dataset").rglob("*.wav"): pm[p.name].append(str(p))
 
     # Duplicate check
