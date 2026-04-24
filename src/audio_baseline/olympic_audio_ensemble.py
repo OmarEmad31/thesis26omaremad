@@ -148,9 +148,8 @@ def run_ensemble():
     colab_root = Path("/content/drive/MyDrive/Thesis Project")
     csv_p = colab_root / "data/processed/splits/audio_hc"
     
-    # 1. Verification of assets
+    # 1. Verification of assets (BiLSTM explicitly ignored due to 4% crash weights)
     paths = {
-        "BiLSTM": colab_root / "harness_wavlm_bilstm.pt",
         "Backup": colab_root / "wavlm_elite_best.pt",
         "Titan":  colab_root / "colab_titan_best.pt"
     }
@@ -159,7 +158,7 @@ def run_ensemble():
     if missing:
         print(f"⚠️ Missing Models: {missing}. The ensemble will still run using the available models to boost accuracy!")
     else:
-        print("✅ All 3 peak models detected successfully.")
+        print("✅ Both peak models detected successfully.")
 
     available_models = [name for name, p in paths.items() if p.exists()]
     if not available_models:
