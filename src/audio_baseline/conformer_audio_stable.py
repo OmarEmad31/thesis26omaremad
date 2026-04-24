@@ -393,6 +393,11 @@ def train():
     # PHASE 2 — LoRA fine-tune, FOCAL ONLY (no SupCon)
     # ═══════════════════════════════════════════════════
     model.unfreeze_lora()
+    # Phase 2: natural distribution (no balanced sampler)
+    # Focal Loss handles imbalance. Balanced sampler here causes distribution
+    # shift that collapses accuracy (model calibrates for uniform, val is not).
+    tr_phase2 = DataLoader(tr_ds, batch_size=16, shuffle=True,
+                           drop_last=True, num_workers=0)
     opt2 = torch.optim.AdamW([
         {"params": [p for n, p in model.wavlm.named_parameters()
                     if "lora_" not in n and p.requires_grad], "lr": 5e-7},
@@ -402,8 +407,8 @@ def train():
         {"params": model.attn_pool.parameters(),              "lr": 2e-5},
         {"params": model.classifier.parameters(),             "lr": 2e-5},
     ], weight_decay=0.01)
-    smp  = make_sampler()
-    sch2 = get_cosine_schedule_with_warmup(opt2, len(smp), len(smp) * PHASE2_EPOCHS)
+    smp  = make_sampler()  # still used for SWA BN pass
+    sch2 = get_cosine_schedule_with_warmup(opt2, len(tr_phase2), len(tr_phase2) * PHASE2_EPOCHS)
 
     print(f"\n{'='*60}")
     print(f"  PHASE 2 — LoRA Fine-tune ({PHASE2_EPOCHS} epochs, Focal only)")
@@ -411,10 +416,8 @@ def train():
     print(f"{'='*60}")
 
     for ep in range(1, PHASE2_EPOCHS + 1):
-        smp       = make_sampler()
-        tr_loader = DataLoader(tr_ds, batch_sampler=smp, num_workers=0)
         model.train(); ep_loss = 0.0
-        for b in tqdm(tr_loader, desc=f"Ph2 Ep{ep:02d}", leave=False):
+        for b in tqdm(tr_phase2, desc=f"Ph2 Ep{ep:02d}", leave=False):
             with autocast("cuda"):
                 loss = crit(model(b["wav"].to(device), b["prosody"].to(device)),
                             b["label"].to(device))
@@ -431,7 +434,7 @@ def train():
         tag = ""
         if acc > best_acc:
             best_acc = acc; torch.save(model.state_dict(), save_path); tag = "  *** BEST ***"
-        print(f"Ph2 Ep {ep:02d} | Loss {ep_loss/len(smp):.3f} | "
+        print(f"Ph2 Ep {ep:02d} | Loss {ep_loss/len(tr_phase2):.3f} | "
               f"Val Acc {acc:.3f} | F1 {f1:.3f}{tag}")
 
     # ═══════════════════════════════════════════════════
