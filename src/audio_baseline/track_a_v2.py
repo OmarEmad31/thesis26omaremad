@@ -126,14 +126,17 @@ def main():
          print("❌ Manifest not found. Run Stage 1 logic first.")
          return
     
-    # We use original split (Track A)
-    # The manifest already contains the 'split' column from the original train/val CSVs
+    # We use original split (Track A) for target performance
+    # We re-import the original split from the source CSVs to be sure
     df = pd.read_csv(manifest_p)
-    # Ensure stable split
+    orig_val_ids = set(pd.read_csv(csv_r/"val.csv")['sample_id'])
+    
+    df['split'] = df['sample_id'].apply(lambda x: 'val' if x in orig_val_ids else 'train')
+    
     tr_df = df[df['split'] == 'train']
     va_df = df[df['split'] == 'val']
     
-    print(f"TRACK A: Train {len(tr_df)} | Val {len(va_df)}")
+    print(f"TRACK A (Original Split): Train {len(tr_df)} | Val {len(va_df)}")
     y_tr, y_va = tr_df['label_id'], va_df['label_id']
 
     # 1. Handcrafted Features
