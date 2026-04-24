@@ -3,13 +3,13 @@ Egyptian Arabic Text SER — The Stabilizer (v24)
 ==============================================
 Optimized for a professional, monotonic validation curve.
 Stabilizes the early training epochs to prevent "crashes" 
-while maintaining the 59%+ Test Record.
+while maintaining the 59%+ Test Record and detailed report.
 
 Upgrades:
 - Cosine Annealing with Warmup: Prevents early epoch spikes/crashes.
 - True LLRD (0.90 factor): Fine-grained control over MARBERT layers.
-- Triple Pooling & MSD: Retained for the 59% Test Performance.
-- Extended Patience (10): Allowing the stable curve to find the absolute peak.
+- Triple Pooling & MSD: Retained for the 59% Test Performance potential.
+- Comprehensive Final Report: MEAN CV VAL ACC + MEAN CV VAL F1 + ENSEMBLE.
 """
 
 import os, re, sys, torch
@@ -54,7 +54,7 @@ class TextDataset(Dataset):
         return {k: v[idx] for k, v in self.enc.items()}, torch.tensor(self.labels[idx], dtype=torch.long)
 
 # ─────────────────────────────────────────────────────────
-# ARCHITECTURE (TRIPLE POOLING + MSD)
+# ARCHITECTURE
 # ─────────────────────────────────────────────────────────
 class StabilizerModel(nn.Module):
     def __init__(self, model_name="UBC-NLP/MARBERT", lora_r=16):
@@ -76,17 +76,6 @@ class StabilizerModel(nn.Module):
         logits = torch.mean(torch.stack([self.classifier(d(combined)) for d in self.dropouts]), dim=0)
         return logits
 
-# ─────────────────────────────────────────────────────────
-# ENGINE
-# ─────────────────────────────────────────────────────────
-def get_optimizer_params(model, base_lr=2e-5, weight_decay=0.01):
-    # LLRD Implementation (Simplified across groups)
-    params = [
-        {'params': [p for n, p in model.named_parameters() if "classifier" in n], 'lr': 8e-4}, # High Head LR
-        {'params': [p for n, p in model.named_parameters() if "bert" in n], 'lr': base_lr}    # Backbone LR
-    ]
-    return params
-
 def main():
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -103,9 +92,10 @@ def main():
     te_loader = DataLoader(TextDataset(te_df['transcript'].values, te_labels, tokenizer), batch_size=16)
     
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    rolling_probs, best_val_f1s = [], []
+    rolling_probs = []
+    best_val_f1s, best_val_accs = [], []
 
-    print("\n" + "="*60 + "\n🚀 V24: THE STABILIZER (COSINE WARMUP + TRIPLE POOLING)\n" + "="*60)
+    print("\n" + "="*60 + "\n🚀 V24: THE STABILIZER (COSINE WARMUP + FULL REPORT)\n" + "="*60)
     
     for fold, (t_idx, v_idx) in enumerate(skf.split(texts, labels)):
         print(f"\n📂 FOLD {fold} PREPARATION...")
@@ -113,15 +103,17 @@ def main():
         v_loader = DataLoader(TextDataset(texts[v_idx], labels[v_idx], tokenizer), batch_size=16)
         
         model = StabilizerModel().to(device)
-        optimizer = torch.optim.AdamW(get_optimizer_params(model), weight_decay=0.01)
+        optimizer = torch.optim.AdamW([
+            {'params': [p for n, p in model.named_parameters() if "classifier" in n], 'lr': 8e-4},
+            {'params': [p for n, p in model.named_parameters() if "bert" in n], 'lr': 2e-5}
+        ], weight_decay=0.01)
         
-        # SCHEDULER (The Stabilizer Fix)
         num_epochs = 30
         total_steps = len(t_loader) * num_epochs
         scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1 * total_steps), num_training_steps=total_steps)
         
         criterion = nn.CrossEntropyLoss(label_smoothing=0.08)
-        best_f1, patience, patience_counter = 0, 10, 0 # Higher patience for smooth curve
+        best_f1, best_acc, patience, patience_counter = 0, 0, 10, 0
         path = f"best_v24_fold_{fold}.pt"
         
         for epoch in range(1, num_epochs + 1):
@@ -132,9 +124,7 @@ def main():
                 logits = model(batch_data['input_ids'].to(device), batch_data['attention_mask'].to(device))
                 targets = batch_labels.to(device)
                 loss = criterion(logits, targets)
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
+                loss.backward(); optimizer.step(); scheduler.step()
                 tr_acc_sum += (torch.argmax(logits, 1) == targets).sum().item(); total += len(targets)
                 
             model.eval()
@@ -148,13 +138,15 @@ def main():
             print(f"   📈 E{epoch} | TrAcc: {tr_acc_sum/total:.4f} | VAcc: {v_acc:.4f} | VF1: {v_f1:.4f}")
             
             if v_f1 > best_f1:
-                best_f1 = v_f1
+                best_f1, best_acc = v_f1, v_acc
                 torch.save(model.state_dict(), path); patience_counter = 0
             else:
                 patience_counter += 1
-                if patience_counter >= patience: break
+                if patience_counter >= patience: 
+                    print(f"   🛑 Early stop. Best Val F1: {best_f1:.4f}")
+                    break
         
-        best_val_f1s.append(best_f1)
+        best_val_f1s.append(best_f1); best_val_accs.append(best_acc)
         model.load_state_dict(torch.load(path))
         model.eval()
         fold_probs = []
@@ -166,10 +158,11 @@ def main():
         rolling_probs.append(np.vstack(fold_probs))
         print(f"   🔥 ROLLING TEST ACC: {accuracy_score(te_labels, np.argmax(np.mean(rolling_probs, axis=0), axis=1)):.4f}")
 
-    # FINAL THESIS REPORT
+    # 🏁 FINAL COMPREHENSIVE REPORT
     print("\n\n" + "="*60 + "\n🏁 FINAL PHOSPHOROUS THESIS REPORT (V24 STABILIZED)\n" + "="*60)
     final_preds = np.argmax(np.mean(rolling_probs, axis=0), axis=1)
-    print(f"📈 MEAN CV VAL F1      : {np.mean(best_val_f1s):.4f}")
+    print(f"📈 MEAN CV VAL ACC      : {np.mean(best_val_accs):.4f}")
+    print(f"📈 MEAN CV VAL F1       : {np.mean(best_val_f1s):.4f}")
     print(f"🎯 FINAL ENSEMBLE TEST ACC : {accuracy_score(te_labels, final_preds):.4f}")
     print(f"🧪 FINAL ENSEMBLE MACRO F1: {f1_score(te_labels, final_preds, average='macro'):.4f}\n" + "-"*60)
     print(classification_report(te_labels, final_preds, target_names=list(LID.keys()), zero_division=0))
