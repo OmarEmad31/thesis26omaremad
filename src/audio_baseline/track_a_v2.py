@@ -128,6 +128,7 @@ def main():
     
     # We use original split (Track A) for target performance
     # We re-import the original split from the source CSVs to be sure
+    csv_r = root / "data/processed/splits/text_hc"
     df = pd.read_csv(manifest_p)
     orig_val_ids = set(pd.read_csv(csv_r/"val.csv")['sample_id'])
     
