@@ -73,21 +73,25 @@ def main():
         print("✨ Using CLEANED (No Leakage) Track A Split...")
         tr_df = pd.read_csv(clean_p / "trackA_train_clean.csv")
         va_df = pd.read_csv(clean_p / "trackA_val_clean.csv")
+        # Ensure numeric IDs exist
+        tr_df['label_id'] = tr_df['emotion_final'].map(TrackAConfig.LID)
+        va_df['label_id'] = va_df['emotion_final'].map(TrackAConfig.LID)
     else:
         print("⚠️ Using Original Split (Audit Recommended)...")
         manifest = pd.read_csv(root / "audio_manifest.csv")
         man_map = manifest.set_index('sample_id')['resolved_path'].to_dict()
-        lab_map = manifest.set_index('sample_id')['label_id'].to_dict()
         
         tr_df = pd.read_csv(csv_r / "train.csv")
         va_df = pd.read_csv(csv_r / "val.csv")
         tr_df['resolved_path'] = tr_df['sample_id'].map(man_map)
         va_df['resolved_path'] = va_df['sample_id'].map(man_map)
-        tr_df['label_id'] = tr_df['sample_id'].map(lab_map)
-        va_df['label_id'] = va_df['sample_id'].map(lab_map)
+        tr_df['label_id'] = tr_df['emotion_final'].map(TrackAConfig.LID)
+        va_df['label_id'] = va_df['emotion_final'].map(TrackAConfig.LID)
         tr_df = tr_df.dropna(subset=['resolved_path'])
         va_df = va_df.dropna(subset=['resolved_path'])
 
+    tr_df['resolved_path'] = tr_df['resolved_path'].astype(str)
+    va_df['resolved_path'] = va_df['resolved_path'].astype(str)
     y_tr, y_va = tr_df['label_id'].values, va_df['label_id'].values
 
     hc_tr_p, hc_va_p = TrackAConfig.CACHE_DIR/"hc_tr.npy", TrackAConfig.CACHE_DIR/"hc_va.npy"
