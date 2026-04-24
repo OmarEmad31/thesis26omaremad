@@ -191,6 +191,9 @@ def main():
     root = Path("/content/drive/MyDrive/Thesis Project")
     df = pd.read_csv(root / "audio_manifest.csv")
     
+    # Ensure speaker identity column exists for the splitter
+    df['spk_clean'] = df['speaker_identity'].fillna(df['speaker']).astype(str)
+    
     # We use the Scientific Split (Track B) for this experiment
     # Import the splitter from v52
     from clean_rebuild_v1 import generate_n_stable_splits
