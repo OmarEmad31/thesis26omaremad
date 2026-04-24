@@ -195,11 +195,19 @@ def main():
     df['spk_clean'] = df['speaker_identity'].fillna(df['speaker']).astype(str)
     
     # We use the Scientific Split (Track B) for this experiment
-    # Import the splitter from v52
     from clean_rebuild_v1 import generate_n_stable_splits
-    splits = generate_n_stable_splits(df, n=1) # Just one split for time check
+    print("\n⚖️ [STAGE 1] Generating Speaker-Independent Split...")
+    splits = generate_n_stable_splits(df, n=10) # 10 attempts to ensure we get a valid split
+    
+    # Correctly apply the map
     df['split'] = splits[0]['map']
     
+    print(f"📊 Split result: {df['split'].value_counts().to_dict()}")
+    
+    if len(df[df['split']=='train']) == 0:
+        print("❌ CRITICAL ERROR: Train set is empty. Check speaker distribution.")
+        return
+
     metrics = train_sota(df, fold_idx=1)
     print("\n🏆 SOTA GENERALIZATION RESULTS:")
     print(metrics)
