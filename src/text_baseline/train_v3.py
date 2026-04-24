@@ -108,7 +108,13 @@ def main():
     te = pd.read_csv(split_dir / "test.csv")
     
     tokenizer = AutoTokenizer.from_pretrained("UBC-NLP/MARBERT")
-    model = MARBERTWithMultiSampleDropout("UBC-NLP/MARBERT", num_labels=7).to("cuda")
+    id2label = {i: e for e, i in trainer.LID.items()}
+    model = MARBERTWithMultiSampleDropout(
+        "UBC-NLP/MARBERT", 
+        num_labels=7, 
+        id2label=id2label, 
+        label2id=trainer.LID
+    ).to("cuda")
     
     trainer = TrainerV3(model, tr, va, te, tokenizer)
     trainer.train()
