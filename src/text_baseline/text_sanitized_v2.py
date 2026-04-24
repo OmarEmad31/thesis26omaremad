@@ -9,23 +9,13 @@ import os, json, random, sys, torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
-import pandas as pd
-import numpy as np
-from tqdm import tqdm
-from transformers import (
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-    set_seed,
-    DataCollatorWithPadding
-)
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import StratifiedKFold
-from sklearn.utils.class_weight import compute_class_weight
 
-# ─────────────────────────────────────────────────────────
-# STEP 1: IMPORT YOUR EXACT MODEL ARCHITECTURE
-# ─────────────────────────────────────────────────────────
+# Fix: Guarantee project root is in sys.path
+_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import pandas as pd
 from src.text_baseline.model import MARBERTWithMultiSampleDropout
 from src.text_baseline.metrics_utils import compute_metrics
 
