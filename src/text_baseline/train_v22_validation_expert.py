@@ -123,7 +123,7 @@ def main():
         patience, patience_counter = 7, 0
         path = f"best_v22_fold_{fold}.pt"
         
-        for epoch in range(1, 25):
+        for epoch in range(1, 40): # Extended epoch limit
             model.train()
             tr_acc_sum, total = 0, 0
             for batch_data, batch_labels in tqdm(t_loader, desc=f"   E{epoch}", leave=False):
@@ -155,8 +155,11 @@ def main():
                 patience_counter = 0
             else:
                 patience_counter += 1
-                if patience_counter >= patience: break
+                if patience_counter >= patience: 
+                    print(f"   🛑 Early stop triggered. Best Val F1: {best_f1:.4f}")
+                    break
         
+        print(f"\n🔍 Evaluating Fold {fold} on UNSEEN 44 Test Samples...")
         model.load_state_dict(torch.load(path))
         model.eval()
         fold_probs = []
@@ -164,9 +167,10 @@ def main():
             for batch_data, _ in te_loader:
                 logits = model(batch_data['input_ids'].to(device), batch_data['attention_mask'].to(device))
                 fold_probs.append(F.softmax(logits, dim=-1).cpu().numpy())
+        
         rolling_probs.append(np.vstack(fold_probs))
         ens_preds = np.argmax(np.mean(rolling_probs, axis=0), axis=1)
-        print(f"\n   🔥 ROLLING TEST ACC: {accuracy_score(te_labels, ens_preds):.4f}")
+        print(f"   🔥 ROLLING TEST ACC: {accuracy_score(te_labels, ens_preds):.4f}")
         if accuracy_score(te_labels, ens_preds) >= 0.50:
             print(classification_report(te_labels, ens_preds, target_names=list(LID.keys()), zero_division=0))
 
