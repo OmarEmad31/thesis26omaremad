@@ -134,7 +134,7 @@ def main():
         
         model = OmegaModel().to(device)
         optimizer = torch.optim.AdamW([
-            {'params': [p for n, p in model.named_parameters() if "classifier" in n or "att" in n], 'lr': 1e-3},
+            {'params': [p for n, p in model.named_parameters() if "classifier" in n or "att_query" in n], 'lr': 1e-3},
             {'params': [p for n, p in model.named_parameters() if "bert" in n], 'lr': 2e-5}
         ], weight_decay=0.01)
         
