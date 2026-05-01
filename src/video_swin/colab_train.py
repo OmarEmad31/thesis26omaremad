@@ -146,29 +146,42 @@ def load_csv_split(csv_path: str) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_frames(video_path: str, num_frames: int = 16) -> np.ndarray | None:
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return None
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total <= 0:
-        cap.release()
-        return None
-    indices = np.linspace(0, total - 1, num_frames, dtype=int)
-    frames = []
-    for idx in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-        ret, frame = cap.read()
-        if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(idx) - 1))
+    import shutil, tempfile, os
+    # Google Drive FUSE doesn't support random seeks — copy to local /tmp first
+    tmp_path = None
+    try:
+        suffix = Path(video_path).suffix or ".mp4"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+        shutil.copy2(video_path, tmp_path)
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            return None
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
+            cap.release()
+            return None
+        indices = np.linspace(0, total - 1, num_frames, dtype=int)
+        frames = []
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
             ret, frame = cap.read()
-        if ret and frame is not None:
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    cap.release()
-    if not frames:
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(idx) - 1))
+                ret, frame = cap.read()
+            if ret and frame is not None:
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
+        if not frames:
+            return None
+        while len(frames) < num_frames:
+            frames.append(frames[-1])
+        return np.stack(frames[:num_frames])   # (T, H, W, 3)
+    except Exception:
         return None
-    while len(frames) < num_frames:
-        frames.append(frames[-1])
-    return np.stack(frames[:num_frames])   # (T, H, W, 3)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
