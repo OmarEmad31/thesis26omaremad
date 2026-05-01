@@ -83,23 +83,31 @@ SEED = 42
 
 def resolve_video_path(row: dict) -> Path | None:
     """Find the video file under DATASET_ROOT using folder + relpath."""
-    folder  = row.get("folder", "")
-    relpath = row.get("video_relpath", "")
-    candidate = DATASET_ROOT / folder / relpath
-    if candidate.exists():
-        return candidate
-    # Fallback: try stripping old absolute prefix from video_path column
-    raw = row.get("video_path", "")
+    # Strategy 1: direct join (works when folder/relpath columns are populated)
+    folder  = row.get("folder", "").strip()
+    relpath = row.get("video_relpath", "").strip()
+    if folder and relpath:
+        candidate = DATASET_ROOT / folder / relpath
+        if candidate.exists():
+            return candidate
+
+    # Strategy 2: parse the raw video_path column.
+    # On Colab (Linux), Windows paths like C:\Users\...\file.mp4 are a single
+    # string — we must split on backslash manually, not use Path.parts.
+    raw = row.get("video_path", "").strip()
     if raw:
-        p = Path(raw)
-        parts = p.parts
+        # Normalise: replace backslashes with forward slashes then split
+        parts = raw.replace("\\", "/").split("/")
         try:
             idx = next(i for i, pt in enumerate(parts)
                        if "Final Modalink Dataset MERGED" in pt)
-            tail = Path(*parts[idx + 1:])      # everything after the root dir
-            c2 = DATASET_ROOT / tail
-            if c2.exists():
-                return c2
+            # Everything AFTER "Final Modalink Dataset MERGED"
+            tail_parts = parts[idx + 1:]
+            if tail_parts:
+                tail = Path(*tail_parts)
+                candidate = DATASET_ROOT / tail
+                if candidate.exists():
+                    return candidate
         except StopIteration:
             pass
     return None
