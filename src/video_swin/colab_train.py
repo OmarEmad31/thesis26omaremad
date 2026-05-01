@@ -105,8 +105,23 @@ def resolve_video_path(row: dict) -> Path | None:
     return None
 
 
+def check_dataset_root():
+    """Print diagnostics to help find the correct --dataset_root."""
+    print(f"\n[DIAGNOSTIC] DATASET_ROOT = {DATASET_ROOT}")
+    print(f"[DIAGNOSTIC] DATASET_ROOT exists = {DATASET_ROOT.exists()}")
+    if not DATASET_ROOT.exists():
+        parent = DATASET_ROOT.parent
+        print(f"[DIAGNOSTIC] Parent '{parent}' exists = {parent.exists()}")
+        if parent.exists():
+            children = [p.name for p in sorted(parent.iterdir())[:20]]
+            print(f"[DIAGNOSTIC] Contents of parent:\n  " + "\n  ".join(children))
+    else:
+        children = [p.name for p in sorted(DATASET_ROOT.iterdir())[:5]]
+        print(f"[DIAGNOSTIC] First 5 subfolders: {children}")
+
+
 def load_csv_split(csv_path: str) -> list[dict]:
-    rows = []
+    rows, failed = [], 0
     with open(csv_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             emotion = row.get("emotion_final", "").strip()
@@ -116,10 +131,13 @@ def load_csv_split(csv_path: str) -> list[dict]:
                 continue
             path = resolve_video_path(row)
             if path is None:
+                failed += 1
                 continue
             row["_resolved_path"] = str(path)
             row["_label"] = EMOTION_LABELS[emotion]
             rows.append(row)
+    if failed > 0:
+        logger.warning("%d rows could not be resolved — check --dataset_root", failed)
     return rows
 
 
@@ -201,7 +219,12 @@ class VideoEmotionDataset(Dataset):
         self.transform  = VideoAugment(train=train)
         self.samples    = load_csv_split(csv_path)
         if not self.samples:
-            raise RuntimeError(f"No valid samples in {csv_path}")
+            check_dataset_root()
+            raise RuntimeError(
+                f"No valid samples found in {csv_path}.\n"
+                f"DATASET_ROOT={DATASET_ROOT} — does it contain 'videoplayback (N)' subfolders?\n"
+                f"Pass the correct path via --dataset_root"
+            )
         counts = [0] * NUM_CLASSES
         for row in self.samples:
             counts[row["_label"]] += 1
