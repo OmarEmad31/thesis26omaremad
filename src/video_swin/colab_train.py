@@ -236,12 +236,14 @@ class VideoEmotionDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        row   = self.samples[idx]
-        label = row["_label"]
-        frames = extract_frames(row["_resolved_path"], self.num_frames)
-        if frames is None:
-            return self.__getitem__(random.randint(0, len(self.samples) - 1))
-        return self.transform(frames), label
+        # Iterative fallback — avoids RecursionError on bad/slow Drive files
+        for attempt in range(len(self.samples)):
+            current_idx = (idx + attempt) % len(self.samples)
+            row = self.samples[current_idx]
+            frames = extract_frames(row["_resolved_path"], self.num_frames)
+            if frames is not None:
+                return self.transform(frames), row["_label"]
+        raise RuntimeError("Could not load any video from the dataset.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
