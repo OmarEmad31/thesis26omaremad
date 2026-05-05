@@ -39,6 +39,7 @@ CELL 2 — Run training
 """
 
 import os, sys, csv, json, time, logging, random, argparse
+from tqdm import tqdm
 from pathlib import Path
 
 import numpy as np
@@ -333,30 +334,31 @@ def make_criterion(dataset, device, label_smoothing=0.1):
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, grad_clip):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
-    for batch_idx, (videos, labels) in enumerate(loader):
+    bar = tqdm(loader, desc="  Train", leave=False, dynamic_ncols=True)
+    for videos, labels in bar:
         videos, labels = videos.to(device), labels.to(device)
         optimizer.zero_grad(set_to_none=True)
         with autocast("cuda"):
-            loss = criterion(model(videos), labels)
+            logits = model(videos)
+            loss = criterion(logits, labels)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         scaler.step(optimizer)
         scaler.update()
         total_loss += loss.item() * labels.size(0)
-        correct    += (model(videos).detach().argmax(1) == labels).sum().item() if False else 0
+        correct    += (logits.detach().argmax(1) == labels).sum().item()
         total      += labels.size(0)
-        if (batch_idx + 1) % 15 == 0:
-            logger.info("  [%d/%d] loss=%.4f", batch_idx + 1, len(loader),
-                        total_loss / total)
-    return total_loss / total
+        bar.set_postfix(loss=f"{total_loss/total:.4f}", acc=f"{correct/total:.3f}")
+    return total_loss / total, correct / total
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
     preds, labs, total_loss = [], [], 0.0
-    for videos, labels in loader:
+    bar = tqdm(loader, desc="  Val  ", leave=False, dynamic_ncols=True)
+    for videos, labels in bar:
         videos, labels = videos.to(device), labels.to(device)
         with autocast("cuda"):
             logits = model(videos)
@@ -476,20 +478,17 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
-        logger.info("\n── Epoch %d/%d ──", epoch, args.epochs)
+        print(f"\n── Epoch {epoch}/{args.epochs} ──")
 
-        train_loss = train_one_epoch(
+        train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler, device, args.grad_clip)
         scheduler.step()
 
         val = evaluate(model, val_loader, criterion, device)
-        logger.info(
-            "Epoch %d | train_loss=%.4f | val_loss=%.4f val_acc=%.4f "
-            "val_f1_macro=%.4f val_f1_w=%.4f | %.0fs",
-            epoch, train_loss,
-            val["loss"], val["accuracy"], val["f1_macro"], val["f1_weighted"],
-            time.time() - t0,
-        )
+        elapsed = time.time() - t0
+        print(f"  train_loss={train_loss:.4f}  train_acc={train_acc:.3f} "
+              f"| val_loss={val['loss']:.4f}  val_acc={val['accuracy']:.3f} "
+              f"val_f1={val['f1_macro']:.3f} | {elapsed:.0f}s")
 
         if val["accuracy"] > best_acc:
             best_acc = val["accuracy"]
