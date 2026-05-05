@@ -380,25 +380,26 @@ def evaluate(model, loader, criterion, device):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--train_csv",      required=True)
-    p.add_argument("--val_csv",        required=True)
-    p.add_argument("--dataset_root",   required=True,
+    p.add_argument("--train_csv",       required=True)
+    p.add_argument("--val_csv",         required=True)
+    p.add_argument("--test_csv",        default=None)
+    p.add_argument("--dataset_root",    required=True,
                    help="Root folder containing 'videoplayback (N)' subdirs")
-    p.add_argument("--checkpoint_dir", default="checkpoints/video_swin")
-    p.add_argument("--backbone",       default="swin_base_patch4_window7_224")
-    p.add_argument("--num_frames",     type=int,   default=16)
-    p.add_argument("--batch_size",     type=int,   default=8)
-    p.add_argument("--epochs",         type=int,   default=40)
-    p.add_argument("--lr",             type=float, default=5e-5)
-    p.add_argument("--min_lr",         type=float, default=1e-7)
-    p.add_argument("--warmup_epochs",  type=int,   default=5)
-    p.add_argument("--weight_decay",   type=float, default=0.05)
-    p.add_argument("--dropout",        type=float, default=0.4)
-    p.add_argument("--label_smoothing",type=float, default=0.1)
-    p.add_argument("--freeze_stages",  type=int,   default=2)
-    p.add_argument("--grad_clip",      type=float, default=1.0)
-    p.add_argument("--num_workers",    type=int,   default=2)
-    p.add_argument("--resume",         default=None)
+    p.add_argument("--checkpoint_dir",  default="checkpoints/video_swin")
+    p.add_argument("--backbone",        default="swin_base_patch4_window7_224")
+    p.add_argument("--num_frames",      type=int,   default=16)
+    p.add_argument("--batch_size",      type=int,   default=8)
+    p.add_argument("--epochs",          type=int,   default=40)
+    p.add_argument("--lr",              type=float, default=5e-5)
+    p.add_argument("--min_lr",          type=float, default=1e-7)
+    p.add_argument("--warmup_epochs",   type=int,   default=5)
+    p.add_argument("--weight_decay",    type=float, default=0.05)
+    p.add_argument("--dropout",         type=float, default=0.4)
+    p.add_argument("--label_smoothing", type=float, default=0.1)
+    p.add_argument("--freeze_stages",   type=int,   default=2)
+    p.add_argument("--grad_clip",       type=float, default=1.0)
+    p.add_argument("--num_workers",     type=int,   default=2)
+    p.add_argument("--resume",          default=None)
     return p.parse_args()
 
 
@@ -488,7 +489,8 @@ def main():
         elapsed = time.time() - t0
         print(f"  train_loss={train_loss:.4f}  train_acc={train_acc:.3f} "
               f"| val_loss={val['loss']:.4f}  val_acc={val['accuracy']:.3f} "
-              f"val_f1={val['f1_macro']:.3f} | {elapsed:.0f}s")
+              f"val_f1_macro={val['f1_macro']:.3f}  val_f1_w={val['f1_weighted']:.3f} "
+              f"| {elapsed:.0f}s")
 
         if val["accuracy"] > best_acc:
             best_acc = val["accuracy"]
@@ -515,11 +517,29 @@ def main():
         with open(ckpt_dir / "history.json", "w") as f:
             json.dump(history, f, indent=2)
 
-    logger.info("\n" + "=" * 60)
-    logger.info("Done!  Best val_acc=%.4f (%.1f%%)  f1_macro=%.4f",
-                best_acc, best_acc * 100, best_f1)
-    logger.info("Best model → %s", ckpt_dir / "best_model.pt")
-    logger.info("=" * 60)
+    print("\n" + "=" * 60)
+    print(f"Training complete!")
+    print(f"Best val_acc={best_acc:.4f} ({best_acc*100:.1f}%)  f1_macro={best_f1:.4f}")
+    print(f"Best model -> {ckpt_dir / 'best_model.pt'}")
+
+    # ── Final test evaluation on best checkpoint ──
+    if args.test_csv:
+        print("\n" + "=" * 60)
+        print("FINAL TEST SET EVALUATION (best_model.pt)")
+        print("=" * 60)
+        model.load_state_dict(torch.load(ckpt_dir / "best_model.pt", map_location=device))
+        test_ds     = VideoEmotionDataset(args.test_csv, args.num_frames, train=False)
+        test_loader = DataLoader(test_ds, batch_size=args.batch_size,
+                                 shuffle=False, num_workers=args.num_workers, pin_memory=True)
+        test = evaluate(model, test_loader, criterion, device)
+        label_names = [ID_TO_EMOTION[i] for i in range(NUM_CLASSES)]
+        print(f"  test_acc     = {test['accuracy']:.4f} ({test['accuracy']*100:.1f}%)")
+        print(f"  f1_macro     = {test['f1_macro']:.4f}")
+        print(f"  f1_weighted  = {test['f1_weighted']:.4f}")
+        print()
+        print(classification_report(test["labels"], test["preds"],
+                                    target_names=label_names, zero_division=0))
+        print("=" * 60)
 
 
 if __name__ == "__main__":
