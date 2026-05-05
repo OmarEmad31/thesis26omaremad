@@ -272,6 +272,17 @@ class VideoEmotionDataset(Dataset):
 # MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TemporalAttention(nn.Module):
+    """Lightweight self-attention over T frame tokens before classification."""
+    def __init__(self, dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(dim)
+    def forward(self, x):          # x: (B, T, D)
+        out, _ = self.attn(x, x, x)
+        return self.norm(x + out).mean(dim=1)   # (B, D)
+
+
 class SwinVideoModel(nn.Module):
     def __init__(self, backbone="swin_base_patch4_window7_224",
                  pretrained=True, num_classes=NUM_CLASSES,
@@ -292,8 +303,9 @@ class SwinVideoModel(nn.Module):
                     for p in layer.parameters():
                         p.requires_grad = False
 
+        self.temporal_attn = TemporalAttention(feat_dim, num_heads=4, dropout=dropout * 0.5)
+
         self.head = nn.Sequential(
-            nn.LayerNorm(feat_dim),
             nn.Dropout(dropout),
             nn.Linear(feat_dim, 512),
             nn.GELU(),
@@ -304,7 +316,8 @@ class SwinVideoModel(nn.Module):
     def forward(self, x):                     # x: (B, 3, T, H, W)
         B, C, T, H, W = x.shape
         x = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
-        feat = self.backbone(x).reshape(B, T, -1).mean(dim=1)
+        feat = self.backbone(x).reshape(B, T, -1)  # (B, T, D)
+        feat = self.temporal_attn(feat)            # (B, D)
         return self.head(feat)
 
 
@@ -331,22 +344,24 @@ def make_criterion(dataset, device, label_smoothing=0.1):
     )
 
 
-def train_one_epoch(model, loader, criterion, optimizer, scaler, device, grad_clip):
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device, grad_clip, grad_accum=1):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
+    optimizer.zero_grad(set_to_none=True)
     bar = tqdm(loader, desc="  Train", leave=False, dynamic_ncols=True)
-    for videos, labels in bar:
+    for step, (videos, labels) in enumerate(bar):
         videos, labels = videos.to(device), labels.to(device)
-        optimizer.zero_grad(set_to_none=True)
         with autocast("cuda"):
             logits = model(videos)
-            loss = criterion(logits, labels)
+            loss   = criterion(logits, labels) / grad_accum
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        total_loss += loss.item() * labels.size(0)
+        if (step + 1) % grad_accum == 0 or (step + 1) == len(loader):
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        total_loss += loss.item() * grad_accum * labels.size(0)
         correct    += (logits.detach().argmax(1) == labels).sum().item()
         total      += labels.size(0)
         bar.set_postfix(loss=f"{total_loss/total:.4f}", acc=f"{correct/total:.3f}")
@@ -398,6 +413,10 @@ def parse_args():
     p.add_argument("--label_smoothing", type=float, default=0.1)
     p.add_argument("--freeze_stages",   type=int,   default=2)
     p.add_argument("--grad_clip",       type=float, default=1.0)
+    p.add_argument("--grad_accum",      type=int,   default=1,
+                   help="Gradient accumulation steps (effective_batch = batch_size * grad_accum)")
+    p.add_argument("--patience",        type=int,   default=10,
+                   help="Early stopping patience (epochs without val_acc improvement)")
     p.add_argument("--num_workers",     type=int,   default=2)
     p.add_argument("--resume",          default=None)
     return p.parse_args()
@@ -471,18 +490,21 @@ def main():
         history     = ckpt.get("history", [])
         logger.info("Resumed from epoch %d (best_acc=%.4f)", start_epoch-1, best_acc)
 
-    # ── Training Loop ──
     logger.info("=" * 60)
-    logger.info("Training %d epochs  |  train=%d  val=%d",
-                args.epochs, len(train_ds), len(val_ds))
+    logger.info("Training %d epochs  |  train=%d  val=%d  effective_batch=%d",
+                args.epochs, len(train_ds), len(val_ds),
+                args.batch_size * args.grad_accum)
     logger.info("=" * 60)
+
+    no_improve = 0  # early stopping counter
 
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         print(f"\n── Epoch {epoch}/{args.epochs} ──")
 
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, scaler, device, args.grad_clip)
+            model, train_loader, criterion, optimizer, scaler, device,
+            args.grad_clip, args.grad_accum)
         scheduler.step()
 
         val = evaluate(model, val_loader, criterion, device)
@@ -493,13 +515,20 @@ def main():
               f"| {elapsed:.0f}s")
 
         if val["accuracy"] > best_acc:
-            best_acc = val["accuracy"]
+            best_acc   = val["accuracy"]
+            no_improve = 0
             best_f1  = val["f1_macro"]
             torch.save(model.state_dict(), ckpt_dir / "best_model.pt")
             logger.info("★ New best  acc=%.4f  f1_macro=%.4f  → saved!", best_acc, best_f1)
             label_names = [ID_TO_EMOTION[i] for i in range(NUM_CLASSES)]
             print(classification_report(val["labels"], val["preds"],
                                         target_names=label_names, zero_division=0))
+
+        else:
+            no_improve += 1
+            if no_improve >= args.patience:
+                print(f"\nEarly stopping triggered (no improvement for {args.patience} epochs).")
+                break
 
         # Full checkpoint (for resume)
         torch.save({
