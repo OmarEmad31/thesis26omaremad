@@ -582,9 +582,9 @@ def parse_args():
     p.add_argument("--weight_decay",    type=float, default=0.05)
     p.add_argument("--dropout",         type=float, default=0.5)
     p.add_argument("--label_smoothing", type=float, default=0.15)
-    p.add_argument("--freeze_stages",   type=int,   default=2)
+    p.add_argument("--freeze_stages",   type=int,   default=3)
     p.add_argument("--grad_clip",       type=float, default=1.0)
-    p.add_argument("--grad_accum",      type=int,   default=1,
+    p.add_argument("--grad_accum",      type=int,   default=2,
                    help="Gradient accumulation steps (effective_batch = batch_size * grad_accum)")
     p.add_argument("--patience",        type=int,   default=10,
                    help="Early stopping patience (epochs without val_acc improvement)")
