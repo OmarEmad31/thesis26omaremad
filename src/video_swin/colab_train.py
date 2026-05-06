@@ -503,13 +503,11 @@ def make_sampler(dataset):
 
 
 def make_criterion(dataset, device, label_smoothing=0.15):
-    counts  = np.array(dataset.class_counts, dtype=np.float32)
-    weights = 1.0 / (counts + 1.0)
-    weights = weights / weights.sum() * NUM_CLASSES
-    logger.info("Class weights: %s",
-                {ID_TO_EMOTION[i]: f"{w:.3f}" for i, w in enumerate(weights)})
+    # We do NOT pass class weights to FocalLoss because the WeightedRandomSampler
+    # already guarantees perfectly balanced batches. Passing weights here would
+    # result in a "double penalty" that destroys majority classes.
     return FocalLoss(
-        weight=torch.tensor(weights).to(device),
+        weight=None,
         gamma=2.0,
         label_smoothing=label_smoothing,
     )
