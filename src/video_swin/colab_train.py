@@ -155,15 +155,8 @@ def load_csv_split(csv_path: str) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_frames(video_path: str, num_frames: int = 16) -> np.ndarray | None:
-    import shutil, tempfile, os
-    # Google Drive FUSE doesn't support random seeks — copy to local /tmp first
-    tmp_path = None
     try:
-        suffix = Path(video_path).suffix or ".mp4"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp_path = tmp.name
-        shutil.copy2(video_path, tmp_path)
-        cap = cv2.VideoCapture(tmp_path)
+        cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return None
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -188,9 +181,7 @@ def extract_frames(video_path: str, num_frames: int = 16) -> np.ndarray | None:
         return np.stack(frames[:num_frames])   # (T, H, W, 3)
     except Exception:
         return None
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
