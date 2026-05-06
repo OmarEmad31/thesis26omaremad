@@ -260,6 +260,94 @@ class VideoEmotionDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FEATURE CACHE DATASET  (fast path — loads pre-extracted .pt files)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FeatureDataset(Dataset):
+    """Loads pre-extracted (T, D) feature tensors instead of raw video."""
+    def __init__(self, csv_path: str, cache_dir: str, augment: bool = False):
+        self.cache_dir = Path(cache_dir)
+        self.augment   = augment
+        rows = []
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                emotion = row.get("emotion_final", "").strip()
+                if emotion not in EMOTION_LABELS:
+                    continue
+                if row.get("elig_video", "0").strip() != "1":
+                    continue
+                sid = (row.get("sample_id", "").strip()
+                       .replace("/", "_").replace("\\", "_")
+                       .replace(" ", "_").replace(":", "_"))
+                feat_path = self.cache_dir / f"{sid}.pt"
+                if feat_path.exists():
+                    rows.append({"feat_path": feat_path,
+                                 "_label": EMOTION_LABELS[emotion]})
+        self.samples = rows
+        counts = [0] * NUM_CLASSES
+        for r in rows:
+            counts[r["_label"]] += 1
+        self.class_counts = counts
+        logger.info("FeatureDataset: %d cached samples from %s", len(rows), csv_path)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        row  = self.samples[idx]
+        feat = torch.load(row["feat_path"], map_location="cpu", weights_only=True)
+        if self.augment and random.random() < 0.5:
+            feat = feat[torch.randperm(feat.size(0))]  # temporal shuffle augment
+        return feat, row["_label"]
+
+
+def preextract_features(backbone, csv_paths: list, cache_dir: str,
+                        num_frames: int, device: torch.device):
+    """Run all videos through frozen Swin once, save (T, D) tensors to disk."""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    backbone.eval()
+    transform = VideoAugment(train=False)
+
+    all_rows = []
+    for csv_path in csv_paths:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("elig_video", "0").strip() != "1":
+                    continue
+                if row.get("emotion_final", "").strip() not in EMOTION_LABELS:
+                    continue
+                path = resolve_video_path(row)
+                if path is None:
+                    continue
+                sid = (row.get("sample_id", "").strip()
+                       .replace("/", "_").replace("\\", "_")
+                       .replace(" ", "_").replace(":", "_"))
+                all_rows.append({"path": path, "sid": sid})
+
+    logger.info("Pre-extracting features for %d videos...", len(all_rows))
+    done, skipped = 0, 0
+    with torch.no_grad():
+        for r in tqdm(all_rows, desc="Extracting features"):
+            feat_path = cache_dir / f"{r['sid']}.pt"
+            if feat_path.exists():
+                skipped += 1
+                continue
+            frames = extract_frames(str(r["path"]), num_frames)
+            if frames is None:
+                continue
+            clip = transform(frames).unsqueeze(0).to(device)  # (1, 3, T, H, W)
+            _, C, T, H, W = clip.shape
+            clip = clip.squeeze(0).permute(1, 0, 2, 3)        # (T, C, H, W)
+            with autocast("cuda"):
+                feat = backbone(clip)                          # (T, D)
+            torch.save(feat.cpu(), feat_path)
+            done += 1
+
+    logger.info("Done: %d new features, %d skipped.", done, skipped)
+
+
+
 # MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -304,12 +392,18 @@ class SwinVideoModel(nn.Module):
             nn.Linear(512, num_classes),
         )
 
-    def forward(self, x):                     # x: (B, 3, T, H, W)
-        B, C, T, H, W = x.shape
-        x = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
-        feat = self.backbone(x).reshape(B, T, -1)  # (B, T, D)
-        feat = self.temporal_attn(feat)            # (B, D)
+    def forward(self, x):
+        if x.dim() == 3:
+            # Pre-extracted features: (B, T, D) — skip backbone
+            feat = self.temporal_attn(x)     # (B, D)
+        else:
+            # Raw video: (B, 3, T, H, W)
+            B, C, T, H, W = x.shape
+            x    = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+            feat = self.backbone(x).reshape(B, T, -1)
+            feat = self.temporal_attn(feat)  # (B, D)
         return self.head(feat)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -410,6 +504,8 @@ def parse_args():
                    help="Early stopping patience (epochs without val_acc improvement)")
     p.add_argument("--num_workers",     type=int,   default=2)
     p.add_argument("--resume",          default=None)
+    p.add_argument("--cache_dir",       default="/content/feat_cache",
+                   help="Where to store pre-extracted backbone features")
     return p.parse_args()
 
 
@@ -430,37 +526,48 @@ def main():
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Data ──
-    train_ds = VideoEmotionDataset(args.train_csv, args.num_frames, train=True)
-    val_ds   = VideoEmotionDataset(args.val_csv,   args.num_frames, train=False)
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              sampler=make_sampler(train_ds),
-                              num_workers=args.num_workers, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
-                              shuffle=False, num_workers=args.num_workers,
-                              pin_memory=True)
-
-    # ── Model ──
+    # ── Phase 1: pre-extract backbone features (runs once, skips if cached) ──
+    # Build model first so we can reuse the backbone
+    logger.info("Building backbone: %s", args.backbone)
     model = SwinVideoModel(args.backbone, pretrained=True,
                            dropout=args.dropout,
                            freeze_stages=args.freeze_stages).to(device)
-    total   = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("Params: %dM total | %dM trainable", total//1_000_000, trainable//1_000_000)
+
+    preextract_features(
+        backbone  = model.backbone,
+        csv_paths = [args.train_csv, args.val_csv] + ([args.test_csv] if args.test_csv else []),
+        cache_dir = args.cache_dir,
+        num_frames= args.num_frames,
+        device    = device,
+    )
+
+    # ── Phase 2: train only temporal attention + head on cached features ──
+    train_ds = FeatureDataset(args.train_csv, args.cache_dir, augment=True)
+    val_ds   = FeatureDataset(args.val_csv,   args.cache_dir, augment=False)
+
+    if len(train_ds) == 0 or len(val_ds) == 0:
+        raise RuntimeError("Feature cache is empty — extraction may have failed.")
 
     # ── Loss / Optim ──
     criterion = make_criterion(train_ds, device, args.label_smoothing)
 
-    backbone_params = [p for n,p in model.named_parameters() if "backbone" in n and p.requires_grad]
-    head_params     = [p for n,p in model.named_parameters() if "head"     in n and p.requires_grad]
-    optimizer = optim.AdamW([
-        {"params": backbone_params, "lr": args.lr * 0.1, "weight_decay": args.weight_decay},
-        {"params": head_params,     "lr": args.lr,       "weight_decay": args.weight_decay * 0.1},
-    ])
+    # In feature mode backbone is frozen — only train temporal_attn + head
+    trainable_params = [p for p in model.parameters() if p.requires_grad
+                        and not any(id(p) == id(bp)
+                                    for bp in model.backbone.parameters())]
+    optimizer = optim.AdamW(trainable_params, lr=args.lr,
+                            weight_decay=args.weight_decay)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              sampler=make_sampler(train_ds),
+                              num_workers=args.num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds, batch_size=args.batch_size,
+                              shuffle=False, num_workers=args.num_workers,
+                              pin_memory=True)
 
     total_steps  = args.epochs * len(train_loader)
     warmup_steps = args.warmup_epochs * len(train_loader)
+
     scheduler = SequentialLR(optimizer, schedulers=[
         LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps),
         CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=args.min_lr),
