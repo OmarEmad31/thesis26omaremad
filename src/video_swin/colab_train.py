@@ -437,13 +437,14 @@ class SwinVideoModel(nn.Module):
                     for p in layer.parameters():
                         p.requires_grad = False
 
-        self.temporal_attn = TemporalAttention(feat_dim, num_heads=4, dropout=dropout * 0.5)
+        self.temporal_attn = TemporalAttention(feat_dim, num_heads=4, dropout=0.5)
 
         self.head = nn.Sequential(
-            nn.Dropout(dropout),
+            nn.Dropout(0.5),
             nn.Linear(feat_dim, 512),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
+            nn.LayerNorm(512),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(0.5),
             nn.Linear(512, num_classes),
         )
 
@@ -457,8 +458,36 @@ class SwinVideoModel(nn.Module):
             x    = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
             feat = self.backbone(x).reshape(B, T, -1)
             feat = self.temporal_attn(feat)  # (B, D)
-        return self.head(feat)
+        return self.head(feat), feat
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOSS ENGINES (SCL + FOCAL)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0, label_smoothing=0.15):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.ce = nn.CrossEntropyLoss(weight=weight, label_smoothing=label_smoothing, reduction='none')
+
+    def forward(self, inputs, targets):
+        ce_loss = self.ce(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
+def scl_loss(hidden, labels, temp=0.1):
+    features = F.normalize(hidden, p=2, dim=1)
+    sim = torch.matmul(features, features.T) / temp
+    mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float().to(hidden.device)
+    mask *= (1 - torch.eye(labels.size(0), device=hidden.device))
+    valid = mask.sum(1) > 0
+    if not valid.any(): return torch.tensor(0.0).to(hidden.device)
+    log_p = (sim - torch.max(sim, 1, True)[0].detach()) - torch.log(torch.exp(sim-torch.max(sim,1,True)[0].detach()).sum(1, True) + 1e-8)
+    loss = - (mask[valid] * log_p[valid]).sum(1) / (mask[valid].sum(1) + 1e-8)
+    return loss.mean()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -472,14 +501,15 @@ def make_sampler(dataset):
     return WeightedRandomSampler(sw, num_samples=len(sw), replacement=True)
 
 
-def make_criterion(dataset, device, label_smoothing=0.1):
+def make_criterion(dataset, device, label_smoothing=0.15):
     counts  = np.array(dataset.class_counts, dtype=np.float32)
     weights = 1.0 / (counts + 1.0)
     weights = weights / weights.sum() * NUM_CLASSES
     logger.info("Class weights: %s",
                 {ID_TO_EMOTION[i]: f"{w:.3f}" for i, w in enumerate(weights)})
-    return nn.CrossEntropyLoss(
+    return FocalLoss(
         weight=torch.tensor(weights).to(device),
+        gamma=2.0,
         label_smoothing=label_smoothing,
     )
 
@@ -492,8 +522,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, grad_cl
     for step, (videos, labels) in enumerate(bar):
         videos, labels = videos.to(device), labels.to(device)
         with autocast("cuda"):
-            logits = model(videos)
-            loss   = criterion(logits, labels) / grad_accum
+            logits, pooled = model(videos)
+            loss   = (criterion(logits, labels) + 0.1 * scl_loss(pooled, labels)) / grad_accum
         scaler.scale(loss).backward()
         if (step + 1) % grad_accum == 0 or (step + 1) == len(loader):
             scaler.unscale_(optimizer)
@@ -516,7 +546,7 @@ def evaluate(model, loader, criterion, device):
     for videos, labels in bar:
         videos, labels = videos.to(device), labels.to(device)
         with autocast("cuda"):
-            logits = model(videos)
+            logits, _ = model(videos)
             total_loss += criterion(logits, labels).item() * labels.size(0)
         preds.extend(logits.argmax(1).cpu().numpy())
         labs.extend(labels.cpu().numpy())
@@ -545,12 +575,13 @@ def parse_args():
     p.add_argument("--num_frames",      type=int,   default=16)
     p.add_argument("--batch_size",      type=int,   default=8)
     p.add_argument("--epochs",          type=int,   default=40)
-    p.add_argument("--lr",              type=float, default=5e-5)
+    p.add_argument("--lr",              type=float, default=5e-4, help="Learning rate for head")
+    p.add_argument("--backbone_lr",     type=float, default=5e-5, help="Learning rate for backbone")
     p.add_argument("--min_lr",          type=float, default=1e-7)
     p.add_argument("--warmup_epochs",   type=int,   default=5)
     p.add_argument("--weight_decay",    type=float, default=0.05)
-    p.add_argument("--dropout",         type=float, default=0.4)
-    p.add_argument("--label_smoothing", type=float, default=0.1)
+    p.add_argument("--dropout",         type=float, default=0.5)
+    p.add_argument("--label_smoothing", type=float, default=0.15)
     p.add_argument("--freeze_stages",   type=int,   default=2)
     p.add_argument("--grad_clip",       type=float, default=1.0)
     p.add_argument("--grad_accum",      type=int,   default=1,
@@ -612,8 +643,8 @@ def main():
     head_params     = [p for n, p in model.named_parameters()
                        if "backbone" not in n and p.requires_grad]
     optimizer = optim.AdamW([
-        {"params": backbone_params, "lr": args.lr * 0.1, "weight_decay": args.weight_decay},
-        {"params": head_params,     "lr": args.lr,       "weight_decay": args.weight_decay * 0.1},
+        {"params": backbone_params, "lr": args.backbone_lr, "weight_decay": args.weight_decay},
+        {"params": head_params,     "lr": args.lr,          "weight_decay": args.weight_decay},
     ])
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
