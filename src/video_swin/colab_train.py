@@ -638,15 +638,19 @@ def main():
     # ── Resume ──
     start_epoch, best_acc, best_f1, history = 1, 0.0, 0.0, []
     if args.resume and Path(args.resume).exists():
-        ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scaler.load_state_dict(ckpt["scaler"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-        start_epoch = ckpt["epoch"] + 1
-        best_acc    = ckpt.get("best_val_acc", 0.0)
-        history     = ckpt.get("history", [])
-        logger.info("Resumed from epoch %d (best_acc=%.4f)", start_epoch-1, best_acc)
+        try:
+            ckpt = torch.load(args.resume, map_location=device)
+            model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scaler.load_state_dict(ckpt["scaler"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            start_epoch = ckpt["epoch"] + 1
+            best_acc    = ckpt.get("best_val_acc", 0.0)
+            history     = ckpt.get("history", [])
+            logger.info("Resumed from epoch %d (best_acc=%.4f)", start_epoch-1, best_acc)
+        except Exception as e:
+            logger.warning("Failed to resume from %s: %s. Starting fresh.", args.resume, e)
+            start_epoch, best_acc, best_f1, history = 1, 0.0, 0.0, []
 
     logger.info("=" * 60)
     logger.info("Training %d epochs  |  train=%d  val=%d  effective_batch=%d",
