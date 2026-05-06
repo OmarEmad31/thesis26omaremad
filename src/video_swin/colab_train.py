@@ -154,109 +154,126 @@ def load_csv_split(csv_path: str) -> list[dict]:
 # FRAME EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_frames(video_path: str, num_frames: int = 16) -> np.ndarray | None:
-    try:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return None
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total <= 0:
-            cap.release()
-            return None
-        indices = np.linspace(0, total - 1, num_frames, dtype=int)
-        frames = []
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ret, frame = cap.read()
-            if not ret:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(idx) - 1))
-                ret, frame = cap.read()
-            if ret and frame is not None:
-                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+def extract_and_save_frames(video_path: str, out_dir: Path, num_frames: int) -> bool:
+    """Decode num_frames from video and save as JPEGs. Returns True on success."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if (out_dir / f"frame_{num_frames-1:04d}.jpg").exists():
+        return True  # already done
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return False
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total <= 0:
         cap.release()
-        if not frames:
-            return None
-        while len(frames) < num_frames:
-            frames.append(frames[-1])
-        return np.stack(frames[:num_frames])   # (T, H, W, 3)
-    except Exception:
-        return None
+        return False
+    indices = np.linspace(0, total - 1, num_frames, dtype=int)
+    saved = 0
+    for i, idx in enumerate(indices):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(idx) - 1))
+            ret, frame = cap.read()
+        if ret and frame is not None:
+            cv2.imwrite(str(out_dir / f"frame_{i:04d}.jpg"), frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, 90])
+            saved += 1
+    cap.release()
+    # Pad missing frames by copying last
+    if 0 < saved < num_frames:
+        last = out_dir / f"frame_{saved-1:04d}.jpg"
+        for i in range(saved, num_frames):
+            import shutil
+            shutil.copy(str(last), str(out_dir / f"frame_{i:04d}.jpg"))
+    return saved > 0
 
 
+def preextract_frames(csv_paths: list, frames_root: str, num_frames: int):
+    """Phase 1: decode all videos to JPEG frames on local SSD (one-time)."""
+    frames_root = Path(frames_root)
+    frames_root.mkdir(parents=True, exist_ok=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUGMENTATION
-# ─────────────────────────────────────────────────────────────────────────────
+    all_rows = []
+    seen_sids = set()
+    for csv_path in csv_paths:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("elig_video", "0").strip() != "1":
+                    continue
+                if row.get("emotion_final", "").strip() not in EMOTION_LABELS:
+                    continue
+                path = resolve_video_path(row)
+                if path is None:
+                    continue
+                sid = (row.get("sample_id", "").strip()
+                       .replace("/", "_").replace("\\", "_")
+                       .replace(" ", "_").replace(":", "_"))
+                if sid in seen_sids:
+                    continue
+                seen_sids.add(sid)
+                all_rows.append({"path": path, "sid": sid})
 
-class VideoAugment:
-    def __init__(self, train: bool = True, size: int = 224):
-        self.train = train
-        self.size  = size
-        self.norm  = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-
-    def __call__(self, frames: np.ndarray) -> torch.Tensor:
-        T_len, H, W, _ = frames.shape
-        if self.train:
-            i, j, h, w = T.RandomResizedCrop.get_params(
-                torch.zeros(H, W), scale=(0.6, 1.0), ratio=(0.75, 1.333))
-            do_flip = random.random() < 0.5
-            brightness  = random.uniform(0.8, 1.2)
-            contrast    = random.uniform(0.8, 1.2)
-            saturation  = random.uniform(0.8, 1.2)
-            angle       = random.uniform(-10, 10)
-        processed = []
-        for frame in frames:
-            img = TF.to_tensor(frame)
-            if self.train:
-                img = TF.resized_crop(img, i, j, h, w, [self.size, self.size])
-                if do_flip:        img = TF.hflip(img)
-                img = TF.adjust_brightness(img, brightness)
-                img = TF.adjust_contrast(img, contrast)
-                img = TF.adjust_saturation(img, saturation)
-                img = TF.rotate(img, angle)
-            else:
-                img = TF.resize(img, [self.size + 32, self.size + 32])
-                img = TF.center_crop(img, [self.size, self.size])
-            processed.append(self.norm(img))
-        stacked = torch.stack(processed, dim=0)   # (T, 3, H, W)
-        return stacked.permute(1, 0, 2, 3)        # (3, T, H, W)
+    logger.info("Phase 1: extracting frames for %d videos to %s...", len(all_rows), frames_root)
+    done, skipped = 0, 0
+    for r in tqdm(all_rows, desc="Extracting frames"):
+        out_dir = frames_root / r["sid"]
+        if extract_and_save_frames(r["path"], out_dir, num_frames):
+            if (out_dir / f"frame_{num_frames-1:04d}.jpg").exists():
+                skipped += 1 if done == 0 else 0
+            done += 1
+        else:
+            logger.warning("Failed to extract: %s", r["path"])
+    logger.info("Phase 1 done: %d videos -> %s", done, frames_root)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DATASET
-# ─────────────────────────────────────────────────────────────────────────────
-
-class VideoEmotionDataset(Dataset):
-    def __init__(self, csv_path: str, num_frames: int = 16, train: bool = True):
-        self.num_frames = num_frames
-        self.transform  = VideoAugment(train=train)
-        self.samples    = load_csv_split(csv_path)
-        if not self.samples:
-            check_dataset_root()
-            raise RuntimeError(
-                f"No valid samples found in {csv_path}.\n"
-                f"DATASET_ROOT={DATASET_ROOT} — does it contain 'videoplayback (N)' subfolders?\n"
-                f"Pass the correct path via --dataset_root"
-            )
+class FrameDataset(Dataset):
+    """Loads pre-extracted JPEG frames from SSD — fast end-to-end training."""
+    def __init__(self, csv_path: str, frames_root: str,
+                 num_frames: int = 16, train: bool = True):
+        self.frames_root = Path(frames_root)
+        self.num_frames  = num_frames
+        self.transform   = VideoAugment(train=train)
+        rows = []
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                emotion = row.get("emotion_final", "").strip()
+                if emotion not in EMOTION_LABELS:
+                    continue
+                if row.get("elig_video", "0").strip() != "1":
+                    continue
+                sid = (row.get("sample_id", "").strip()
+                       .replace("/", "_").replace("\\", "_")
+                       .replace(" ", "_").replace(":", "_"))
+                frame_dir = self.frames_root / sid
+                if frame_dir.exists():
+                    rows.append({"frame_dir": frame_dir,
+                                 "_label": EMOTION_LABELS[emotion]})
+        self.samples = rows
         counts = [0] * NUM_CLASSES
-        for row in self.samples:
-            counts[row["_label"]] += 1
+        for r in rows:
+            counts[r["_label"]] += 1
         self.class_counts = counts
-        logger.info("Loaded %d samples | dist: %s", len(self.samples),
-                    {ID_TO_EMOTION[i]: c for i, c in enumerate(counts)})
+        logger.info("FrameDataset: %d samples (train=%s)", len(rows), train)
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        # Iterative fallback — avoids RecursionError on bad/slow Drive files
-        for attempt in range(len(self.samples)):
-            current_idx = (idx + attempt) % len(self.samples)
-            row = self.samples[current_idx]
-            frames = extract_frames(row["_resolved_path"], self.num_frames)
-            if frames is not None:
-                return self.transform(frames), row["_label"]
-        raise RuntimeError("Could not load any video from the dataset.")
+        row = self.samples[idx]
+        frames = []
+        for i in range(self.num_frames):
+            img = cv2.imread(str(row["frame_dir"] / f"frame_{i:04d}.jpg"))
+            if img is not None:
+                frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        if not frames:
+            return self.__getitem__((idx + 1) % len(self.samples))
+        while len(frames) < self.num_frames:
+            frames.append(frames[-1])
+        clip = self.transform(np.stack(frames[:self.num_frames]))
+        return clip, row["_label"]
+
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -526,37 +543,40 @@ def main():
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Phase 1: pre-extract backbone features (runs once, skips if cached) ──
-    # Build model first so we can reuse the backbone
-    logger.info("Building backbone: %s", args.backbone)
+    # ── Phase 1: extract frames to JPEG on local SSD (one-time, skips if done) ──
+    preextract_frames(
+        csv_paths   = [args.train_csv, args.val_csv] + ([args.test_csv] if args.test_csv else []),
+        frames_root = args.cache_dir,
+        num_frames  = args.num_frames,
+    )
+
+    # ── Phase 2: end-to-end fine-tuning loading from JPEG (fast I/O) ──
+    train_ds = FrameDataset(args.train_csv, args.cache_dir, args.num_frames, train=True)
+    val_ds   = FrameDataset(args.val_csv,   args.cache_dir, args.num_frames, train=False)
+
+    if len(train_ds) == 0 or len(val_ds) == 0:
+        raise RuntimeError("No frame directories found — Phase 1 may have failed.")
+
+    # ── Model ──
+    logger.info("Building model: %s", args.backbone)
     model = SwinVideoModel(args.backbone, pretrained=True,
                            dropout=args.dropout,
                            freeze_stages=args.freeze_stages).to(device)
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info("Params: %dM total | %dM trainable", total//1_000_000, trainable//1_000_000)
 
-    preextract_features(
-        backbone  = model.backbone,
-        csv_paths = [args.train_csv, args.val_csv] + ([args.test_csv] if args.test_csv else []),
-        cache_dir = args.cache_dir,
-        num_frames= args.num_frames,
-        device    = device,
-    )
-
-    # ── Phase 2: train only temporal attention + head on cached features ──
-    train_ds = FeatureDataset(args.train_csv, args.cache_dir, augment=True)
-    val_ds   = FeatureDataset(args.val_csv,   args.cache_dir, augment=False)
-
-    if len(train_ds) == 0 or len(val_ds) == 0:
-        raise RuntimeError("Feature cache is empty — extraction may have failed.")
-
-    # ── Loss / Optim ──
+    # ── Loss / Optim — discriminative LRs ──
     criterion = make_criterion(train_ds, device, args.label_smoothing)
 
-    # In feature mode backbone is frozen — only train temporal_attn + head
-    trainable_params = [p for p in model.parameters() if p.requires_grad
-                        and not any(id(p) == id(bp)
-                                    for bp in model.backbone.parameters())]
-    optimizer = optim.AdamW(trainable_params, lr=args.lr,
-                            weight_decay=args.weight_decay)
+    backbone_params = [p for n, p in model.named_parameters()
+                       if "backbone" in n and p.requires_grad]
+    head_params     = [p for n, p in model.named_parameters()
+                       if "backbone" not in n and p.requires_grad]
+    optimizer = optim.AdamW([
+        {"params": backbone_params, "lr": args.lr * 0.1, "weight_decay": args.weight_decay},
+        {"params": head_params,     "lr": args.lr,       "weight_decay": args.weight_decay * 0.1},
+    ])
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                               sampler=make_sampler(train_ds),
@@ -574,6 +594,8 @@ def main():
     ], milestones=[warmup_steps])
 
     scaler = GradScaler("cuda")
+
+
 
     # ── Resume ──
     start_epoch, best_acc, best_f1, history = 1, 0.0, 0.0, []
@@ -655,7 +677,7 @@ def main():
         print("FINAL TEST SET EVALUATION (best_model.pt)")
         print("=" * 60)
         model.load_state_dict(torch.load(ckpt_dir / "best_model.pt", map_location=device))
-        test_ds     = VideoEmotionDataset(args.test_csv, args.num_frames, train=False)
+        test_ds     = FrameDataset(args.test_csv, args.cache_dir, args.num_frames, train=False)
         test_loader = DataLoader(test_ds, batch_size=args.batch_size,
                                  shuffle=False, num_workers=args.num_workers, pin_memory=True)
         test = evaluate(model, test_loader, criterion, device)
