@@ -226,6 +226,44 @@ def preextract_frames(csv_paths: list, frames_root: str, num_frames: int):
     logger.info("Phase 1 done: %d videos -> %s", done, frames_root)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AUGMENTATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VideoAugment:
+    def __init__(self, train: bool = True, size: int = 224):
+        self.train = train
+        self.size  = size
+        self.norm  = T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+
+    def __call__(self, frames: np.ndarray) -> torch.Tensor:
+        T_len, H, W, _ = frames.shape
+        if self.train:
+            i, j, h, w = T.RandomResizedCrop.get_params(
+                torch.zeros(H, W), scale=(0.6, 1.0), ratio=(0.75, 1.333))
+            do_flip = random.random() < 0.5
+            brightness  = random.uniform(0.8, 1.2)
+            contrast    = random.uniform(0.8, 1.2)
+            saturation  = random.uniform(0.8, 1.2)
+            angle       = random.uniform(-10, 10)
+        processed = []
+        for frame in frames:
+            img = TF.to_tensor(frame)
+            if self.train:
+                img = TF.resized_crop(img, i, j, h, w, [self.size, self.size])
+                if do_flip:        img = TF.hflip(img)
+                img = TF.adjust_brightness(img, brightness)
+                img = TF.adjust_contrast(img, contrast)
+                img = TF.adjust_saturation(img, saturation)
+                img = TF.rotate(img, angle)
+            else:
+                img = TF.resize(img, [self.size + 32, self.size + 32])
+                img = TF.center_crop(img, [self.size, self.size])
+            processed.append(self.norm(img))
+        stacked = torch.stack(processed, dim=0)   # (T, 3, H, W)
+        return stacked.permute(1, 0, 2, 3)        # (3, T, H, W)
+
+
 class FrameDataset(Dataset):
     """Loads pre-extracted JPEG frames from SSD — fast end-to-end training."""
     def __init__(self, csv_path: str, frames_root: str,
