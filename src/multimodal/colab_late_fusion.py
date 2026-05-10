@@ -317,7 +317,7 @@ def train_audio(tr, va, te):
     return probs
 
 # ─────────────────────────────────────────────────────────
-# MODALITY 3 — TEXT  (MARBERT, Triple-Pooling)
+# MODALITY 3 — TEXT  (MARBERT + LoRA, 5-Fold CV Ensemble)
 # ─────────────────────────────────────────────────────────
 MODEL_NAME = "UBC-NLP/MARBERT"
 
@@ -332,66 +332,89 @@ def clean(t):
 class MARBERTClassifier(nn.Module):
     def __init__(self):
         super().__init__()
-        self.bert = AutoModel.from_pretrained(MODEL_NAME)
-        self.cls  = nn.Linear(768*3,7)
+        from peft import LoraConfig, get_peft_model
+        bert     = AutoModel.from_pretrained(MODEL_NAME)
+        lora_cfg = LoraConfig(r=16, lora_alpha=32, target_modules=["query","value"],
+                              lora_dropout=0.1, bias="none")
+        self.bert = get_peft_model(bert, lora_cfg)
+        self.cls  = nn.Linear(768*3, 7)
         self.drops= nn.ModuleList([nn.Dropout(0.3) for _ in range(5)])
-    def forward(self,ids,mask):
-        lh  = self.bert(input_ids=ids,attention_mask=mask).last_hidden_state
-        m   = mask.unsqueeze(-1).expand(lh.size()).float()
-        mp  = (lh*m).sum(1)/m.sum(1).clamp(min=1e-9)
-        xp  = (lh*m - (1-m)*1e9).max(1)[0]
+    def forward(self, ids, mask):
+        lh  = self.bert(input_ids=ids, attention_mask=mask).last_hidden_state
+        msk = mask.unsqueeze(-1).expand(lh.size()).float()
+        mp  = (lh*msk).sum(1) / msk.sum(1).clamp(min=1e-9)
+        xp  = (lh*msk - (1-msk)*1e9).max(1)[0]
         cat = torch.cat([lh[:,0,:], mp, xp], 1)
         return torch.stack([self.cls(d(cat)) for d in self.drops]).mean(0)
 
 class TextDS(Dataset):
-    def __init__(self, df, tok):
-        self.enc    = tok([clean(t) for t in df['transcript'].values],
+    def __init__(self, texts, labels, tok):
+        self.enc    = tok([clean(str(t)) for t in texts],
                           truncation=True, padding="max_length", max_length=64, return_tensors="pt")
-        self.labels = [LID[e] for e in df['emotion_final'].values]
+        self.labels = list(labels)
     def __len__(self): return len(self.labels)
     def __getitem__(self,i): return {k:v[i] for k,v in self.enc.items()}, torch.tensor(self.labels[i], dtype=torch.long)
 
 def train_text(tr, va, te):
-    sep("📝  TEXT MODALITY — MARBERT (Triple-Pooling, Multi-Dropout)")
+    from sklearn.model_selection import StratifiedKFold
+    sep("📝  TEXT MODALITY — MARBERT + LoRA (5-Fold CV Ensemble)")
     set_seed(42)
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tl  = DataLoader(TextDS(tr, tok), batch_size=16, shuffle=True)
-    vl  = DataLoader(TextDS(va, tok), batch_size=16)
-    el  = DataLoader(TextDS(te, tok), batch_size=16)
-    m   = MARBERTClassifier().to(DEVICE)
-    opt = torch.optim.AdamW([
-        {'params':[p for n,p in m.named_parameters() if 'bert' in n], 'lr':2e-5},
-        {'params':[p for n,p in m.named_parameters() if 'bert' not in n], 'lr':8e-4}
-    ], weight_decay=0.01)
-    best_f1, ckpt, patience, pat = 0, SAVE_DIR/"txt_best.pt", 8, 0
-    for ep in range(1, 35):
-        m.train()
-        for bd,bl in tl:
-            opt.zero_grad()
-            F.cross_entropy(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)),
-                            bl.to(DEVICE), label_smoothing=0.08).backward()
-            opt.step()
-        m.eval(); ps,ts=[],[]
+
+    # Pool train+val for 5-fold CV (mirrors v30 champion strategy)
+    pool      = pd.concat([tr, va]).reset_index(drop=True)
+    texts     = pool['transcript'].values
+    labels    = np.array([LID[e] for e in pool['emotion_final'].values])
+    te_labels = np.array([LID[e] for e in te['emotion_final'].values])
+    te_loader = DataLoader(TextDS(te['transcript'].values, te_labels, tok), batch_size=16)
+
+    skf        = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_probs = []
+
+    for fold, (t_idx, v_idx) in enumerate(skf.split(texts, labels)):
+        print(f"\n  ── Fold {fold+1}/5 ──")
+        tl = DataLoader(TextDS(texts[t_idx], labels[t_idx], tok), batch_size=16, shuffle=True)
+        vl = DataLoader(TextDS(texts[v_idx], labels[v_idx], tok), batch_size=16)
+
+        m   = MARBERTClassifier().to(DEVICE)
+        opt = torch.optim.AdamW([
+            {'params':[p for n,p in m.named_parameters() if 'bert' in n], 'lr':2e-5},
+            {'params':[p for n,p in m.named_parameters() if 'bert' not in n], 'lr':8e-4}
+        ], weight_decay=0.01)
+
+        best_acc, ckpt, patience, pat = 0, SAVE_DIR/f"txt_fold{fold}.pt", 8, 0
+        for ep in range(1, 40):
+            m.train()
+            for bd,bl in tl:
+                opt.zero_grad()
+                F.cross_entropy(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)),
+                                bl.to(DEVICE), label_smoothing=0.08).backward()
+                opt.step()
+            m.eval(); ps,ts=[],[]
+            with torch.no_grad():
+                for bd,bl in vl:
+                    ps.extend(m(bd['input_ids'].to(DEVICE),bd['attention_mask'].to(DEVICE)).argmax(1).cpu().numpy())
+                    ts.extend(bl.numpy())
+            acc=accuracy_score(ts,ps); f1=f1_score(ts,ps,average='macro',zero_division=0)
+            marker = " ⭐" if acc > best_acc else ""
+            print(f"    Ep {ep:02d} | Val Acc: {acc:.4f} | Val F1: {f1:.4f}{marker}")
+            if acc > best_acc: best_acc=acc; torch.save(m.state_dict(),str(ckpt)); pat=0
+            else:
+                pat+=1
+                if pat>=patience: print(f"    Early stop."); break
+
+        m.load_state_dict(torch.load(str(ckpt), weights_only=True)); m.eval()
+        fp=[]
         with torch.no_grad():
-            for bd,bl in vl:
-                ps.extend(m(bd['input_ids'].to(DEVICE),bd['attention_mask'].to(DEVICE)).argmax(1).cpu().numpy())
-                ts.extend(bl.numpy())
-        acc=accuracy_score(ts,ps); f1=f1_score(ts,ps,average='macro',zero_division=0)
-        marker = " ⭐" if f1 > best_f1 else ""
-        print(f"  Ep {ep:02d} | Val Acc: {acc:.4f} | Val F1: {f1:.4f}{marker}")
-        if f1>best_f1: best_f1=f1; torch.save(m.state_dict(),str(ckpt)); pat=0
-        else:
-            pat+=1
-            if pat>=patience: print(f"  Early stop at Ep {ep}."); break
-    m.load_state_dict(torch.load(str(ckpt), weights_only=True)); m.eval()
-    tp=[]
-    with torch.no_grad():
-        for bd,_ in el:
-            tp.append(F.softmax(m(bd['input_ids'].to(DEVICE),bd['attention_mask'].to(DEVICE)),1).cpu().numpy())
-    probs = np.vstack(tp)
-    t_labels = [LID[e] for e in te['emotion_final'].values]
-    report("TEXT", t_labels, probs.argmax(1))
+            for bd,_ in te_loader:
+                fp.append(F.softmax(m(bd['input_ids'].to(DEVICE),bd['attention_mask'].to(DEVICE)),1).cpu().numpy())
+        fold_probs.append(np.vstack(fp))
+        print(f"    Rolling Test Acc: {accuracy_score(te_labels, np.mean(fold_probs,0).argmax(1)):.4f}")
+
+    probs = np.mean(fold_probs, 0)
+    report("TEXT (5-Fold Ensemble)", te_labels, probs.argmax(1))
     return probs
+
 
 # ─────────────────────────────────────────────────────────
 # LATE FUSION
