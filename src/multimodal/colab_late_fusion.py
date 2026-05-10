@@ -56,25 +56,62 @@ def report(name, targets, preds):
 # ─────────────────────────────────────────────────────────
 # SPLIT LOADING & ALIGNMENT
 # ─────────────────────────────────────────────────────────
+def resolve_audio_path(relpath):
+    """Try multiple base paths to find audio file."""
+    for base in [DRIVE, DRIVE / "data", DRIVE / "data/raw", Path("/content/drive/MyDrive")]:
+        p = base / relpath
+        if p.exists(): return p
+    return None
+
 def load_splits():
     tr = pd.read_csv(SPLIT_DIR / "train.csv")
     va = pd.read_csv(SPLIT_DIR / "val.csv")
     te = pd.read_csv(SPLIT_DIR / "test.csv")
 
+    # ── DIAGNOSTICS on first split ──────────────────────
+    sep("🔍 DIAGNOSTIC — checking first 3 train rows")
+    row0 = tr.iloc[0]
+    print(f"  Columns: {list(tr.columns)}")
+    print(f"  Sample ID: {row0['sample_id']}")
+    sid0 = row0['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
+    vpath = VID_DIR / f"{sid0}_clip_seq.npy"
+    print(f"  Video path: {vpath}")
+    print(f"  Video exists: {vpath.exists()}")
+    if 'audio_relpath' in tr.columns:
+        apath = resolve_audio_path(row0['audio_relpath'])
+        print(f"  Audio relpath: {row0['audio_relpath']}")
+        print(f"  Audio resolved: {apath} | exists: {apath is not None}")
+    if 'transcript' in tr.columns:
+        print(f"  Transcript sample: '{str(row0.get('transcript',''))[:60]}'")
+
     def ok(row):
-        sid  = row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-        vid  = (VID_DIR / f"{sid}_clip_seq.npy").exists()
-        aud  = (DRIVE / row['audio_relpath']).exists() if isinstance(row.get('audio_relpath'), str) else False
-        txt  = isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
+        sid = row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
+        vid = (VID_DIR / f"{sid}_clip_seq.npy").exists()
+        aud = resolve_audio_path(row['audio_relpath']) is not None if 'audio_relpath' in row.index else False
+        txt = isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
         return vid and aud and txt
+
+    def count_conditions(df):
+        n_vid, n_aud, n_txt = 0, 0, 0
+        for _, row in df.iterrows():
+            sid = row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
+            if (VID_DIR / f"{sid}_clip_seq.npy").exists(): n_vid += 1
+            if 'audio_relpath' in row.index and resolve_audio_path(row['audio_relpath']) is not None: n_aud += 1
+            if isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2: n_txt += 1
+        return n_vid, n_aud, n_txt
+
+    sep("📊 PER-CONDITION COUNTS (Train)")
+    nv, na, nt = count_conditions(tr)
+    print(f"  Total: {len(tr)} | Has Video: {nv} | Has Audio: {na} | Has Text: {nt}")
 
     tr = tr[tr.apply(ok, axis=1)].reset_index(drop=True)
     va = va[va.apply(ok, axis=1)].reset_index(drop=True)
     te = te[te.apply(ok, axis=1)].reset_index(drop=True)
+
     sep("ALIGNED SPLITS (all 3 modalities present)")
     print(f"  Train: {len(tr)} | Val: {len(va)} | Test: {len(te)}")
     for split, df in [("Train", tr), ("Val", va), ("Test", te)]:
-        print(f"  {split} emotions: {df['emotion_final'].value_counts().to_dict()}")
+        if len(df): print(f"  {split} emotions: {df['emotion_final'].value_counts().to_dict()}")
     return tr, va, te
 
 # ─────────────────────────────────────────────────────────
