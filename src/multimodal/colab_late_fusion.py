@@ -27,10 +27,10 @@ warnings.filterwarnings("ignore")
 # PATHS (Colab)
 # ─────────────────────────────────────────────────────────
 DRIVE       = Path("/content/drive/MyDrive/Thesis Project")
-REPO        = Path("/content/thesis")   # cloned from GitHub
-SPLIT_DIR   = REPO / "data/processed/splits/multimodal_eligible"  # CSVs live in repo
-VID_DIR     = DRIVE / "data/processed/features/video_sequences_v1"
-AUDIO_BASE  = Path("/content/audio")   # unzipped from Thesis_Audio_Full.zip
+REPO        = Path("/content/thesis")
+SPLIT_DIR   = REPO / "data/processed/splits/multimodal_eligible"
+VID_DIR     = Path("/content/video_features/video_sequences_v1")   # extracted locally
+AUDIO_BASE  = Path("/content/audio")                                # extracted locally
 SAVE_DIR    = Path("/content/fusion_models")
 SAVE_DIR.mkdir(exist_ok=True)
 
