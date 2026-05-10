@@ -30,6 +30,7 @@ DRIVE       = Path("/content/drive/MyDrive/Thesis Project")
 REPO        = Path("/content/thesis")   # cloned from GitHub
 SPLIT_DIR   = REPO / "data/processed/splits/multimodal_eligible"  # CSVs live in repo
 VID_DIR     = DRIVE / "data/processed/features/video_sequences_v1"
+AUDIO_BASE  = Path("/content/audio")   # unzipped from Thesis_Audio_Full.zip
 SAVE_DIR    = Path("/content/fusion_models")
 SAVE_DIR.mkdir(exist_ok=True)
 
@@ -57,28 +58,30 @@ def report(name, targets, preds):
 # SPLIT LOADING & ALIGNMENT
 # ─────────────────────────────────────────────────────────
 def resolve_audio_path(row):
-    """Try audio_path column first, then build from audio_relpath."""
-    # 1. Try the full audio_path column if it exists
-    if 'audio_path' in row.index and isinstance(row['audio_path'], str):
-        # May be an absolute Windows path — map it to Drive
-        ap = str(row['audio_path'])
-        # Try direct path (if it's a Linux/Drive path)
-        if Path(ap).exists(): return Path(ap)
-        # Try stripping Windows drive letter and mapping to Drive root
-        if ':\\' in ap or ':/' in ap:
-            # Extract relative part after the project root
-            for marker in ['Thesis Project/', 'Thesis Project\\']:
-                if marker in ap:
-                    rel = ap.split(marker)[-1].replace('\\', '/')
-                    p = DRIVE / rel
-                    if p.exists(): return p
-    # 2. Try audio_relpath with multiple bases
-    if 'audio_relpath' in row.index and isinstance(row['audio_relpath'], str):
-        for base in [DRIVE, DRIVE/"data", DRIVE/"data/raw",
-                     DRIVE/"data/processed", Path("/content/drive/MyDrive")]:
-            p = base / row['audio_relpath']
+    """Resolve audio path using folder + audio_relpath under AUDIO_BASE."""
+    folder      = str(row.get('folder', ''))
+    audio_rel   = str(row.get('audio_relpath', ''))
+
+    # Strategy 1: AUDIO_BASE / folder / audio_relpath  (from Thesis_Audio_Full.zip)
+    if folder and audio_rel:
+        p = AUDIO_BASE / folder / audio_rel
+        if p.exists(): return p
+
+    # Strategy 2: AUDIO_BASE / audio_relpath  (flat structure in zip)
+    if audio_rel:
+        p = AUDIO_BASE / audio_rel
+        if p.exists(): return p
+
+    # Strategy 3: Drive fallbacks
+    for base in [DRIVE/"dataset/Final Modalink Dataset MERGED", DRIVE/"data/raw", DRIVE]:
+        if folder:
+            p = base / folder / audio_rel
             if p.exists(): return p
+        p = base / audio_rel
+        if p.exists(): return p
+
     return None
+
 
 def load_splits():
     tr = pd.read_csv(SPLIT_DIR / "train.csv")
@@ -261,7 +264,9 @@ class AudioDS(Dataset):
     def __getitem__(self, i):
         r = self.df.iloc[i]
         try:
-            y,_ = librosa.load(str(DRIVE/r['audio_relpath']), sr=self.sr)
+            apath = resolve_audio_path(r)
+            if apath is None: raise FileNotFoundError
+            y,_ = librosa.load(str(apath), sr=self.sr)
             y,_ = librosa.effects.trim(y, top_db=25)
             y   = y[:self.maxlen] if len(y)>self.maxlen else np.pad(y,(0,self.maxlen-len(y)))
         except: y = np.zeros(self.maxlen)
