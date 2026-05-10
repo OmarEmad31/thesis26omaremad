@@ -12,6 +12,12 @@ ENV/
 # Project Specific - LARGE DATA (Do NOT push these)
 dataset/
 data/
+
+# Exception: small split CSVs needed by Colab (committed to repo)
+!data/processed/splits/multimodal_eligible/
+!data/processed/splits/multimodal_eligible/train.csv
+!data/processed/splits/multimodal_eligible/val.csv
+!data/processed/splits/multimodal_eligible/test.csv
 checkpoints/
 outputs/
 

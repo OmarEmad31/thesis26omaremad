@@ -27,7 +27,8 @@ warnings.filterwarnings("ignore")
 # PATHS (Colab)
 # ─────────────────────────────────────────────────────────
 DRIVE       = Path("/content/drive/MyDrive/Thesis Project")
-SPLIT_DIR   = DRIVE / "data/processed/splits/multimodal_eligible"
+REPO        = Path("/content/thesis")   # cloned from GitHub
+SPLIT_DIR   = REPO / "data/processed/splits/multimodal_eligible"  # CSVs live in repo
 VID_DIR     = DRIVE / "data/processed/features/video_sequences_v1"
 SAVE_DIR    = Path("/content/fusion_models")
 SAVE_DIR.mkdir(exist_ok=True)
