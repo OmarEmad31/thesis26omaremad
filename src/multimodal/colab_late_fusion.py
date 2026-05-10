@@ -56,11 +56,28 @@ def report(name, targets, preds):
 # ─────────────────────────────────────────────────────────
 # SPLIT LOADING & ALIGNMENT
 # ─────────────────────────────────────────────────────────
-def resolve_audio_path(relpath):
-    """Try multiple base paths to find audio file."""
-    for base in [DRIVE, DRIVE / "data", DRIVE / "data/raw", Path("/content/drive/MyDrive")]:
-        p = base / relpath
-        if p.exists(): return p
+def resolve_audio_path(row):
+    """Try audio_path column first, then build from audio_relpath."""
+    # 1. Try the full audio_path column if it exists
+    if 'audio_path' in row.index and isinstance(row['audio_path'], str):
+        # May be an absolute Windows path — map it to Drive
+        ap = str(row['audio_path'])
+        # Try direct path (if it's a Linux/Drive path)
+        if Path(ap).exists(): return Path(ap)
+        # Try stripping Windows drive letter and mapping to Drive root
+        if ':\\' in ap or ':/' in ap:
+            # Extract relative part after the project root
+            for marker in ['Thesis Project/', 'Thesis Project\\']:
+                if marker in ap:
+                    rel = ap.split(marker)[-1].replace('\\', '/')
+                    p = DRIVE / rel
+                    if p.exists(): return p
+    # 2. Try audio_relpath with multiple bases
+    if 'audio_relpath' in row.index and isinstance(row['audio_relpath'], str):
+        for base in [DRIVE, DRIVE/"data", DRIVE/"data/raw",
+                     DRIVE/"data/processed", Path("/content/drive/MyDrive")]:
+            p = base / row['audio_relpath']
+            if p.exists(): return p
     return None
 
 def load_splits():
@@ -68,41 +85,45 @@ def load_splits():
     va = pd.read_csv(SPLIT_DIR / "val.csv")
     te = pd.read_csv(SPLIT_DIR / "test.csv")
 
-    # ── DIAGNOSTICS on first split ──────────────────────
-    sep("🔍 DIAGNOSTIC — checking first 3 train rows")
+    # ── DIAGNOSTICS ─────────────────────────────────────
+    sep("🔍 DIAGNOSTIC — Path Resolution Check")
     row0 = tr.iloc[0]
     print(f"  Columns: {list(tr.columns)}")
-    print(f"  Sample ID: {row0['sample_id']}")
     sid0 = row0['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
     vpath = VID_DIR / f"{sid0}_clip_seq.npy"
-    print(f"  Video path: {vpath}")
-    print(f"  Video exists: {vpath.exists()}")
-    if 'audio_relpath' in tr.columns:
-        apath = resolve_audio_path(row0['audio_relpath'])
-        print(f"  Audio relpath: {row0['audio_relpath']}")
-        print(f"  Audio resolved: {apath} | exists: {apath is not None}")
-    if 'transcript' in tr.columns:
-        print(f"  Transcript sample: '{str(row0.get('transcript',''))[:60]}'")
+    print(f"\n  [VIDEO]")
+    print(f"  Feature path checked : {vpath}")
+    print(f"  Exists               : {vpath.exists()}")
+    if not vpath.exists():
+        print(f"  ⚠️  Video .npy files not found on Drive!")
+        print(f"  ➡  Zip your local folder: d:\\Thesis Project\\data\\processed\\features\\video_sequences_v1\\")
+        print(f"  ➡  Upload to Drive at   : Thesis Project/data/processed/features/video_sequences_v1.zip")
+        print(f"  ➡  Then unzip in Colab  : !unzip -q '/content/drive/MyDrive/Thesis Project/data/processed/features/video_sequences_v1.zip' -d '{VID_DIR.parent}'")
+
+    print(f"\n  [AUDIO]")
+    print(f"  audio_relpath : {row0.get('audio_relpath','N/A')}")
+    print(f"  audio_path    : {str(row0.get('audio_path','N/A'))[:100]}")
+    aresolved = resolve_audio_path(row0)
+    print(f"  Resolved to   : {aresolved}")
+    print(f"  Exists        : {aresolved is not None}")
+
+    print(f"\n  [TEXT]")
+    print(f"  transcript    : '{str(row0.get('transcript',''))[:80]}'")
 
     def ok(row):
         sid = row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
         vid = (VID_DIR / f"{sid}_clip_seq.npy").exists()
-        aud = resolve_audio_path(row['audio_relpath']) is not None if 'audio_relpath' in row.index else False
+        aud = resolve_audio_path(row) is not None
         txt = isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
         return vid and aud and txt
 
-    def count_conditions(df):
-        n_vid, n_aud, n_txt = 0, 0, 0
-        for _, row in df.iterrows():
-            sid = row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-            if (VID_DIR / f"{sid}_clip_seq.npy").exists(): n_vid += 1
-            if 'audio_relpath' in row.index and resolve_audio_path(row['audio_relpath']) is not None: n_aud += 1
-            if isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2: n_txt += 1
-        return n_vid, n_aud, n_txt
+    # Per-condition count on full train
+    nv = sum((VID_DIR / f"{r['sample_id'].replace('::','__').replace('/','_').replace('.mp4','')}_clip_seq.npy").exists() for _,r in tr.iterrows())
+    na = sum(resolve_audio_path(r) is not None for _,r in tr.iterrows())
+    nt = sum(isinstance(r.get('transcript'), str) and len(str(r['transcript']).strip()) > 2 for _,r in tr.iterrows())
 
     sep("📊 PER-CONDITION COUNTS (Train)")
-    nv, na, nt = count_conditions(tr)
-    print(f"  Total: {len(tr)} | Has Video: {nv} | Has Audio: {na} | Has Text: {nt}")
+    print(f"  Total: {len(tr)} | Has Video Features: {nv} | Has Audio: {na} | Has Text: {nt}")
 
     tr = tr[tr.apply(ok, axis=1)].reset_index(drop=True)
     va = va[va.apply(ok, axis=1)].reset_index(drop=True)
@@ -113,6 +134,7 @@ def load_splits():
     for split, df in [("Train", tr), ("Val", va), ("Test", te)]:
         if len(df): print(f"  {split} emotions: {df['emotion_final'].value_counts().to_dict()}")
     return tr, va, te
+
 
 # ─────────────────────────────────────────────────────────
 # MODALITY 1 — VIDEO  (Multi-Scale Window Transformer)
