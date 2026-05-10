@@ -30,7 +30,7 @@ DRIVE       = Path("/content/drive/MyDrive/Thesis Project")
 REPO        = Path("/content/thesis")
 SPLIT_DIR   = REPO / "data/processed/splits/multimodal_eligible"
 VID_DIR     = Path("/content/video_features/video_sequences_v1")   # extracted locally
-AUDIO_BASE  = Path("/content/audio")                                # extracted locally
+AUDIO_BASE  = Path("/content/audio/Thesis Project/dataset/Final Modalink Dataset MERGED")
 SAVE_DIR    = Path("/content/fusion_models")
 SAVE_DIR.mkdir(exist_ok=True)
 
