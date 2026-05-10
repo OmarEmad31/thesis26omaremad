@@ -34,3 +34,25 @@ Thesis_Audio_Full.zip
 # Logs
 *.log
 text_train_log.txt
+
+# Model weights (large binary files)
+*.pt
+*.bin
+*.pth
+models/
+results/
+
+# Root-level audit/scratch CSVs
+extra_video_not_in_final_split.csv
+missing_video_from_final_split.csv
+unresolved_video_rows.csv
+video_audit_report.csv
+video_evaluation_summary_v2.csv
+video_feature_manifest.csv
+video_feature_manifest_v2.csv
+video_manifest_trackA.csv
+video_v2_extraction_progress.json
+temporal_transformer_results.csv
+transformer_cm_*.csv
+verification_log.txt
+scratch/
