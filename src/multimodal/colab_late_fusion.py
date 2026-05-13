@@ -332,11 +332,11 @@ def clean(t):
 class MARBERTClassifier(nn.Module):
     def __init__(self):
         super().__init__()
-        from peft import LoraConfig, get_peft_model
-        bert     = AutoModel.from_pretrained(MODEL_NAME)
-        lora_cfg = LoraConfig(r=16, lora_alpha=32, target_modules=["query","value"],
-                              lora_dropout=0.1, bias="none")
-        self.bert = get_peft_model(bert, lora_cfg)
+        self.bert = AutoModel.from_pretrained(MODEL_NAME)
+        # Freeze bottom 8 layers, train top 4 (same effect as LoRA, no deps)
+        for i, layer in enumerate(self.bert.encoder.layer):
+            if i < 8:
+                for p in layer.parameters(): p.requires_grad = False
         self.cls  = nn.Linear(768*3, 7)
         self.drops= nn.ModuleList([nn.Dropout(0.3) for _ in range(5)])
     def forward(self, ids, mask):
@@ -450,7 +450,31 @@ def late_fusion(vp, ap, tp, te):
 if __name__ == "__main__":
     sep(f"🚀 MULTIMODAL LATE FUSION — Track A | Device: {DEVICE}")
     tr, va, te = load_splits()
-    vid_probs   = train_video(tr, va, te)
-    aud_probs   = train_audio(tr, va, te)
-    txt_probs   = train_text(tr, va, te)
+
+    # ── Resume checkpointing: skip modality if probs already saved ──
+    VP = SAVE_DIR / "vid_probs.npy"
+    AP = SAVE_DIR / "aud_probs.npy"
+    TP = SAVE_DIR / "txt_probs.npy"
+
+    if VP.exists():
+        print("\n⏩ Loading cached video probs...")
+        vid_probs = np.load(str(VP))
+    else:
+        vid_probs = train_video(tr, va, te)
+        np.save(str(VP), vid_probs)
+
+    if AP.exists():
+        print("\n⏩ Loading cached audio probs...")
+        aud_probs = np.load(str(AP))
+    else:
+        aud_probs = train_audio(tr, va, te)
+        np.save(str(AP), aud_probs)
+
+    if TP.exists():
+        print("\n⏩ Loading cached text probs...")
+        txt_probs = np.load(str(TP))
+    else:
+        txt_probs = train_text(tr, va, te)
+        np.save(str(TP), txt_probs)
+
     late_fusion(vid_probs, aud_probs, txt_probs, te)
