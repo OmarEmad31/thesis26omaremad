@@ -340,77 +340,76 @@ class TextDS(Dataset):
 def train_text(tr, va, te, tr_raw, va_raw):
     from sklearn.model_selection import StratifiedKFold
     from sklearn.utils.class_weight import compute_class_weight
-    from transformers import get_linear_schedule_with_warmup
-    sep("📝  TEXT — MARBERT | Layer-Freeze | Warmup+Cosine | 5-Fold")
+    sep("\ud83d\udcdd  TEXT \u2014 MARBERT | 5-Fold | Live Test Tracking")
     set_seed(42)
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    # Combine BOTH pools: final_sanitized (v30 data) + multimodal_eligible raw
+    # Combined pool: multimodal_eligible + final_sanitized (if on Drive)
     def has_text(row): return isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
     FS_DIR = DRIVE / "data/processed/splits/final_sanitized"
     parts = [tr_raw[tr_raw.apply(has_text, axis=1)],
              va_raw[va_raw.apply(has_text, axis=1)]]
     if (FS_DIR / "train.csv").exists():
         parts += [pd.read_csv(FS_DIR / "train.csv"), pd.read_csv(FS_DIR / "val.csv")]
-        print("  Including final_sanitized pool")
+        print("  \u2705 Including final_sanitized pool")
     pool = pd.concat(parts).drop_duplicates(subset=['transcript']).reset_index(drop=True)
 
     texts     = pool['transcript'].values
     labels    = np.array([LID[e] for e in pool['emotion_final'].values])
     te_labels = np.array([LID[e] for e in te['emotion_final'].values])
-    te_loader = DataLoader(TextDS(te['transcript'].values, te_labels, tok), batch_size=16)
+    te_loader = DataLoader(TextDS(te['transcript'].values, te_labels, tok), batch_size=32)
 
-    # Class weights for imbalanced 7-class problem
-    cw = compute_class_weight('balanced', classes=np.arange(7), y=labels)
+    cw   = compute_class_weight('balanced', classes=np.arange(7), y=labels)
     cw_t = torch.tensor(cw, dtype=torch.float32).to(DEVICE)
-    print(f"  Training pool: {len(pool)} | Test: {len(te)}")
+    print(f"  Pool: {len(pool)} | Test: {len(te)}")
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     fold_probs = []
 
     for fold, (t_idx, v_idx) in enumerate(skf.split(texts, labels)):
-        print(f"\n  ── Fold {fold+1}/5 ──")
+        print(f"\n  \u2500\u2500 Fold {fold+1}/5 \u2500\u2500")
         tl = DataLoader(TextDS(texts[t_idx], labels[t_idx], tok), batch_size=16, shuffle=True)
-        vl = DataLoader(TextDS(texts[v_idx], labels[v_idx], tok), batch_size=16)
+        vl = DataLoader(TextDS(texts[v_idx], labels[v_idx], tok), batch_size=32)
 
         m = MARBERTClassifier().to(DEVICE)
-        # Discriminative LRs matching v30 (head 8e-4, bert 2e-5)
         opt = torch.optim.AdamW([
-            {'params': [p for n,p in m.named_parameters() if 'classifier' in n], 'lr': 8e-4},
+            {'params': [p for n,p in m.named_parameters() if 'classifier' in n], 'lr': 1e-3},
             {'params': [p for n,p in m.named_parameters() if 'bert' in n and p.requires_grad], 'lr': 2e-5}
         ], weight_decay=0.01)
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=40)
 
-        # Warmup 3 epochs then cosine decay — best practice for BERT fine-tuning
-        total_steps  = 40 * len(tl)
-        warmup_steps = 3  * len(tl)
-        sch = get_linear_schedule_with_warmup(opt, num_warmup_steps=warmup_steps,
-                                               num_training_steps=total_steps)
-
-        best_acc, ckpt, patience, pat = 0, SAVE_DIR/f"txt_fold{fold}.pt", 8, 0
-        for ep in range(1, 41):
+        best_acc, ckpt, patience, pat = 0, SAVE_DIR/f"txt_fold{fold}.pt", 12, 0
+        for ep in range(1, 45):
             m.train()
             for bd, bl in tl:
                 opt.zero_grad()
-                loss = F.cross_entropy(
-                    m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)),
-                    bl.to(DEVICE), weight=cw_t, label_smoothing=0.08)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)  # stability
-                opt.step(); sch.step()
-            m.eval(); ps, ts = [], []
+                F.cross_entropy(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)),
+                                bl.to(DEVICE), weight=cw_t, label_smoothing=0.08).backward()
+                torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+                opt.step()
+            sch.step()
+            m.eval()
+            # Val metrics
+            ps, ts = [], []
             with torch.no_grad():
                 for bd, bl in vl:
                     ps.extend(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)).argmax(1).cpu().numpy())
                     ts.extend(bl.numpy())
             acc = accuracy_score(ts, ps)
             f1  = f1_score(ts, ps, average='macro', zero_division=0)
-            marker = " ⭐" if acc > best_acc else ""
-            print(f"    Ep {ep:02d} | Val Acc: {acc:.4f} | Val F1: {f1:.4f}{marker}")
+            # Live test acc every epoch (cheap: only 97 samples)
+            tp = []
+            with torch.no_grad():
+                for bd, _ in te_loader:
+                    tp.append(F.softmax(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)), 1).cpu().numpy())
+            live_test_acc = accuracy_score(te_labels, np.vstack(tp).argmax(1))
+            marker = " \u2b50" if acc > best_acc else ""
+            print(f"    Ep {ep:02d} | Val Acc: {acc:.4f} | F1: {f1:.4f} | \ud83e\udde0 TestAcc: {live_test_acc:.4f}{marker}")
             if acc > best_acc:
                 best_acc = acc; torch.save(m.state_dict(), str(ckpt)); pat = 0
             else:
                 pat += 1
-                if pat >= patience: print(f"    Early stop. Best: {best_acc:.4f}"); break
+                if pat >= patience: print(f"    Early stop. Best Val: {best_acc:.4f}"); break
 
         m.load_state_dict(torch.load(str(ckpt), weights_only=True)); m.eval()
         fp = []
@@ -418,10 +417,11 @@ def train_text(tr, va, te, tr_raw, va_raw):
             for bd, _ in te_loader:
                 fp.append(F.softmax(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)), 1).cpu().numpy())
         fold_probs.append(np.vstack(fp))
-        print(f"    Rolling Test Acc: {accuracy_score(te_labels, np.mean(fold_probs,0).argmax(1)):.4f}")
+        fold_acc = accuracy_score(te_labels, np.mean(fold_probs,0).argmax(1))
+        print(f"    \ud83c\udfc6 Fold {fold+1} done. Rolling Ensemble Test Acc: {fold_acc:.4f}")
 
     probs = np.mean(fold_probs, 0)
-    report("TEXT (Layer-Freeze, Warmup, Combined Pool)", te_labels, probs.argmax(1))
+    report("TEXT (5-Fold Ensemble)", te_labels, probs.argmax(1))
     return probs
 
 
