@@ -94,32 +94,21 @@ def load_splits():
     def has_text(row):  return isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
     def all_ok(row):    return has_video(row) and has_audio(row) and has_text(row)
 
-    # Diagnostic on first row
     sep("🔍 DIAGNOSTIC — Path Resolution Check")
     row0 = tr_raw.iloc[0]
     vpath = VID_DIR / f"{sid(row0)}_clip_seq.npy"
     print(f"  [VIDEO] {vpath} → exists: {vpath.exists()}")
-    apath = resolve_audio_path(row0)
-    print(f"  [AUDIO] relpath={row0.get('audio_relpath','?')} → resolved: {apath is not None}")
-    print(f"  [TEXT]  transcript present: {has_text(row0)}")
+    print(f"  [AUDIO] resolved: {resolve_audio_path(row0) is not None}")
+    print(f"  [TEXT]  present: {has_text(row0)}")
 
-    # Modality-specific train/val (each modality trains on ALL its eligible samples)
-    tr_vid = tr_raw[tr_raw.apply(has_video, axis=1)].reset_index(drop=True)
-    va_vid = va_raw[va_raw.apply(has_video, axis=1)].reset_index(drop=True)
-    tr_aud = tr_raw[tr_raw.apply(has_audio, axis=1)].reset_index(drop=True)
-    va_aud = va_raw[va_raw.apply(has_audio, axis=1)].reset_index(drop=True)
-    tr_txt = tr_raw[tr_raw.apply(has_text,  axis=1)].reset_index(drop=True)
-    va_txt = va_raw[va_raw.apply(has_text,  axis=1)].reset_index(drop=True)
-
-    # Aligned test: ALL 3 modalities required
+    tr = tr_raw[tr_raw.apply(all_ok, axis=1)].reset_index(drop=True)
+    va = va_raw[va_raw.apply(all_ok, axis=1)].reset_index(drop=True)
     te = te_raw[te_raw.apply(all_ok, axis=1)].reset_index(drop=True)
 
-    sep("📊 MODALITY-SPECIFIC SPLIT SIZES")
-    print(f"  Video  train: {len(tr_vid)} | val: {len(va_vid)}")
-    print(f"  Audio  train: {len(tr_aud)} | val: {len(va_aud)}")
-    print(f"  Text   train: {len(tr_txt)} | val: {len(va_txt)}")
-    print(f"  Aligned test (all 3): {len(te)}")
-    return tr_vid, va_vid, tr_aud, va_aud, tr_txt, va_txt, te
+    sep("ALIGNED SPLITS (all 3 modalities)")
+    print(f"  Train: {len(tr)} | Val: {len(va)} | Test: {len(te)}")
+    return tr, va, te, tr_raw, va_raw   # tr_raw/va_raw used by text for full pool
+
 
 
 
@@ -189,7 +178,7 @@ class Lookahead:
     def zero_grad(self, **kw): self.opt.zero_grad(**kw)
 
 def train_video(tr, va, te):
-    sep("🎥  VIDEO MODALITY — MSW Transformer (5-seed, Top-3 Ckpt Avg)")
+    sep("🎥  VIDEO MODALITY — MSW Transformer (5-seed ensemble)")
     tl = DataLoader(VideoDS(tr), batch_size=32, shuffle=True)
     vl = DataLoader(VideoDS(va), batch_size=32)
     el = DataLoader(VideoDS(te), batch_size=32)
@@ -200,8 +189,7 @@ def train_video(tr, va, te):
         m   = MSWModel().to(DEVICE)
         opt = Lookahead(torch.optim.AdamW(m.parameters(), lr=7e-5, weight_decay=5e-2))
         sch = torch.optim.lr_scheduler.OneCycleLR(opt.opt, max_lr=8.4e-5, steps_per_epoch=len(tl), epochs=25)
-        # Track top-3 checkpoints by val F1 to average at inference
-        top3 = []  # list of (f1, state_dict)
+        best_f1, ckpt = 0, SAVE_DIR/f"vid_{seed}.pt"
         for ep in range(1, 26):
             m.train()
             for x,y in tl:
@@ -214,29 +202,20 @@ def train_video(tr, va, te):
                 for x,y in vl: lo,_ = m(x.to(DEVICE)); ps.extend(lo.argmax(1).cpu().numpy()); ts.extend(y.numpy())
             acc = accuracy_score(ts, ps)
             f1  = f1_score(ts, ps, average='macro', zero_division=0)
-            # Maintain top-3 checkpoints
-            top3.append((f1, {k: v.cpu().clone() for k,v in m.state_dict().items()}))
-            top3.sort(key=lambda x: x[0], reverse=True)
-            top3 = top3[:3]
-            marker = " ⭐" if f1 >= top3[0][0] else ""
+            marker = " ⭐" if f1 > best_f1 else ""
             print(f"    Ep {ep:02d} | Val Acc: {acc:.4f} | Val F1: {f1:.4f}{marker}")
-        # Average the top-3 checkpoint weights
-        avg_state = {}
-        for key in top3[0][1].keys():
-            avg_state[key] = torch.stack([ckpt[key].float() for _, ckpt in top3]).mean(0)
-        m.load_state_dict(avg_state); m.to(DEVICE); m.eval()
-        best_f1 = top3[0][0]
-        print(f"    → Using avg of top-3 checkpoints (best F1: {best_f1:.4f})")
+            if f1 > best_f1: best_f1=f1; torch.save(m.state_dict(), str(ckpt))
+        m.load_state_dict(torch.load(str(ckpt), weights_only=True)); m.eval()
         tp = []
         with torch.no_grad():
             for x,_ in el: lo,_ = m(x.to(DEVICE)); tp.append(F.softmax(lo,1).cpu().numpy())
         all_probs.append(np.vstack(tp)); all_w.append(best_f1)
-
     w = np.array(all_w); w /= w.sum()
     probs = sum(p*wt for p,wt in zip(all_probs,w))
     t_labels = [LID[e] for e in te['emotion_final'].values]
     report("VIDEO ENSEMBLE", t_labels, probs.argmax(1))
     return probs
+
 
 # ─────────────────────────────────────────────────────────
 # MODALITY 2 — AUDIO  (WavLM-Base-Plus, Layer-Weighted)
@@ -312,7 +291,7 @@ def train_audio(tr, va, te):
     return probs
 
 # ─────────────────────────────────────────────────────────
-# MODALITY 3 — TEXT  (MARBERT + LoRA, 5-Fold CV Ensemble)
+# MODALITY 3 — TEXT  (MARBERT, 5-Fold CV, Full Text Pool)
 # ─────────────────────────────────────────────────────────
 MODEL_NAME = "UBC-NLP/MARBERT"
 
@@ -328,7 +307,7 @@ class MARBERTClassifier(nn.Module):
     def __init__(self):
         super().__init__()
         self.bert = AutoModel.from_pretrained(MODEL_NAME)
-        # Freeze bottom 8 layers, train top 4 (same effect as LoRA, no deps)
+        # Freeze bottom 8 of 12 layers — train only top 4
         for i, layer in enumerate(self.bert.encoder.layer):
             if i < 8:
                 for p in layer.parameters(): p.requires_grad = False
@@ -350,20 +329,33 @@ class TextDS(Dataset):
     def __len__(self): return len(self.labels)
     def __getitem__(self,i): return {k:v[i] for k,v in self.enc.items()}, torch.tensor(self.labels[i], dtype=torch.long)
 
-def train_text(tr, va, te):
+def train_text(tr, va, te, tr_raw, va_raw):
+    """Train on ALL text-eligible samples (not restricted to multimodal intersection)."""
     from sklearn.model_selection import StratifiedKFold
-    sep("📝  TEXT MODALITY — MARBERT + LoRA (5-Fold CV Ensemble)")
+    from sklearn.utils.class_weight import compute_class_weight
+    sep("📝  TEXT MODALITY — MARBERT (5-Fold CV, Full Text Pool)")
     set_seed(42)
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    # Pool train+val for 5-fold CV (mirrors v30 champion strategy)
-    pool      = pd.concat([tr, va]).reset_index(drop=True)
-    texts     = pool['transcript'].values
-    labels    = np.array([LID[e] for e in pool['emotion_final'].values])
+    # Build FULL text pool from raw CSVs (all rows with a transcript)
+    def has_text(row): return isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
+    full_tr = tr_raw[tr_raw.apply(has_text, axis=1)].reset_index(drop=True)
+    full_va = va_raw[va_raw.apply(has_text, axis=1)].reset_index(drop=True)
+    pool    = pd.concat([full_tr, full_va]).reset_index(drop=True)
+    texts   = pool['transcript'].values
+    labels  = np.array([LID[e] for e in pool['emotion_final'].values])
+
     te_labels = np.array([LID[e] for e in te['emotion_final'].values])
     te_loader = DataLoader(TextDS(te['transcript'].values, te_labels, tok), batch_size=16)
 
-    skf        = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    # Class weights to handle imbalance
+    cw = compute_class_weight('balanced', classes=np.arange(7), y=labels)
+    cw_tensor = torch.tensor(cw, dtype=torch.float32).to(DEVICE)
+
+    print(f"  Training pool: {len(pool)} samples (full text-eligible)")
+    print(f"  Aligned test : {len(te)} samples")
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     fold_probs = []
 
     for fold, (t_idx, v_idx) in enumerate(skf.split(texts, labels)):
@@ -372,25 +364,32 @@ def train_text(tr, va, te):
         vl = DataLoader(TextDS(texts[v_idx], labels[v_idx], tok), batch_size=16)
 
         m   = MARBERTClassifier().to(DEVICE)
+        # Discriminative LRs: higher for head, lower for top BERT layers
+        bert_params  = [p for n,p in m.named_parameters() if 'bert' in n and p.requires_grad]
+        head_params  = [p for n,p in m.named_parameters() if 'bert' not in n]
         opt = torch.optim.AdamW([
-            {'params':[p for n,p in m.named_parameters() if 'bert' in n], 'lr':2e-5},
-            {'params':[p for n,p in m.named_parameters() if 'bert' not in n], 'lr':8e-4}
+            {'params': bert_params, 'lr': 3e-5},
+            {'params': head_params, 'lr': 1e-3}
         ], weight_decay=0.01)
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=40)
 
-        best_acc, ckpt, patience, pat = 0, SAVE_DIR/f"txt_fold{fold}.pt", 8, 0
-        for ep in range(1, 40):
+        best_acc, ckpt, patience, pat = 0, SAVE_DIR/f"txt_fold{fold}.pt", 10, 0
+        for ep in range(1, 45):
             m.train()
             for bd,bl in tl:
                 opt.zero_grad()
-                F.cross_entropy(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)),
-                                bl.to(DEVICE), label_smoothing=0.08).backward()
-                opt.step()
+                loss = F.cross_entropy(
+                    m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)),
+                    bl.to(DEVICE), weight=cw_tensor, label_smoothing=0.05)
+                loss.backward(); opt.step()
+            sch.step()
             m.eval(); ps,ts=[],[]
             with torch.no_grad():
                 for bd,bl in vl:
                     ps.extend(m(bd['input_ids'].to(DEVICE),bd['attention_mask'].to(DEVICE)).argmax(1).cpu().numpy())
                     ts.extend(bl.numpy())
-            acc=accuracy_score(ts,ps); f1=f1_score(ts,ps,average='macro',zero_division=0)
+            acc = accuracy_score(ts,ps)
+            f1  = f1_score(ts,ps,average='macro',zero_division=0)
             marker = " ⭐" if acc > best_acc else ""
             print(f"    Ep {ep:02d} | Val Acc: {acc:.4f} | Val F1: {f1:.4f}{marker}")
             if acc > best_acc: best_acc=acc; torch.save(m.state_dict(),str(ckpt)); pat=0
@@ -407,8 +406,9 @@ def train_text(tr, va, te):
         print(f"    Rolling Test Acc: {accuracy_score(te_labels, np.mean(fold_probs,0).argmax(1)):.4f}")
 
     probs = np.mean(fold_probs, 0)
-    report("TEXT (5-Fold Ensemble)", te_labels, probs.argmax(1))
+    report("TEXT (5-Fold, Full Pool)", te_labels, probs.argmax(1))
     return probs
+
 
 
 # ─────────────────────────────────────────────────────────
@@ -444,7 +444,7 @@ def late_fusion(vp, ap, tp, te):
 # ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
     sep(f"🚀 MULTIMODAL LATE FUSION v2 — Track A | Device: {DEVICE}")
-    tr_vid, va_vid, tr_aud, va_aud, tr_txt, va_txt, te = load_splits()
+    tr, va, te, tr_raw, va_raw = load_splits()
 
     VP = SAVE_DIR / "vid_probs.npy"
     AP = SAVE_DIR / "aud_probs.npy"
@@ -453,17 +453,18 @@ if __name__ == "__main__":
     if VP.exists():
         print("\n⏩ Loading cached video probs..."); vid_probs = np.load(str(VP))
     else:
-        vid_probs = train_video(tr_vid, va_vid, te); np.save(str(VP), vid_probs)
+        vid_probs = train_video(tr, va, te); np.save(str(VP), vid_probs)
 
     if AP.exists():
         print("\n⏩ Loading cached audio probs..."); aud_probs = np.load(str(AP))
     else:
-        aud_probs = train_audio(tr_aud, va_aud, te); np.save(str(AP), aud_probs)
+        aud_probs = train_audio(tr, va, te); np.save(str(AP), aud_probs)
 
     if TP.exists():
         print("\n⏩ Loading cached text probs..."); txt_probs = np.load(str(TP))
     else:
-        txt_probs = train_text(tr_txt, va_txt, te); np.save(str(TP), txt_probs)
+        txt_probs = train_text(tr, va, te, tr_raw, va_raw); np.save(str(TP), txt_probs)
 
     late_fusion(vid_probs, aud_probs, txt_probs, te)
+
 
