@@ -345,11 +345,10 @@ def train_text(tr, va, te, tr_raw, va_raw):
     set_seed(42)
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    # Full text pool with HC filtering (audio_clarity >= 2 = 2/3 or 3/3 annotators agree)
+    # Full text pool — all samples with a valid transcript
+    # (multimodal_eligible CSVs are already quality-filtered upstream)
     def is_hc(row):
-        txt_ok = isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
-        hc_ok  = float(row.get('audio_clarity', 2)) >= 2  # HC filter
-        return txt_ok and hc_ok
+        return isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
 
     full_tr = tr_raw[tr_raw.apply(is_hc, axis=1)].reset_index(drop=True)
     full_va = va_raw[va_raw.apply(is_hc, axis=1)].reset_index(drop=True)
