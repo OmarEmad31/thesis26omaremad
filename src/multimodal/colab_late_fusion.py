@@ -84,59 +84,43 @@ def resolve_audio_path(row):
 
 
 def load_splits():
-    tr = pd.read_csv(SPLIT_DIR / "train.csv")
-    va = pd.read_csv(SPLIT_DIR / "val.csv")
-    te = pd.read_csv(SPLIT_DIR / "test.csv")
+    tr_raw = pd.read_csv(SPLIT_DIR / "train.csv")
+    va_raw = pd.read_csv(SPLIT_DIR / "val.csv")
+    te_raw = pd.read_csv(SPLIT_DIR / "test.csv")
 
-    # ── DIAGNOSTICS ─────────────────────────────────────
+    def sid(row): return row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
+    def has_video(row): return (VID_DIR / f"{sid(row)}_clip_seq.npy").exists()
+    def has_audio(row): return resolve_audio_path(row) is not None
+    def has_text(row):  return isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
+    def all_ok(row):    return has_video(row) and has_audio(row) and has_text(row)
+
+    # Diagnostic on first row
     sep("🔍 DIAGNOSTIC — Path Resolution Check")
-    row0 = tr.iloc[0]
-    print(f"  Columns: {list(tr.columns)}")
-    sid0 = row0['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-    vpath = VID_DIR / f"{sid0}_clip_seq.npy"
-    print(f"\n  [VIDEO]")
-    print(f"  Feature path checked : {vpath}")
-    print(f"  Exists               : {vpath.exists()}")
-    if not vpath.exists():
-        print(f"  ⚠️  Video .npy files not found on Drive!")
-        print(f"  ➡  Zip your local folder: d:\\Thesis Project\\data\\processed\\features\\video_sequences_v1\\")
-        print(f"  ➡  Upload to Drive at   : Thesis Project/data/processed/features/video_sequences_v1.zip")
-        print(f"  ➡  Then unzip in Colab  : !unzip -q '/content/drive/MyDrive/Thesis Project/data/processed/features/video_sequences_v1.zip' -d '{VID_DIR.parent}'")
+    row0 = tr_raw.iloc[0]
+    vpath = VID_DIR / f"{sid(row0)}_clip_seq.npy"
+    print(f"  [VIDEO] {vpath} → exists: {vpath.exists()}")
+    apath = resolve_audio_path(row0)
+    print(f"  [AUDIO] relpath={row0.get('audio_relpath','?')} → resolved: {apath is not None}")
+    print(f"  [TEXT]  transcript present: {has_text(row0)}")
 
-    print(f"\n  [AUDIO]")
-    print(f"  audio_relpath : {row0.get('audio_relpath','N/A')}")
-    print(f"  audio_path    : {str(row0.get('audio_path','N/A'))[:100]}")
-    aresolved = resolve_audio_path(row0)
-    print(f"  Resolved to   : {aresolved}")
-    print(f"  Exists        : {aresolved is not None}")
+    # Modality-specific train/val (each modality trains on ALL its eligible samples)
+    tr_vid = tr_raw[tr_raw.apply(has_video, axis=1)].reset_index(drop=True)
+    va_vid = va_raw[va_raw.apply(has_video, axis=1)].reset_index(drop=True)
+    tr_aud = tr_raw[tr_raw.apply(has_audio, axis=1)].reset_index(drop=True)
+    va_aud = va_raw[va_raw.apply(has_audio, axis=1)].reset_index(drop=True)
+    tr_txt = tr_raw[tr_raw.apply(has_text,  axis=1)].reset_index(drop=True)
+    va_txt = va_raw[va_raw.apply(has_text,  axis=1)].reset_index(drop=True)
 
-    print(f"\n  [TEXT]")
-    print(f"  transcript    : '{str(row0.get('transcript',''))[:80]}'")
+    # Aligned test: ALL 3 modalities required
+    te = te_raw[te_raw.apply(all_ok, axis=1)].reset_index(drop=True)
 
-    def ok(row):
-        sid = row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-        vid = (VID_DIR / f"{sid}_clip_seq.npy").exists()
-        aud = resolve_audio_path(row) is not None
-        txt = isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
-        return vid and aud and txt
+    sep("📊 MODALITY-SPECIFIC SPLIT SIZES")
+    print(f"  Video  train: {len(tr_vid)} | val: {len(va_vid)}")
+    print(f"  Audio  train: {len(tr_aud)} | val: {len(va_aud)}")
+    print(f"  Text   train: {len(tr_txt)} | val: {len(va_txt)}")
+    print(f"  Aligned test (all 3): {len(te)}")
+    return tr_vid, va_vid, tr_aud, va_aud, tr_txt, va_txt, te
 
-    # Per-condition count on full train
-    nv = sum((VID_DIR / f"{r['sample_id'].replace('::','__').replace('/','_').replace('.mp4','')}_clip_seq.npy").exists() for _,r in tr.iterrows())
-    na = sum(resolve_audio_path(r) is not None for _,r in tr.iterrows())
-    nt = sum(isinstance(r.get('transcript'), str) and len(str(r['transcript']).strip()) > 2 for _,r in tr.iterrows())
-
-    sep("📊 PER-CONDITION COUNTS (Train)")
-    print(f"  Total: {len(tr)} | Has Video Features: {nv} | Has Audio: {na} | Has Text: {nt}")
-
-    tr = tr[tr.apply(ok, axis=1)].reset_index(drop=True)
-    va = va[va.apply(ok, axis=1)].reset_index(drop=True)
-    te = te[te.apply(ok, axis=1)].reset_index(drop=True)
-
-    sep("ALIGNED SPLITS (all 3 modalities present)")
-    print(f"  Train: {len(tr)} | Val: {len(va)} | Test: {len(te)}")
-    for split, df in [("Train", tr), ("Val", va), ("Test", te)]:
-        if len(df): print(f"  {split} emotions: {df['emotion_final'].value_counts().to_dict()}")
-    return tr, va, te
 
 
 # ─────────────────────────────────────────────────────────
@@ -205,7 +189,7 @@ class Lookahead:
     def zero_grad(self, **kw): self.opt.zero_grad(**kw)
 
 def train_video(tr, va, te):
-    sep("🎥  VIDEO MODALITY — MSW Transformer (5-seed ensemble)")
+    sep("🎥  VIDEO MODALITY — MSW Transformer (5-seed, Top-3 Ckpt Avg)")
     tl = DataLoader(VideoDS(tr), batch_size=32, shuffle=True)
     vl = DataLoader(VideoDS(va), batch_size=32)
     el = DataLoader(VideoDS(te), batch_size=32)
@@ -216,7 +200,8 @@ def train_video(tr, va, te):
         m   = MSWModel().to(DEVICE)
         opt = Lookahead(torch.optim.AdamW(m.parameters(), lr=7e-5, weight_decay=5e-2))
         sch = torch.optim.lr_scheduler.OneCycleLR(opt.opt, max_lr=8.4e-5, steps_per_epoch=len(tl), epochs=25)
-        best_f1, ckpt = 0, SAVE_DIR/f"vid_{seed}.pt"
+        # Track top-3 checkpoints by val F1 to average at inference
+        top3 = []  # list of (f1, state_dict)
         for ep in range(1, 26):
             m.train()
             for x,y in tl:
@@ -229,14 +214,24 @@ def train_video(tr, va, te):
                 for x,y in vl: lo,_ = m(x.to(DEVICE)); ps.extend(lo.argmax(1).cpu().numpy()); ts.extend(y.numpy())
             acc = accuracy_score(ts, ps)
             f1  = f1_score(ts, ps, average='macro', zero_division=0)
-            marker = " ⭐" if f1 > best_f1 else ""
+            # Maintain top-3 checkpoints
+            top3.append((f1, {k: v.cpu().clone() for k,v in m.state_dict().items()}))
+            top3.sort(key=lambda x: x[0], reverse=True)
+            top3 = top3[:3]
+            marker = " ⭐" if f1 >= top3[0][0] else ""
             print(f"    Ep {ep:02d} | Val Acc: {acc:.4f} | Val F1: {f1:.4f}{marker}")
-            if f1 > best_f1: best_f1=f1; torch.save(m.state_dict(), str(ckpt))
-        m.load_state_dict(torch.load(str(ckpt), weights_only=True)); m.eval()
+        # Average the top-3 checkpoint weights
+        avg_state = {}
+        for key in top3[0][1].keys():
+            avg_state[key] = torch.stack([ckpt[key].float() for _, ckpt in top3]).mean(0)
+        m.load_state_dict(avg_state); m.to(DEVICE); m.eval()
+        best_f1 = top3[0][0]
+        print(f"    → Using avg of top-3 checkpoints (best F1: {best_f1:.4f})")
         tp = []
         with torch.no_grad():
             for x,_ in el: lo,_ = m(x.to(DEVICE)); tp.append(F.softmax(lo,1).cpu().numpy())
         all_probs.append(np.vstack(tp)); all_w.append(best_f1)
+
     w = np.array(all_w); w /= w.sum()
     probs = sum(p*wt for p,wt in zip(all_probs,w))
     t_labels = [LID[e] for e in te['emotion_final'].values]
@@ -448,33 +443,27 @@ def late_fusion(vp, ap, tp, te):
 # MAIN
 # ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    sep(f"🚀 MULTIMODAL LATE FUSION — Track A | Device: {DEVICE}")
-    tr, va, te = load_splits()
+    sep(f"🚀 MULTIMODAL LATE FUSION v2 — Track A | Device: {DEVICE}")
+    tr_vid, va_vid, tr_aud, va_aud, tr_txt, va_txt, te = load_splits()
 
-    # ── Resume checkpointing: skip modality if probs already saved ──
     VP = SAVE_DIR / "vid_probs.npy"
     AP = SAVE_DIR / "aud_probs.npy"
     TP = SAVE_DIR / "txt_probs.npy"
 
     if VP.exists():
-        print("\n⏩ Loading cached video probs...")
-        vid_probs = np.load(str(VP))
+        print("\n⏩ Loading cached video probs..."); vid_probs = np.load(str(VP))
     else:
-        vid_probs = train_video(tr, va, te)
-        np.save(str(VP), vid_probs)
+        vid_probs = train_video(tr_vid, va_vid, te); np.save(str(VP), vid_probs)
 
     if AP.exists():
-        print("\n⏩ Loading cached audio probs...")
-        aud_probs = np.load(str(AP))
+        print("\n⏩ Loading cached audio probs..."); aud_probs = np.load(str(AP))
     else:
-        aud_probs = train_audio(tr, va, te)
-        np.save(str(AP), aud_probs)
+        aud_probs = train_audio(tr_aud, va_aud, te); np.save(str(AP), aud_probs)
 
     if TP.exists():
-        print("\n⏩ Loading cached text probs...")
-        txt_probs = np.load(str(TP))
+        print("\n⏩ Loading cached text probs..."); txt_probs = np.load(str(TP))
     else:
-        txt_probs = train_text(tr, va, te)
-        np.save(str(TP), txt_probs)
+        txt_probs = train_text(tr_txt, va_txt, te); np.save(str(TP), txt_probs)
 
     late_fusion(vid_probs, aud_probs, txt_probs, te)
+
