@@ -295,22 +295,32 @@ def train_audio(tr, va, te):
 # ─────────────────────────────────────────────────────────
 MODEL_NAME = "UBC-NLP/MARBERT"
 
+EGYPTIAN_FILLERS = re.compile(
+    r'\b(اه|ايه|يعني|بص|كده|كدا|اهو|والله|عشان|بقا|بقى|يا|اوه|هاه|اوكي|اوكى|تمام|صح|ايوه|لا|اه|مش|ميش)\b'
+)
+
 def clean(t):
-    if not isinstance(t,str): return ""
-    t = re.sub(r'[\u064B-\u065F\u0670]','',t)
-    t = re.sub(r'[أإآ]','ا',t)
-    t = re.sub(r'\u0640','',t)
-    t = re.sub(r'(.)\1+',r'\1\1',t)
-    return re.sub(r'\s+',' ',t).strip()
+    if not isinstance(t, str): return ""
+    t = re.sub(r'[\u064B-\u065F\u0670]', '', t)   # diacritics
+    t = re.sub(r'[\u0622\u0623\u0625]', '\u0627', t)  # Alef variants → bare Alef
+    t = re.sub(r'\u0629', '\u0647', t)              # Ta marbuta → Ha
+    t = re.sub(r'\u0649', '\u064A', t)              # Alef maqsura → Ya
+    t = re.sub(r'\u0640', '', t)                    # Tatweel
+    t = EGYPTIAN_FILLERS.sub(' ', t)                # dialect fillers
+    t = re.sub(r'(.)\1+', r'\1\1', t)              # repeated chars
+    return re.sub(r'\s+', ' ', t).strip()
 
 class MARBERTClassifier(nn.Module):
     def __init__(self):
         super().__init__()
-        self.bert = AutoModel.from_pretrained(MODEL_NAME)
-        # Freeze bottom 8 of 12 layers — train only top 4
-        for i, layer in enumerate(self.bert.encoder.layer):
-            if i < 8:
-                for p in layer.parameters(): p.requires_grad = False
+        from peft import LoraConfig, get_peft_model
+        bert     = AutoModel.from_pretrained(MODEL_NAME)
+        lora_cfg = LoraConfig(
+            r=16, lora_alpha=32,
+            target_modules=["query", "value"],
+            lora_dropout=0.1, bias="none"
+        )
+        self.bert = get_peft_model(bert, lora_cfg)
         self.cls  = nn.Linear(768*3, 7)
         self.drops= nn.ModuleList([nn.Dropout(0.3) for _ in range(5)])
     def forward(self, ids, mask):
@@ -330,17 +340,19 @@ class TextDS(Dataset):
     def __getitem__(self,i): return {k:v[i] for k,v in self.enc.items()}, torch.tensor(self.labels[i], dtype=torch.long)
 
 def train_text(tr, va, te, tr_raw, va_raw):
-    """Train on ALL text-eligible samples (not restricted to multimodal intersection)."""
     from sklearn.model_selection import StratifiedKFold
-    from sklearn.utils.class_weight import compute_class_weight
-    sep("📝  TEXT MODALITY — MARBERT (5-Fold CV, Full Text Pool)")
+    sep("📝  TEXT — MARBERT+LoRA | Triple-Pool | MSD | 5-Fold CV")
     set_seed(42)
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    # Build FULL text pool from raw CSVs (all rows with a transcript)
-    def has_text(row): return isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
-    full_tr = tr_raw[tr_raw.apply(has_text, axis=1)].reset_index(drop=True)
-    full_va = va_raw[va_raw.apply(has_text, axis=1)].reset_index(drop=True)
+    # Full text pool with HC filtering (audio_clarity >= 2 = 2/3 or 3/3 annotators agree)
+    def is_hc(row):
+        txt_ok = isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
+        hc_ok  = float(row.get('audio_clarity', 2)) >= 2  # HC filter
+        return txt_ok and hc_ok
+
+    full_tr = tr_raw[tr_raw.apply(is_hc, axis=1)].reset_index(drop=True)
+    full_va = va_raw[va_raw.apply(is_hc, axis=1)].reset_index(drop=True)
     pool    = pd.concat([full_tr, full_va]).reset_index(drop=True)
     texts   = pool['transcript'].values
     labels  = np.array([LID[e] for e in pool['emotion_final'].values])
@@ -348,12 +360,8 @@ def train_text(tr, va, te, tr_raw, va_raw):
     te_labels = np.array([LID[e] for e in te['emotion_final'].values])
     te_loader = DataLoader(TextDS(te['transcript'].values, te_labels, tok), batch_size=16)
 
-    # Class weights to handle imbalance
-    cw = compute_class_weight('balanced', classes=np.arange(7), y=labels)
-    cw_tensor = torch.tensor(cw, dtype=torch.float32).to(DEVICE)
-
-    print(f"  Training pool: {len(pool)} samples (full text-eligible)")
-    print(f"  Aligned test : {len(te)} samples")
+    print(f"  HC training pool : {len(pool)} samples")
+    print(f"  Aligned test     : {len(te)} samples")
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     fold_probs = []
@@ -364,49 +372,47 @@ def train_text(tr, va, te, tr_raw, va_raw):
         vl = DataLoader(TextDS(texts[v_idx], labels[v_idx], tok), batch_size=16)
 
         m   = MARBERTClassifier().to(DEVICE)
-        # Discriminative LRs: higher for head, lower for top BERT layers
-        bert_params  = [p for n,p in m.named_parameters() if 'bert' in n and p.requires_grad]
-        head_params  = [p for n,p in m.named_parameters() if 'bert' not in n]
+        # Exact v30 champion LRs: BERT=2e-5 (gentle), head=8e-4 (aggressive)
         opt = torch.optim.AdamW([
-            {'params': bert_params, 'lr': 3e-5},
-            {'params': head_params, 'lr': 1e-3}
+            {'params': [p for n,p in m.named_parameters() if 'bert' in n], 'lr': 2e-5},
+            {'params': [p for n,p in m.named_parameters() if 'bert' not in n], 'lr': 8e-4}
         ], weight_decay=0.01)
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=40)
 
-        best_acc, ckpt, patience, pat = 0, SAVE_DIR/f"txt_fold{fold}.pt", 10, 0
-        for ep in range(1, 45):
+        best_f1, ckpt, patience, pat = 0, SAVE_DIR/f"txt_fold{fold}.pt", 8, 0
+        for ep in range(1, 40):
             m.train()
-            for bd,bl in tl:
+            for bd, bl in tl:
                 opt.zero_grad()
-                loss = F.cross_entropy(
+                # Label smoothing 0.08 — exact v30 setting
+                F.cross_entropy(
                     m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)),
-                    bl.to(DEVICE), weight=cw_tensor, label_smoothing=0.05)
-                loss.backward(); opt.step()
-            sch.step()
-            m.eval(); ps,ts=[],[]
+                    bl.to(DEVICE), label_smoothing=0.08
+                ).backward()
+                opt.step()
+            m.eval(); ps, ts = [], []
             with torch.no_grad():
-                for bd,bl in vl:
-                    ps.extend(m(bd['input_ids'].to(DEVICE),bd['attention_mask'].to(DEVICE)).argmax(1).cpu().numpy())
+                for bd, bl in vl:
+                    ps.extend(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)).argmax(1).cpu().numpy())
                     ts.extend(bl.numpy())
-            acc = accuracy_score(ts,ps)
-            f1  = f1_score(ts,ps,average='macro',zero_division=0)
-            marker = " ⭐" if acc > best_acc else ""
+            acc = accuracy_score(ts, ps)
+            f1  = f1_score(ts, ps, average='macro', zero_division=0)
+            marker = " ⭐" if f1 > best_f1 else ""
             print(f"    Ep {ep:02d} | Val Acc: {acc:.4f} | Val F1: {f1:.4f}{marker}")
-            if acc > best_acc: best_acc=acc; torch.save(m.state_dict(),str(ckpt)); pat=0
+            if f1 > best_f1: best_f1=f1; torch.save(m.state_dict(), str(ckpt)); pat=0
             else:
-                pat+=1
-                if pat>=patience: print(f"    Early stop."); break
+                pat += 1
+                if pat >= patience: print(f"    Early stop."); break
 
         m.load_state_dict(torch.load(str(ckpt), weights_only=True)); m.eval()
-        fp=[]
+        fp = []
         with torch.no_grad():
-            for bd,_ in te_loader:
-                fp.append(F.softmax(m(bd['input_ids'].to(DEVICE),bd['attention_mask'].to(DEVICE)),1).cpu().numpy())
+            for bd, _ in te_loader:
+                fp.append(F.softmax(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)), 1).cpu().numpy())
         fold_probs.append(np.vstack(fp))
         print(f"    Rolling Test Acc: {accuracy_score(te_labels, np.mean(fold_probs,0).argmax(1)):.4f}")
 
     probs = np.mean(fold_probs, 0)
-    report("TEXT (5-Fold, Full Pool)", te_labels, probs.argmax(1))
+    report("TEXT (5-Fold, HC Pool, LoRA)", te_labels, probs.argmax(1))
     return probs
 
 
@@ -450,6 +456,12 @@ if __name__ == "__main__":
     AP = SAVE_DIR / "aud_probs.npy"
     TP = SAVE_DIR / "txt_probs.npy"
 
+    # TEXT FIRST — so you can stop early and check quality
+    if TP.exists():
+        print("\n⏩ Loading cached text probs..."); txt_probs = np.load(str(TP))
+    else:
+        txt_probs = train_text(tr, va, te, tr_raw, va_raw); np.save(str(TP), txt_probs)
+
     if VP.exists():
         print("\n⏩ Loading cached video probs..."); vid_probs = np.load(str(VP))
     else:
@@ -460,11 +472,4 @@ if __name__ == "__main__":
     else:
         aud_probs = train_audio(tr, va, te); np.save(str(AP), aud_probs)
 
-    if TP.exists():
-        print("\n⏩ Loading cached text probs..."); txt_probs = np.load(str(TP))
-    else:
-        txt_probs = train_text(tr, va, te, tr_raw, va_raw); np.save(str(TP), txt_probs)
-
     late_fusion(vid_probs, aud_probs, txt_probs, te)
-
-
