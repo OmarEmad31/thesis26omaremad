@@ -351,7 +351,7 @@ def train_text(tr, va, te, tr_raw, va_raw):
              va_raw[va_raw.apply(has_text, axis=1)]]
     if (FS_DIR / "train.csv").exists():
         parts += [pd.read_csv(FS_DIR / "train.csv"), pd.read_csv(FS_DIR / "val.csv")]
-        print("  \u2705 Including final_sanitized pool")
+        print("  [OK] Including final_sanitized pool")
     pool = pd.concat(parts).drop_duplicates(subset=['transcript']).reset_index(drop=True)
 
     texts     = pool['transcript'].values
@@ -403,8 +403,8 @@ def train_text(tr, va, te, tr_raw, va_raw):
                 for bd, _ in te_loader:
                     tp.append(F.softmax(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)), 1).cpu().numpy())
             live_test_acc = accuracy_score(te_labels, np.vstack(tp).argmax(1))
-            marker = " \u2b50" if acc > best_acc else ""
-            print(f"    Ep {ep:02d} | Val Acc: {acc:.4f} | F1: {f1:.4f} | \ud83e\udde0 TestAcc: {live_test_acc:.4f}{marker}")
+            marker = " *" if acc > best_acc else ""
+            print(f"    Ep {ep:02d} | Val Acc: {acc:.4f} | F1: {f1:.4f} | Test: {live_test_acc:.4f}{marker}")
             if acc > best_acc:
                 best_acc = acc; torch.save(m.state_dict(), str(ckpt)); pat = 0
             else:
@@ -418,7 +418,7 @@ def train_text(tr, va, te, tr_raw, va_raw):
                 fp.append(F.softmax(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)), 1).cpu().numpy())
         fold_probs.append(np.vstack(fp))
         fold_acc = accuracy_score(te_labels, np.mean(fold_probs,0).argmax(1))
-        print(f"    \ud83c\udfc6 Fold {fold+1} done. Rolling Ensemble Test Acc: {fold_acc:.4f}")
+        print(f"    [Fold {fold+1} done] Rolling Ensemble Test Acc: {fold_acc:.4f}")
 
     probs = np.mean(fold_probs, 0)
     report("TEXT (5-Fold Ensemble)", te_labels, probs.argmax(1))
