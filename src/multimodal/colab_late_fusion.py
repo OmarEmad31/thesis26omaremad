@@ -341,26 +341,29 @@ class TextDS(Dataset):
 
 def train_text(tr, va, te, tr_raw, va_raw):
     from sklearn.model_selection import StratifiedKFold
-    sep("📝  TEXT — MARBERT+LoRA | Triple-Pool | MSD | 5-Fold CV")
+    sep("📝  TEXT — MARBERT+LoRA | v30 Champion Config | 5-Fold CV")
     set_seed(42)
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    # Full text pool — all samples with a valid transcript
-    # (multimodal_eligible CSVs are already quality-filtered upstream)
-    def is_hc(row):
-        return isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
+    # Load training pool from final_sanitized (SAME data v30 used for its 64% result)
+    # Fall back to multimodal_eligible raw pool if Drive path not available
+    FS_DIR = DRIVE / "data/processed/splits/final_sanitized"
+    if (FS_DIR / "train.csv").exists():
+        fs_tr = pd.read_csv(FS_DIR / "train.csv")
+        fs_va = pd.read_csv(FS_DIR / "val.csv")
+        pool  = pd.concat([fs_tr, fs_va]).reset_index(drop=True)
+        print(f"  Using final_sanitized pool: {len(pool)} samples")
+    else:
+        def has_text(row): return isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
+        pool = pd.concat([tr_raw[tr_raw.apply(has_text, axis=1)],
+                          va_raw[va_raw.apply(has_text, axis=1)]]).reset_index(drop=True)
+        print(f"  final_sanitized not found on Drive — using multimodal pool: {len(pool)} samples")
 
-    full_tr = tr_raw[tr_raw.apply(is_hc, axis=1)].reset_index(drop=True)
-    full_va = va_raw[va_raw.apply(is_hc, axis=1)].reset_index(drop=True)
-    pool    = pd.concat([full_tr, full_va]).reset_index(drop=True)
-    texts   = pool['transcript'].values
-    labels  = np.array([LID[e] for e in pool['emotion_final'].values])
-
+    texts     = pool['transcript'].values
+    labels    = np.array([LID[e] for e in pool['emotion_final'].values])
     te_labels = np.array([LID[e] for e in te['emotion_final'].values])
     te_loader = DataLoader(TextDS(te['transcript'].values, te_labels, tok), batch_size=16)
-
-    print(f"  HC training pool : {len(pool)} samples")
-    print(f"  Aligned test     : {len(te)} samples")
+    print(f"  Aligned test: {len(te)} samples")
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     fold_probs = []
@@ -370,23 +373,22 @@ def train_text(tr, va, te, tr_raw, va_raw):
         tl = DataLoader(TextDS(texts[t_idx], labels[t_idx], tok), batch_size=16, shuffle=True)
         vl = DataLoader(TextDS(texts[v_idx], labels[v_idx], tok), batch_size=16)
 
-        m   = MARBERTClassifier().to(DEVICE)
-        # Exact v30 champion LRs: BERT=2e-5 (gentle), head=8e-4 (aggressive)
+        m = MARBERTClassifier().to(DEVICE)
+        # v30 exact optimizer — head first (higher LR), then bert
         opt = torch.optim.AdamW([
-            {'params': [p for n,p in m.named_parameters() if 'bert' in n], 'lr': 2e-5},
-            {'params': [p for n,p in m.named_parameters() if 'bert' not in n], 'lr': 8e-4}
+            {'params': [p for n,p in m.named_parameters() if 'classifier' in n or ('bert' not in n)], 'lr': 8e-4},
+            {'params': [p for n,p in m.named_parameters() if 'bert' in n], 'lr': 2e-5}
         ], weight_decay=0.01)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.08)   # v30 exact
 
-        best_f1, ckpt, patience, pat = 0, SAVE_DIR/f"txt_fold{fold}.pt", 8, 0
+        # v30 exact: monitor ACCURACY, patience=8
+        best_acc, best_f1, ckpt, patience, pat = 0, 0, SAVE_DIR/f"txt_fold{fold}.pt", 8, 0
         for ep in range(1, 40):
             m.train()
             for bd, bl in tl:
                 opt.zero_grad()
-                # Label smoothing 0.08 — exact v30 setting
-                F.cross_entropy(
-                    m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)),
-                    bl.to(DEVICE), label_smoothing=0.08
-                ).backward()
+                criterion(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)),
+                          bl.to(DEVICE)).backward()
                 opt.step()
             m.eval(); ps, ts = [], []
             with torch.no_grad():
@@ -395,12 +397,14 @@ def train_text(tr, va, te, tr_raw, va_raw):
                     ts.extend(bl.numpy())
             acc = accuracy_score(ts, ps)
             f1  = f1_score(ts, ps, average='macro', zero_division=0)
-            marker = " ⭐" if f1 > best_f1 else ""
+            marker = " ⭐" if acc > best_acc else ""
             print(f"    Ep {ep:02d} | Val Acc: {acc:.4f} | Val F1: {f1:.4f}{marker}")
-            if f1 > best_f1: best_f1=f1; torch.save(m.state_dict(), str(ckpt)); pat=0
+            if acc > best_acc:
+                best_acc, best_f1 = acc, f1
+                torch.save(m.state_dict(), str(ckpt)); pat = 0
             else:
                 pat += 1
-                if pat >= patience: print(f"    Early stop."); break
+                if pat >= patience: print(f"    Early stop. Best Acc: {best_acc:.4f}"); break
 
         m.load_state_dict(torch.load(str(ckpt), weights_only=True)); m.eval()
         fp = []
@@ -411,7 +415,7 @@ def train_text(tr, va, te, tr_raw, va_raw):
         print(f"    Rolling Test Acc: {accuracy_score(te_labels, np.mean(fold_probs,0).argmax(1)):.4f}")
 
     probs = np.mean(fold_probs, 0)
-    report("TEXT (5-Fold, HC Pool, LoRA)", te_labels, probs.argmax(1))
+    report("TEXT (v30 Champion Config)", te_labels, probs.argmax(1))
     return probs
 
 
