@@ -29,11 +29,10 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────
 # PATHS & GLOBAL CONFIG (Smart Auto-Detection)
 # ─────────────────────────────────────────────────────────
-import glob
-_repo_str = globals().get("REPO", None)
-if not _repo_str:
-    cands = glob.glob("/content/*thesis*") + glob.glob("/content/*omaremad*")
-    _repo_str = cands[0] if cands else "/content/thesis"
+import glob, os
+cands = glob.glob("/content/*thesis*") + glob.glob("/content/*omaremad*")
+cands = [c for c in cands if os.path.isdir(c) and (Path(c)/"src").exists()]
+_repo_str = cands[0] if cands else "/content/thesis"
 
 REPO       = Path(_repo_str)
 SPLIT_DIR  = REPO / "data/processed/splits/multimodal_eligible"
