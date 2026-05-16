@@ -113,8 +113,19 @@ def resolve_audio_path(row):
     ]
     
     for base in bases:
+        # Standard Path
         p = base / folder / audio_rel if folder else base / audio_rel
         if p.exists(): return p
+        
+        # Windows Backslash Artifact Path (e.g. "videoplayback (1)\audios\SPEAKER_00\SPEAKER_00_segment_0000.wav")
+        if folder:
+            bs_name = f"{folder}\\{audio_rel.replace('/', '\\')}"
+            p_bs = base / bs_name
+            if p_bs.exists(): return p_bs
+            
+        # Flat Directory Fallback
+        p_flat = base / Path(audio_rel).name
+        if p_flat.exists(): return p_flat
         
     return None
 
