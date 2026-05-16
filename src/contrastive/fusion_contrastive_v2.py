@@ -95,12 +95,32 @@ def resolve_audio_path(row):
     if not audio_rel: return None
     folder = str(row.get('folder', ''))
     
-    # Try detected AUDIO_BASE or /content/audio
-    for base in [AUDIO_BASE, Path("/content/audio"), Path("/content/audio/Thesis Project/dataset/Final Modalink Dataset MERGED")]:
+    bases = [
+        AUDIO_BASE,
+        Path("/content/audio"),
+        Path("/content/drive/MyDrive/Thesis_Audio_Full"),
+        Path("/content/drive/MyDrive/Final Modalink Dataset MERGED"),
+        Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED")
+    ]
+    
+    for base in bases:
         p = base / folder / audio_rel if folder else base / audio_rel
         if p.exists(): return p
         
     return None
+
+def get_vid_paths(sid):
+    # Check normal paths
+    p1 = VID_DIR / f"{sid}_clip_seq.npy"
+    if p1.exists():
+        return p1, VID_DIR / f"{sid}_dinov2_seq.npy", VID_DIR / f"{sid}_resnet50_seq.npy"
+        
+    # Check Windows backslash zip extraction artifact
+    p2 = VID_DIR / f"video_sequences_v1\\{sid}_clip_seq.npy"
+    if p2.exists():
+        return p2, VID_DIR / f"video_sequences_v1\\{sid}_dinov2_seq.npy", VID_DIR / f"video_sequences_v1\\{sid}_resnet50_seq.npy"
+        
+    return None, None, None
 
 def load_splits():
     if not SPLIT_DIR.exists():
@@ -114,21 +134,23 @@ def load_splits():
     sep("🔍 PATH DIAGNOSTIC")
     row0 = tr.iloc[0]
     sid0 = row0['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-    v_test = VID_DIR / f"{sid0}_clip_seq.npy"
+    
+    v_test, _, _ = get_vid_paths(sid0)
     a_test = resolve_audio_path(row0)
     
-    vid_ok = v_test.exists()
+    vid_ok = v_test is not None and v_test.exists()
     aud_ok = a_test is not None and a_test.exists()
     txt_ok = isinstance(row0.get('transcript'), str) and len(str(row0['transcript']).strip()) > 2
     
     print(f"  Sample ID: {sid0}")
-    print(f"  Video Status: {'✅ OK' if vid_ok else '❌ MISSING'} ({v_test.name})")
-    print(f"  Audio Status: {'✅ OK' if aud_ok else '❌ MISSING'} ({a_test.name if a_test else 'N/A'})")
+    print(f"  Video Status: {'✅ OK' if vid_ok else '❌ MISSING'} ({v_test.name if v_test else 'Not found'})")
+    print(f"  Audio Status: {'✅ OK' if aud_ok else '❌ MISSING'} ({a_test.name if a_test else 'Not found'})")
     print(f"  Text  Status: {'✅ OK' if txt_ok else '❌ EMPTY'}")
     
     def ok(row):
         sid = row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-        vid = (VID_DIR/f"{sid}_clip_seq.npy").exists()
+        vid_p, _, _ = get_vid_paths(sid)
+        vid = vid_p is not None and vid_p.exists()
         aud = resolve_audio_path(row) is not None
         txt = isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
         return vid and aud and txt
@@ -405,9 +427,10 @@ class VideoSSLDS(Dataset):
     def __getitem__(self, i):
         r   = self.df.iloc[i]
         sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-        c   = np.load(VID_DIR/f"{sid}_clip_seq.npy")
-        d   = np.load(VID_DIR/f"{sid}_dinov2_seq.npy")
-        r2  = np.load(VID_DIR/f"{sid}_resnet50_seq.npy")
+        pc, pd, pr = get_vid_paths(sid)
+        c   = np.load(pc)
+        d   = np.load(pd)
+        r2  = np.load(pr)
         seq = np.concatenate([c, d, r2], -1)   # [16, 3584]
         v1, v2 = video_augment(seq)
         return v1, v2
@@ -500,9 +523,10 @@ class VideoFTDS(Dataset):
     def __getitem__(self, i):
         r   = self.df.iloc[i]
         sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-        c   = np.load(VID_DIR/f"{sid}_clip_seq.npy")
-        d   = np.load(VID_DIR/f"{sid}_dinov2_seq.npy")
-        r2  = np.load(VID_DIR/f"{sid}_resnet50_seq.npy")
+        pc, pd, pr = get_vid_paths(sid)
+        c   = np.load(pc)
+        d   = np.load(pd)
+        r2  = np.load(pr)
         seq = np.concatenate([c, d, r2], -1)   # [16, 3584]
         return torch.tensor(seq, dtype=torch.float32), torch.tensor(LID[r['emotion_final']], dtype=torch.long)
 
