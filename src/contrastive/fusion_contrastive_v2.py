@@ -34,19 +34,28 @@ SAVE_DIR   = Path("/content/fusion_models")
 SSL_DIR    = Path("/content/ssl_pretrained")
 for d in [SAVE_DIR, SSL_DIR]: d.mkdir(exist_ok=True)
 
-# Auto-detect Video and Audio folders
+# Auto-detect Video and Audio folders (Avoid Drive search for speed)
 def find_dir(base, pattern):
-    for p in Path(base).rglob("*"):
-        if p.is_dir() and pattern in p.name: return p
+    try:
+        # Only search 2 levels deep to avoid hanging
+        for p in Path(base).glob("*/" + pattern): return p
+        for p in Path(base).glob("*/*/" + pattern): return p
+    except: pass
     return None
 
-print("  Searching for data directories...")
-# Search in /content for any folder containing 'video' or 'audio'
+print("  Searching for data directories in /content...")
 VID_DIR    = find_dir("/content", "video_sequences_v1") or Path("/content/video_features/video_sequences_v1")
 AUDIO_BASE = find_dir("/content", "Final Modalink Dataset MERGED") or Path("/content/audio")
 
 print(f"  Detected VID_DIR: {VID_DIR}")
 print(f"  Detected AUDIO_BASE: {AUDIO_BASE}")
+
+if VID_DIR.exists():
+    print("  [DEBUG] First 3 files in VID_DIR:")
+    f_list = list(VID_DIR.glob("*.npy"))[:3]
+    for f in f_list: print(f"    - {f.name}")
+else:
+    print("  [WARNING] VID_DIR does not exist!")
 
 LID     = {'Anger':0,'Disgust':1,'Fear':2,'Happiness':3,'Neutral':4,'Sadness':5,'Surprise':6}
 CLASSES = list(LID.keys())
@@ -75,17 +84,10 @@ def resolve_audio_path(row):
     if not audio_rel: return None
     folder = str(row.get('folder', ''))
     
-    # Try detected AUDIO_BASE
-    p = AUDIO_BASE / folder / audio_rel if folder else AUDIO_BASE / audio_rel
-    if p.exists(): return p
-    
-    # Fallback: Search all of /content/audio (common for different zip structures)
-    for root in Path("/content/audio").rglob(audio_rel):
-        if root.exists(): return root
-    
-    # Fallback 2: Direct folder match
-    for root in Path("/content").rglob(audio_rel):
-        if root.exists(): return root
+    # Try detected AUDIO_BASE or /content/audio
+    for base in [AUDIO_BASE, Path("/content/audio"), Path("/content/audio/Thesis Project/dataset/Final Modalink Dataset MERGED")]:
+        p = base / folder / audio_rel if folder else base / audio_rel
+        if p.exists(): return p
         
     return None
 
@@ -104,9 +106,14 @@ def load_splits():
     v_test = VID_DIR / f"{sid0}_clip_seq.npy"
     a_test = resolve_audio_path(row0)
     
-    print(f"  Video Path Check ({v_test.name}): {'EXISTS' if v_test.exists() else 'MISSING'}")
-    print(f"  Audio Path Check ({a_test.name if a_test else 'N/A'}): {'EXISTS' if a_test and a_test.exists() else 'MISSING'}")
-    print(f"  Text  Check: {'OK' if isinstance(row0.get('transcript'), str) and len(str(row0['transcript']).strip()) > 2 else 'EMPTY'}")
+    vid_ok = v_test.exists()
+    aud_ok = a_test is not None and a_test.exists()
+    txt_ok = isinstance(row0.get('transcript'), str) and len(str(row0['transcript']).strip()) > 2
+    
+    print(f"  Sample ID: {sid0}")
+    print(f"  Video Status: {'✅ OK' if vid_ok else '❌ MISSING'} ({v_test.name})")
+    print(f"  Audio Status: {'✅ OK' if aud_ok else '❌ MISSING'} ({a_test.name if a_test else 'N/A'})")
+    print(f"  Text  Status: {'✅ OK' if txt_ok else '❌ EMPTY'}")
     
     def ok(row):
         sid = row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
