@@ -605,8 +605,7 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
             sd = torch.load(SSL_DIR/"audio_ssl.pt", map_location=DEVICE)
             m.backbone.backbone.load_state_dict(sd['backbone'])
             m.backbone.lw.data = sd['lw']
-        lr = 3e-5
-        opt = torch.optim.AdamW(m.parameters(), lr=lr, weight_decay=0.01)
+        lr_bb, lr_hd = 1e-5, 1e-3
         bs = 8
     elif name == "TEXT":
         tok = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -615,22 +614,29 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
         ds_te = TextFTDS(test_df['transcript'].values, test_df['emotion_final'].values, tok)
         m = TextFTModel(SSL_PROJ_DIM).to(DEVICE)
         if use_ssl: m.backbone.load_state_dict(torch.load(SSL_DIR/"text_ssl.pt", map_location=DEVICE), strict=False)
-        lr = 1e-5
-        opt = torch.optim.AdamW(m.parameters(), lr=lr, weight_decay=0.01)
+        lr_bb, lr_hd = 1e-5, 5e-4
         bs = 16
     else: # VIDEO
         ds_tr, VideoFTDS_va, ds_te = VideoFTDS(train_df), VideoFTDS(val_df), VideoFTDS(test_df)
         m = VideoFTModel(SSL_PROJ_DIM).to(DEVICE)
         if use_ssl: m.backbone.load_state_dict(torch.load(SSL_DIR/"video_ssl.pt", map_location=DEVICE), strict=False)
-        lr = 5e-5
-        opt = torch.optim.AdamW(m.parameters(), lr=lr, weight_decay=0.05)
+        lr_bb, lr_hd = 3e-5, 1e-3
         bs = 32
+
+    # Prevent head from destroying backbone
+    bb_params = [p for n, p in m.named_parameters() if 'backbone' in n]
+    hd_params = [p for n, p in m.named_parameters() if 'backbone' not in n]
+    
+    opt = torch.optim.AdamW([
+        {'params': bb_params, 'lr': lr_bb},
+        {'params': hd_params, 'lr': lr_hd}
+    ], weight_decay=0.05)
 
     dl_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True)
     dl_va = DataLoader(VideoFTDS_va if name=="VIDEO" else ds_va, batch_size=bs)
     dl_te = DataLoader(ds_te, batch_size=bs)
     
-    sch = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, steps_per_epoch=len(dl_tr), epochs=20)
+    sch = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[lr_bb, lr_hd], steps_per_epoch=len(dl_tr), epochs=20)
     supcon_fn = SupConLoss(SSL_TEMP)
     best_acc, ckpt = 0, SAVE_DIR/f"{name.lower()}_ft.pt"
     
