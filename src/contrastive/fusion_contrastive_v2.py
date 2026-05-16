@@ -29,7 +29,13 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────
 # PATHS & GLOBAL CONFIG (Smart Auto-Detection)
 # ─────────────────────────────────────────────────────────
-REPO       = Path("/content/thesis")
+import glob
+_repo_str = globals().get("REPO", None)
+if not _repo_str:
+    cands = glob.glob("/content/*thesis*") + glob.glob("/content/*omaremad*")
+    _repo_str = cands[0] if cands else "/content/thesis"
+
+REPO       = Path(_repo_str)
 SPLIT_DIR  = REPO / "data/processed/splits/multimodal_eligible"
 SAVE_DIR   = Path("/content/fusion_models")
 SSL_DIR    = Path("/content/ssl_pretrained")
