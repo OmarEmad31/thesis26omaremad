@@ -63,10 +63,15 @@ if VID_DIR.exists():
     for f in list(VID_DIR.glob("*_clip_seq.npy"))[:3]: print(f"    - {f.name}")
 else: print("    (Directory does not exist)")
 
-print("  [DEBUG] Sample files in AUDIO_BASE:")
-if AUDIO_BASE.exists():
-    for f in list(AUDIO_BASE.rglob("*.wav"))[:3]: print(f"    - {f.name}")
+print("  [DEBUG] Contents of /content/audio:")
+if Path("/content/audio").exists():
+    for f in list(Path("/content/audio").iterdir())[:10]:
+        print(f"    - {f.name} (IsDir: {f.is_dir()})")
+        if f.is_dir():
+            for sub_f in list(f.iterdir())[:3]:
+                print(f"      -> {sub_f.name}")
 else: print("    (Directory does not exist)")
+
 
 LID     = {'Anger':0,'Disgust':1,'Fear':2,'Happiness':3,'Neutral':4,'Sadness':5,'Surprise':6}
 CLASSES = list(LID.keys())
