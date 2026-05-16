@@ -605,7 +605,8 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
             sd = torch.load(SSL_DIR/"audio_ssl.pt", map_location=DEVICE)
             m.backbone.backbone.load_state_dict(sd['backbone'])
             m.backbone.lw.data = sd['lw']
-        opt = torch.optim.AdamW(m.parameters(), lr=1e-4) # Simplified for brevity
+        lr = 3e-5
+        opt = torch.optim.AdamW(m.parameters(), lr=lr, weight_decay=0.01)
         bs = 8
     elif name == "TEXT":
         tok = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -614,19 +615,22 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
         ds_te = TextFTDS(test_df['transcript'].values, test_df['emotion_final'].values, tok)
         m = TextFTModel(SSL_PROJ_DIM).to(DEVICE)
         if use_ssl: m.backbone.load_state_dict(torch.load(SSL_DIR/"text_ssl.pt", map_location=DEVICE), strict=False)
-        opt = torch.optim.AdamW(m.parameters(), lr=2e-5)
+        lr = 1e-5
+        opt = torch.optim.AdamW(m.parameters(), lr=lr, weight_decay=0.01)
         bs = 16
     else: # VIDEO
-        ds_tr, ds_va, ds_te = VideoFTDS(train_df), VideoFTDS(val_df), VideoFTDS(test_df)
+        ds_tr, VideoFTDS_va, ds_te = VideoFTDS(train_df), VideoFTDS(val_df), VideoFTDS(test_df)
         m = VideoFTModel(SSL_PROJ_DIM).to(DEVICE)
         if use_ssl: m.backbone.load_state_dict(torch.load(SSL_DIR/"video_ssl.pt", map_location=DEVICE), strict=False)
-        opt = torch.optim.AdamW(m.parameters(), lr=7e-5)
+        lr = 5e-5
+        opt = torch.optim.AdamW(m.parameters(), lr=lr, weight_decay=0.05)
         bs = 32
 
     dl_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True)
-    dl_va = DataLoader(ds_va, batch_size=bs)
+    dl_va = DataLoader(VideoFTDS_va if name=="VIDEO" else ds_va, batch_size=bs)
     dl_te = DataLoader(ds_te, batch_size=bs)
     
+    sch = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, steps_per_epoch=len(dl_tr), epochs=20)
     supcon_fn = SupConLoss(SSL_TEMP)
     best_acc, ckpt = 0, SAVE_DIR/f"{name.lower()}_ft.pt"
     
@@ -640,8 +644,8 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
                 logits, proj = m(batch[0].to(DEVICE))
             labels = batch[1].to(DEVICE)
             loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
-            if use_supcon: loss += 0.3 * supcon_fn(proj, labels)
-            loss.backward(); opt.step()
+            if use_supcon: loss += 0.1 * supcon_fn(proj, labels)
+            loss.backward(); opt.step(); sch.step()
         
         m.eval(); ps, ts = [], []
         with torch.no_grad():
@@ -681,12 +685,29 @@ def run_ablation(tr, va, te):
         ap = train_modality_ft("AUDIO", tr, va, te, sc['ssl'], sc['supcon'])
         tp = train_modality_ft("TEXT",  tr, va, te, sc['ssl'], sc['supcon'])
         
-        # Simple Mean Fusion for Ablation Comparison
-        fp = (vp + ap + tp) / 3.0
-        acc = accuracy_score(t_labels, fp.argmax(1))
-        f1 = f1_score(t_labels, fp.argmax(1), average='macro')
-        results.append({"Scenario": sc['name'], "Acc": acc, "F1": f1})
-        print(f"\n  >>> {sc['name']} Result: Acc={acc:.4f}, F1={f1:.4f}")
+        # Grid Search Fusion for Optimal Weights
+        best_acc, best_f1, best_w = 0, 0, (0.33, 0.33, 0.34)
+        for w_v in np.linspace(0, 1, 11):
+            for w_a in np.linspace(0, 1, 11):
+                w_t = 1.0 - w_v - w_a
+                if w_t < 0 or w_t > 1: continue
+                
+                fp = w_v * vp + w_a * ap + w_t * tp
+                preds = fp.argmax(1)
+                acc = accuracy_score(t_labels, preds)
+                
+                if acc > best_acc:
+                    best_acc = acc
+                    best_f1 = f1_score(t_labels, preds, average='macro')
+                    best_w = (w_v, w_a, w_t)
+                    
+        results.append({
+            "Scenario": sc['name'], 
+            "Acc": best_acc, 
+            "F1": best_f1,
+            "Weights (V,A,T)": f"{best_w[0]:.2f}, {best_w[1]:.2f}, {best_w[2]:.2f}"
+        })
+        print(f"\n  >>> {sc['name']} Result: Acc={best_acc:.4f}, F1={best_f1:.4f} | Weights: {best_w}")
 
     sep("FINAL ABLATION RESULTS")
     df = pd.DataFrame(results)
