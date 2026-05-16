@@ -22,6 +22,7 @@ from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import GradScaler, autocast
 from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.utils.class_weight import compute_class_weight
 from transformers import WavLMModel, AutoTokenizer, AutoModel
 warnings.filterwarnings("ignore")
 
@@ -639,9 +640,24 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
     sch = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[lr_bb, lr_hd], steps_per_epoch=len(dl_tr), epochs=20)
     supcon_fn = SupConLoss(SSL_TEMP)
     best_acc, ckpt = 0, SAVE_DIR/f"{name.lower()}_ft.pt"
-    
+    # SOTA: Compute Class Weights for Imbalanced Dataset
+    y_tr = train_df['emotion_final'].values
+    cw = compute_class_weight('balanced', classes=np.arange(7), y=y_tr)
+    cw_tensor = torch.tensor(cw, dtype=torch.float).to(DEVICE)
+
     for ep in range(1, 21):
         m.train()
+        
+        # SOTA: LP-FT (Linear Probing then Fine-Tuning)
+        # Freeze backbone for first 5 epochs to allow random head to orient
+        if ep == 1:
+            for p in bb_params: p.requires_grad = False
+        elif ep == 6:
+            for p in bb_params: p.requires_grad = True
+            
+        # SOTA: Schedule SupCon Weight (high during LP, low during FT)
+        cur_supcon_w = 0.3 if ep <= 5 else 0.1
+
         for batch in dl_tr:
             opt.zero_grad()
             if name == "TEXT":
@@ -649,8 +665,11 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
             else:
                 logits, proj = m(batch[0].to(DEVICE))
             labels = batch[1].to(DEVICE)
-            loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
-            if use_supcon: loss += 0.1 * supcon_fn(proj, labels)
+            
+            # SOTA: Weighted Cross-Entropy
+            loss = F.cross_entropy(logits, labels, weight=cw_tensor, label_smoothing=0.1)
+            if use_supcon: loss += cur_supcon_w * supcon_fn(proj, labels)
+            
             loss.backward(); opt.step(); sch.step()
         
         m.eval(); ps, ts = [], []
