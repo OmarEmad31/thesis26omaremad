@@ -74,21 +74,43 @@ def resolve_audio_path(row):
     return None
 
 def load_splits():
+    if not SPLIT_DIR.exists():
+        print(f"  [ERROR] Split directory not found: {SPLIT_DIR}")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        
     tr = pd.read_csv(SPLIT_DIR/"train.csv")
     va = pd.read_csv(SPLIT_DIR/"val.csv")
     te = pd.read_csv(SPLIT_DIR/"test.csv")
+    
+    sep("🔍 PATH DIAGNOSTIC")
+    row0 = tr.iloc[0]
+    sid0 = row0['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
+    v_test = VID_DIR / f"{sid0}_clip_seq.npy"
+    a_test = resolve_audio_path(row0)
+    
+    print(f"  Video Path Check ({v_test.name}): {'EXISTS' if v_test.exists() else 'MISSING'}")
+    print(f"  Audio Path Check ({a_test.name if a_test else 'N/A'}): {'EXISTS' if a_test and a_test.exists() else 'MISSING'}")
+    print(f"  Text  Check: {'OK' if isinstance(row0.get('transcript'), str) and len(str(row0['transcript']).strip()) > 2 else 'EMPTY'}")
+    
     def ok(row):
         sid = row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-        return ((VID_DIR/f"{sid}_clip_seq.npy").exists()
-                and resolve_audio_path(row) is not None
-                and isinstance(row.get('transcript'), str)
-                and len(str(row['transcript']).strip()) > 2)
-    tr = tr[tr.apply(ok, axis=1)].reset_index(drop=True)
-    va = va[va.apply(ok, axis=1)].reset_index(drop=True)
-    te = te[te.apply(ok, axis=1)].reset_index(drop=True)
+        vid = (VID_DIR/f"{sid}_clip_seq.npy").exists()
+        aud = resolve_audio_path(row) is not None
+        txt = isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
+        return vid and aud and txt
+
+    tr_f = tr[tr.apply(ok, axis=1)].reset_index(drop=True)
+    va_f = va[va.apply(ok, axis=1)].reset_index(drop=True)
+    te_f = te[te.apply(ok, axis=1)].reset_index(drop=True)
+    
     sep("ALIGNED SPLITS")
-    print(f"  Train: {len(tr)} | Val: {len(va)} | Test: {len(te)}")
-    return tr, va, te
+    print(f"  Train: {len(tr_f)} | Val: {len(va_f)} | Test: {len(te_f)}")
+    if len(tr_f) == 0:
+        print("  [CRITICAL] 0 samples aligned. Check if VID_DIR and AUDIO_BASE are correct.")
+        print(f"  VID_DIR currently: {VID_DIR}")
+        print(f"  AUDIO_BASE currently: {AUDIO_BASE}")
+        
+    return tr_f, va_f, te_f
 
 # ─────────────────────────────────────────────────────────
 # CONTRASTIVE LOSSES
