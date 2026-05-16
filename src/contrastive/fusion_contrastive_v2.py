@@ -26,7 +26,7 @@ from transformers import WavLMModel, AutoTokenizer, AutoModel
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────
-# PATHS & GLOBAL CONFIG (Auto-Detection)
+# PATHS & GLOBAL CONFIG (Smart Auto-Detection)
 # ─────────────────────────────────────────────────────────
 REPO       = Path("/content/thesis")
 SPLIT_DIR  = REPO / "data/processed/splits/multimodal_eligible"
@@ -34,28 +34,31 @@ SAVE_DIR   = Path("/content/fusion_models")
 SSL_DIR    = Path("/content/ssl_pretrained")
 for d in [SAVE_DIR, SSL_DIR]: d.mkdir(exist_ok=True)
 
-# Auto-detect Video and Audio folders (Avoid Drive search for speed)
-def find_dir(base, pattern):
-    try:
-        # Only search 2 levels deep to avoid hanging
-        for p in Path(base).glob("*/" + pattern): return p
-        for p in Path(base).glob("*/*/" + pattern): return p
-    except: pass
-    return None
+def auto_detect():
+    print("  Smart-detecting data locations...")
+    v_dir, a_dir = None, None
+    
+    # 1. Find Video Dir (Search for any _clip_seq.npy)
+    for p in Path("/content").rglob("*_clip_seq.npy"):
+        v_dir = p.parent
+        print(f"  Found Video files in: {v_dir}")
+        break
+        
+    # 2. Find Audio Base (Search for any audio file)
+    for ext in ["*.wav", "*.mp3", "*.m4a"]:
+        for p in Path("/content").rglob(ext):
+            # We want the parent of the 'folder' or the root audio dir
+            a_dir = p.parent.parent if "Speaker" in str(p) else p.parent
+            print(f"  Found Audio files in: {a_dir}")
+            break
+        if a_dir: break
+        
+    return v_dir or Path("/content/video_features/video_sequences_v1"), \
+           a_dir or Path("/content/audio")
 
-print("  Searching for data directories in /content...")
-VID_DIR    = find_dir("/content", "video_sequences_v1") or Path("/content/video_features/video_sequences_v1")
-AUDIO_BASE = find_dir("/content", "Final Modalink Dataset MERGED") or Path("/content/audio")
-
-print(f"  Detected VID_DIR: {VID_DIR}")
-print(f"  Detected AUDIO_BASE: {AUDIO_BASE}")
-
-if VID_DIR.exists():
-    print("  [DEBUG] First 3 files in VID_DIR:")
-    f_list = list(VID_DIR.glob("*.npy"))[:3]
-    for f in f_list: print(f"    - {f.name}")
-else:
-    print("  [WARNING] VID_DIR does not exist!")
+VID_DIR, AUDIO_BASE = auto_detect()
+print(f"  Final VID_DIR: {VID_DIR}")
+print(f"  Final AUDIO_BASE: {AUDIO_BASE}")
 
 LID     = {'Anger':0,'Disgust':1,'Fear':2,'Happiness':3,'Neutral':4,'Sadness':5,'Surprise':6}
 CLASSES = list(LID.keys())
