@@ -26,16 +26,27 @@ from transformers import WavLMModel, AutoTokenizer, AutoModel
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────
-# PATHS & GLOBAL CONFIG
+# PATHS & GLOBAL CONFIG (Auto-Detection)
 # ─────────────────────────────────────────────────────────
-DRIVE      = Path("/content/drive/MyDrive/Thesis Project")
 REPO       = Path("/content/thesis")
 SPLIT_DIR  = REPO / "data/processed/splits/multimodal_eligible"
-VID_DIR    = Path("/content/video_features/video_sequences_v1")
-AUDIO_BASE = Path("/content/audio/Thesis Project/dataset/Final Modalink Dataset MERGED")
 SAVE_DIR   = Path("/content/fusion_models")
 SSL_DIR    = Path("/content/ssl_pretrained")
 for d in [SAVE_DIR, SSL_DIR]: d.mkdir(exist_ok=True)
+
+# Auto-detect Video and Audio folders
+def find_dir(base, pattern):
+    for p in Path(base).rglob("*"):
+        if p.is_dir() and pattern in p.name: return p
+    return None
+
+print("  Searching for data directories...")
+# Search in /content for any folder containing 'video' or 'audio'
+VID_DIR    = find_dir("/content", "video_sequences_v1") or Path("/content/video_features/video_sequences_v1")
+AUDIO_BASE = find_dir("/content", "Final Modalink Dataset MERGED") or Path("/content/audio")
+
+print(f"  Detected VID_DIR: {VID_DIR}")
+print(f"  Detected AUDIO_BASE: {AUDIO_BASE}")
 
 LID     = {'Anger':0,'Disgust':1,'Fear':2,'Happiness':3,'Neutral':4,'Sadness':5,'Surprise':6}
 CLASSES = list(LID.keys())
@@ -60,17 +71,22 @@ def sep(t=""):
 # DATA LOADING  (same as fusion_production_v1)
 # ─────────────────────────────────────────────────────────
 def resolve_audio_path(row):
-    folder    = str(row.get('folder', ''))
     audio_rel = str(row.get('audio_relpath', ''))
-    if folder and audio_rel:
-        p = AUDIO_BASE / folder / audio_rel
-        if p.exists(): return p
-    if audio_rel:
-        p = AUDIO_BASE / audio_rel
-        if p.exists(): return p
-    for base in [DRIVE/"dataset/Final Modalink Dataset MERGED", DRIVE/"data/raw", DRIVE]:
-        for candidate in ([base/folder/audio_rel] if folder else []) + [base/audio_rel]:
-            if candidate.exists(): return candidate
+    if not audio_rel: return None
+    folder = str(row.get('folder', ''))
+    
+    # Try detected AUDIO_BASE
+    p = AUDIO_BASE / folder / audio_rel if folder else AUDIO_BASE / audio_rel
+    if p.exists(): return p
+    
+    # Fallback: Search all of /content/audio (common for different zip structures)
+    for root in Path("/content/audio").rglob(audio_rel):
+        if root.exists(): return root
+    
+    # Fallback 2: Direct folder match
+    for root in Path("/content").rglob(audio_rel):
+        if root.exists(): return root
+        
     return None
 
 def load_splits():
