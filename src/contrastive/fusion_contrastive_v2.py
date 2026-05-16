@@ -99,8 +99,10 @@ def resolve_audio_path(row):
         AUDIO_BASE,
         Path("/content/audio"),
         Path("/content/drive/MyDrive/Thesis_Audio_Full"),
-        Path("/content/drive/MyDrive/Final Modalink Dataset MERGED"),
-        Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED")
+        Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED"),
+        Path("/content/drive/MyDrive/Thesis Project/data/raw"),
+        Path("/content/drive/MyDrive/Thesis Project"),
+        Path("/content/drive/MyDrive")
     ]
     
     for base in bases:
@@ -144,7 +146,14 @@ def load_splits():
     
     print(f"  Sample ID: {sid0}")
     print(f"  Video Status: {'✅ OK' if vid_ok else '❌ MISSING'} ({v_test.name if v_test else 'Not found'})")
-    print(f"  Audio Status: {'✅ OK' if aud_ok else '❌ MISSING'} ({a_test.name if a_test else 'Not found'})")
+    
+    if aud_ok:
+        print(f"  Audio Status: ✅ OK ({a_test.name})")
+    else:
+        print(f"  Audio Status: ❌ MISSING")
+        print(f"      -> Script is looking for: folder '{row0.get('folder','')}' and file '{row0.get('audio_relpath','')}'")
+        print(f"      -> Are these audio files uploaded to your Google Drive?")
+        
     print(f"  Text  Status: {'✅ OK' if txt_ok else '❌ EMPTY'}")
     
     def ok(row):
