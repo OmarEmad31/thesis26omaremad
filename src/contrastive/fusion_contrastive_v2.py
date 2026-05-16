@@ -410,20 +410,195 @@ def train_video_ssl(pool):
     print(f"  [SAVED] {ckpt}")
 
 # ─────────────────────────────────────────────────────────
-# MAIN — Phase 1 runner
+# PHASE 2 — SUPERVISED FINE-TUNING (FT) WITH SUPCON
 # ─────────────────────────────────────────────────────────
-sep(f"CONTRASTIVE PIPELINE v2 | Device: {DEVICE}")
-tr, va, te = load_splits()
-pool = pd.concat([tr, va]).reset_index(drop=True)
-print(f"  SSL training pool: {len(pool)} samples (train + val)")
 
-# Run Phase 1 for all 3 modalities (cached — safe to re-run)
-train_video_ssl(pool)   # fastest  (~10 min)
-train_text_ssl(pool)    # medium   (~25 min)
-train_audio_ssl(pool)   # slowest  (~60 min)
+# FT Datasets
+class AudioFTDS(Dataset):
+    def __init__(self, df, sr=16000, maxlen=80000):
+        self.df = df.reset_index(drop=True)
+        self.sr = sr; self.maxlen = maxlen
+    def __len__(self): return len(self.df)
+    def __getitem__(self, i):
+        r = self.df.iloc[i]
+        try:
+            p = resolve_audio_path(r)
+            if p is None: raise FileNotFoundError
+            y, _ = librosa.load(str(p), sr=self.sr)
+            y, _ = librosa.effects.trim(y, top_db=25)
+            y    = y[:self.maxlen] if len(y)>self.maxlen else np.pad(y,(0,self.maxlen-len(y)))
+        except: y = np.zeros(self.maxlen)
+        return torch.tensor(y, dtype=torch.float32), torch.tensor(LID[r['emotion_final']], dtype=torch.long)
 
-sep("PHASE 1 COMPLETE")
-print("  Saved weights:")
-for f in SSL_DIR.iterdir():
-    print(f"    {f.name}  ({f.stat().st_size/1e6:.1f} MB)")
-print("\n  Next: run Phase 2 (SupCon fine-tuning) using these pre-trained encoders.")
+class TextFTDS(Dataset):
+    def __init__(self, texts, labels, tok):
+        self.enc = tok([clean(str(t)) for t in texts], truncation=True, padding="max_length", max_length=64, return_tensors="pt")
+        self.labels = [LID[l] for l in labels]
+    def __len__(self): return len(self.labels)
+    def __getitem__(self, i): return {k: v[i] for k,v in self.enc.items()}, torch.tensor(self.labels[i], dtype=torch.long)
+
+class VideoFTDS(Dataset):
+    def __init__(self, df):
+        self.df = df.reset_index(drop=True)
+    def __len__(self): return len(self.df)
+    def __getitem__(self, i):
+        r   = self.df.iloc[i]
+        sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
+        c   = np.load(VID_DIR/f"{sid}_clip_seq.npy")
+        d   = np.load(VID_DIR/f"{sid}_dinov2_seq.npy")
+        r2  = np.load(VID_DIR/f"{sid}_resnet50_seq.npy")
+        seq = np.concatenate([c, d, r2], -1)   # [16, 3584]
+        return torch.tensor(seq, dtype=torch.float32), torch.tensor(LID[r['emotion_final']], dtype=torch.long)
+
+# FT Models
+class AudioFTModel(nn.Module):
+    def __init__(self, proj_dim=128):
+        super().__init__()
+        self.backbone = AudioSSLModel(proj_dim) # Re-use backbone + lw
+        self.classifier = nn.Sequential(nn.Linear(768*2, 512), nn.LayerNorm(512), nn.ReLU(), nn.Dropout(0.3), nn.Linear(512, 7))
+        self.proj_ft = ProjectionHead(768*2, proj_dim) # Separate proj head for SupCon
+    def forward(self, x):
+        feat = self.backbone.encode(x)
+        return self.classifier(feat), self.proj_ft(feat)
+
+class TextFTModel(nn.Module):
+    def __init__(self, proj_dim=128):
+        super().__init__()
+        self.backbone = TextSSLModel(proj_dim)
+        self.classifier = nn.Linear(768*3, 7)
+        self.drops = nn.ModuleList([nn.Dropout(0.3) for _ in range(5)])
+        self.proj_ft = ProjectionHead(768*3, proj_dim)
+    def forward(self, ids, mask):
+        feat = self.backbone.encode(ids, mask)
+        logits = torch.stack([self.classifier(d(feat)) for d in self.drops]).mean(0)
+        return logits, self.proj_ft(feat)
+
+class VideoFTModel(nn.Module):
+    def __init__(self, proj_dim=128):
+        super().__init__()
+        self.backbone = VideoSSLModel(proj_dim=proj_dim)
+        self.classifier = nn.Sequential(nn.LayerNorm(512), nn.Dropout(0.3), nn.Linear(512, 256), nn.GELU(), nn.Dropout(0.3), nn.Linear(256, 7))
+        self.proj_ft = ProjectionHead(512, proj_dim)
+    def forward(self, x):
+        feat = self.backbone.encode(x)
+        return self.classifier(feat), self.proj_ft(feat)
+
+# FT Training Loops
+def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=True):
+    sep(f"PHASE 2 -- {name} FT (SSL={use_ssl}, SupCon={use_supcon})")
+    set_seed(42)
+    
+    if name == "AUDIO":
+        ds_tr, ds_va, ds_te = AudioFTDS(train_df), AudioFTDS(val_df), AudioFTDS(test_df)
+        m = AudioFTModel(SSL_PROJ_DIM).to(DEVICE)
+        if use_ssl: 
+            sd = torch.load(SSL_DIR/"audio_ssl.pt", map_location=DEVICE)
+            m.backbone.backbone.load_state_dict(sd['backbone'])
+            m.backbone.lw.data = sd['lw']
+        opt = torch.optim.AdamW(m.parameters(), lr=1e-4) # Simplified for brevity
+        bs = 8
+    elif name == "TEXT":
+        tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+        ds_tr = TextFTDS(train_df['transcript'].values, train_df['emotion_final'].values, tok)
+        ds_va = TextFTDS(val_df['transcript'].values, val_df['emotion_final'].values, tok)
+        ds_te = TextFTDS(test_df['transcript'].values, test_df['emotion_final'].values, tok)
+        m = TextFTModel(SSL_PROJ_DIM).to(DEVICE)
+        if use_ssl: m.backbone.load_state_dict(torch.load(SSL_DIR/"text_ssl.pt", map_location=DEVICE), strict=False)
+        opt = torch.optim.AdamW(m.parameters(), lr=2e-5)
+        bs = 16
+    else: # VIDEO
+        ds_tr, ds_va, ds_te = VideoFTDS(train_df), VideoFTDS(val_df), VideoFTDS(test_df)
+        m = VideoFTModel(SSL_PROJ_DIM).to(DEVICE)
+        if use_ssl: m.backbone.load_state_dict(torch.load(SSL_DIR/"video_ssl.pt", map_location=DEVICE), strict=False)
+        opt = torch.optim.AdamW(m.parameters(), lr=7e-5)
+        bs = 32
+
+    dl_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True)
+    dl_va = DataLoader(ds_va, batch_size=bs)
+    dl_te = DataLoader(ds_te, batch_size=bs)
+    
+    supcon_fn = SupConLoss(SSL_TEMP)
+    best_acc, ckpt = 0, SAVE_DIR/f"{name.lower()}_ft.pt"
+    
+    for ep in range(1, 21):
+        m.train()
+        for batch in dl_tr:
+            opt.zero_grad()
+            if name == "TEXT":
+                logits, proj = m(batch[0]['input_ids'].to(DEVICE), batch[0]['attention_mask'].to(DEVICE))
+            else:
+                logits, proj = m(batch[0].to(DEVICE))
+            labels = batch[1].to(DEVICE)
+            loss = F.cross_entropy(logits, labels, label_smoothing=0.1)
+            if use_supcon: loss += 0.3 * supcon_fn(proj, labels)
+            loss.backward(); opt.step()
+        
+        m.eval(); ps, ts = [], []
+        with torch.no_grad():
+            for batch in dl_va:
+                if name == "TEXT": logits, _ = m(batch[0]['input_ids'].to(DEVICE), batch[0]['attention_mask'].to(DEVICE))
+                else: logits, _ = m(batch[0].to(DEVICE))
+                ps.extend(logits.argmax(1).cpu().numpy()); ts.extend(batch[1].numpy())
+        acc = accuracy_score(ts, ps)
+        if acc > best_acc: best_acc = acc; torch.save(m.state_dict(), str(ckpt))
+        if ep % 5 == 0: print(f"  Ep {ep:02d} | Val Acc: {acc:.4f}")
+
+    m.load_state_dict(torch.load(str(ckpt), map_location=DEVICE))
+    m.eval(); probs = []
+    with torch.no_grad():
+        for batch in dl_te:
+            if name == "TEXT": logits, _ = m(batch[0]['input_ids'].to(DEVICE), batch[0]['attention_mask'].to(DEVICE))
+            else: logits, _ = m(batch[0].to(DEVICE))
+            probs.append(F.softmax(logits, 1).cpu().numpy())
+    return np.vstack(probs)
+
+# ─────────────────────────────────────────────────────────
+# ABLATION RUNNER
+# ─────────────────────────────────────────────────────────
+def run_ablation(tr, va, te):
+    scenarios = [
+        {"name": "Baseline",    "ssl": False, "supcon": False},
+        {"name": "SupCon only", "ssl": False, "supcon": True},
+        {"name": "SSL only",     "ssl": True,  "supcon": False},
+        {"name": "SSL + SupCon", "ssl": True,  "supcon": True},
+    ]
+    results = []
+    t_labels = [LID[e] for e in te['emotion_final'].values]
+    
+    for sc in scenarios:
+        sep(f"RUNNING SCENARIO: {sc['name']}")
+        vp = train_modality_ft("VIDEO", tr, va, te, sc['ssl'], sc['supcon'])
+        ap = train_modality_ft("AUDIO", tr, va, te, sc['ssl'], sc['supcon'])
+        tp = train_modality_ft("TEXT",  tr, va, te, sc['ssl'], sc['supcon'])
+        
+        # Simple Mean Fusion for Ablation Comparison
+        fp = (vp + ap + tp) / 3.0
+        acc = accuracy_score(t_labels, fp.argmax(1))
+        f1 = f1_score(t_labels, fp.argmax(1), average='macro')
+        results.append({"Scenario": sc['name'], "Acc": acc, "F1": f1})
+        print(f"\n  >>> {sc['name']} Result: Acc={acc:.4f}, F1={f1:.4f}")
+
+    sep("FINAL ABLATION RESULTS")
+    df = pd.DataFrame(results)
+    print(df.to_string(index=False))
+    df.to_csv("ablation_results.csv", index=False)
+
+# ─────────────────────────────────────────────────────────
+# MAIN EXECUTION
+# ─────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    sep(f"CONTRASTIVE PIPELINE v2 | Device: {DEVICE}")
+    tr, va, te = load_splits()
+    
+    # 1. PHASE 1: SELF-SUPERVISED PRE-TRAINING
+    pool = pd.concat([tr, va]).reset_index(drop=True)
+    print(f"  SSL training pool: {len(pool)} samples (train + val)")
+    
+    train_video_ssl(pool)
+    train_text_ssl(pool)
+    train_audio_ssl(pool)
+    
+    sep("PHASE 1 COMPLETE -- Encoders pre-trained.")
+    
+    # 2. PHASE 2: ABLATION (Fine-tuning)
+    run_ablation(tr, va, te)
