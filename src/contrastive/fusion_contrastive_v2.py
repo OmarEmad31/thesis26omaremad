@@ -102,6 +102,9 @@ def resolve_audio_path(row):
     
     bases = [
         AUDIO_BASE,
+        Path("/content/audio/Thesis Project/dataset/Final Modalink Dataset MERGED"),
+        Path("/content/audio/Thesis Project/data/raw"),
+        Path("/content/audio/data/processed"),
         Path("/content/audio"),
         Path("/content/audio/Thesis_Audio_Full"),
         Path("/content/Thesis_Audio_Full"),
