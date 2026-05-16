@@ -38,27 +38,35 @@ def auto_detect():
     print("  Smart-detecting data locations...")
     v_dir, a_dir = None, None
     
-    # 1. Find Video Dir (Search for any _clip_seq.npy)
+    # 1. Search /content first (fast)
     for p in Path("/content").rglob("*_clip_seq.npy"):
-        v_dir = p.parent
-        print(f"  Found Video files in: {v_dir}")
-        break
-        
-    # 2. Find Audio Base (Search for any audio file)
-    for ext in ["*.wav", "*.mp3", "*.m4a"]:
-        for p in Path("/content").rglob(ext):
-            # We want the parent of the 'folder' or the root audio dir
-            a_dir = p.parent.parent if "Speaker" in str(p) else p.parent
-            print(f"  Found Audio files in: {a_dir}")
+        if "drive" not in str(p):
+            v_dir = p.parent
             break
-        if a_dir: break
+            
+    # 2. Fallback to Drive
+    if not v_dir:
+        v_dir = Path("/content/drive/MyDrive/Thesis Project/data/processed/features/video_sequences_v1")
+        if not v_dir.exists(): v_dir = Path("/content/drive/MyDrive/Thesis Project/data/processed/features")
         
-    return v_dir or Path("/content/video_features/video_sequences_v1"), \
-           a_dir or Path("/content/audio")
+    # 3. Audio
+    a_dir = Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED")
+    
+    return v_dir, a_dir
 
 VID_DIR, AUDIO_BASE = auto_detect()
 print(f"  Final VID_DIR: {VID_DIR}")
 print(f"  Final AUDIO_BASE: {AUDIO_BASE}")
+
+print("  [DEBUG] Sample files in VID_DIR:")
+if VID_DIR.exists():
+    for f in list(VID_DIR.glob("*_clip_seq.npy"))[:3]: print(f"    - {f.name}")
+else: print("    (Directory does not exist)")
+
+print("  [DEBUG] Sample files in AUDIO_BASE:")
+if AUDIO_BASE.exists():
+    for f in list(AUDIO_BASE.rglob("*.wav"))[:3]: print(f"    - {f.name}")
+else: print("    (Directory does not exist)")
 
 LID     = {'Anger':0,'Disgust':1,'Fear':2,'Happiness':3,'Neutral':4,'Sadness':5,'Surprise':6}
 CLASSES = list(LID.keys())
