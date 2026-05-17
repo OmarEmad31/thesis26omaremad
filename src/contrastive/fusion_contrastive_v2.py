@@ -646,7 +646,7 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
     supcon_fn = SupConLoss(SSL_TEMP)
     best_acc, ckpt = 0, SAVE_DIR/f"{name.lower()}_ft.pt"
     # SOTA: Compute Class Weights for Imbalanced Dataset
-    y_tr = train_df['emotion_final'].values
+    y_tr = np.array([LID[e] for e in train_df['emotion_final']])
     cw = compute_class_weight('balanced', classes=np.arange(7), y=y_tr)
     cw_tensor = torch.tensor(cw, dtype=torch.float).to(DEVICE)
 
@@ -685,7 +685,7 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
                 ps.extend(logits.argmax(1).cpu().numpy()); ts.extend(batch[1].numpy())
         acc = accuracy_score(ts, ps)
         if acc > best_acc: best_acc = acc; torch.save(m.state_dict(), str(ckpt))
-        if ep % 5 == 0: print(f"  Ep {ep:02d} | Val Acc: {acc:.4f}")
+        if ep % 2 == 0 or ep == 1: print(f"  Ep {ep:02d} | Val Acc: {acc:.4f}")
 
     m.load_state_dict(torch.load(str(ckpt), map_location=DEVICE))
     m.eval(); probs = []
