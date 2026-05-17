@@ -660,8 +660,10 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
         elif ep == 6:
             for p in bb_params: p.requires_grad = True
             
-        # SOTA: Schedule SupCon Weight (high during LP, low during FT)
-        cur_supcon_w = 0.3 if ep <= 5 else 0.1
+        # SOTA: Decoupled SupCon Phase (Khosla et al.)
+        # Ep 1-5: High SupCon weight to build clusters while backbone is frozen
+        # Ep 6-20: SupCon turns off, allowing pure CE fine-tuning without interference
+        cur_supcon_w = 0.5 if ep <= 5 else 0.0
 
         for batch in dl_tr:
             opt.zero_grad()
