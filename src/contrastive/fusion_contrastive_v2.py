@@ -35,8 +35,8 @@ _repo_str = cands[0] if cands else "/content/thesis"
 REPO       = Path(_repo_str)
 SPLIT_DIR  = REPO / "data/processed/splits/multimodal_eligible"
 SAVE_DIR   = Path("/content/fusion_models")
-SSL_DIR    = Path("/content/ssl_pretrained")
-for d in [SAVE_DIR, SSL_DIR]: d.mkdir(exist_ok=True)
+SSL_DIR    = Path("/content/drive/MyDrive/Thesis Project/ssl_pretrained")
+for d in [SAVE_DIR, SSL_DIR]: d.mkdir(parents=True, exist_ok=True)
 
 def auto_detect():
     v_dir, a_dir = None, None
@@ -262,8 +262,96 @@ class VideoSSLModel(nn.Module):
         return self.fuse(torch.cat([self._pool(x), self._pool(x[:,4:12,:]), self._pool(x[:,6:10,:])], -1))
     def forward(self, x): return self.proj(self.encode(x))
 
-# Phase 1 Pre-training routines skipped for brevity but available (see fusion_production_v2.py)
-# Assuming phase 1 models are saved
+# Phase 1 Training Wrappers
+def train_ssl_phase(pool):
+    sep("PHASE 1: SELF-SUPERVISED PRE-TRAINING (SAVING TO GOOGLE DRIVE)")
+    
+    # Text
+    ckpt = SSL_DIR / "text_ssl.pt"
+    if not ckpt.exists():
+        print("  Training Text SSL (Enhanced)...")
+        class TextSSLDS(Dataset):
+            def __init__(self, texts, tok):
+                self.enc = tok([clean(str(t)) for t in texts], truncation=True, padding="max_length", max_length=64, return_tensors="pt")
+            def __len__(self): return self.enc['input_ids'].size(0)
+            def __getitem__(self, i): return {k: v[i] for k,v in self.enc.items()}
+        ds = TextSSLDS(pool['transcript'].values, AutoTokenizer.from_pretrained(MODEL_NAME))
+        dl = DataLoader(ds, batch_size=16, shuffle=True, drop_last=True)
+        m = TextSSLModel().to(DEVICE)
+        opt = torch.optim.AdamW([{'params':[p for n,p in m.named_parameters() if 'bert' in n and p.requires_grad],'lr':3e-5},{'params':[p for n,p in m.named_parameters() if 'proj' in n],'lr':1e-3}], weight_decay=0.01)
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
+        loss_fn = InfoNCELoss(0.1) # Higher temperature for NLP
+        for ep in range(1, SSL_EPOCHS+1):
+            m.train(); ep_loss=0
+            for bd in dl:
+                ids, mask = bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)
+                opt.zero_grad()
+                loss = loss_fn(m(ids, mask), m(ids, mask))
+                loss.backward(); opt.step(); ep_loss += loss.item()
+            sch.step()
+        torch.save({k:v for k,v in m.state_dict().items() if 'proj' not in k}, str(ckpt))
+        print(f"  [SAVED] {ckpt}")
+
+    # Video
+    ckpt = SSL_DIR / "video_ssl.pt"
+    if not ckpt.exists():
+        print("  Training Video SSL...")
+        class VideoSSLDS(Dataset):
+            def __init__(self, df): self.df = df
+            def __len__(self): return len(self.df)
+            def __getitem__(self, i):
+                sid = self.df.iloc[i]['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
+                pc, pd, pr = get_vid_paths(sid)
+                seq = np.concatenate([np.load(pc), np.load(pd), np.load(pr)], -1)
+                return video_augment(seq)
+        dl = DataLoader(VideoSSLDS(pool), batch_size=32, shuffle=True, drop_last=True)
+        m = VideoSSLModel().to(DEVICE)
+        opt = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=1e-2)
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
+        loss_fn = InfoNCELoss(SSL_TEMP)
+        for ep in range(1, SSL_EPOCHS+1):
+            m.train(); ep_loss=0
+            for v1, v2 in dl:
+                opt.zero_grad()
+                loss = loss_fn(m(v1.float().to(DEVICE)), m(v2.float().to(DEVICE)))
+                loss.backward(); opt.step(); ep_loss += loss.item()
+            sch.step()
+        torch.save({k:v for k,v in m.state_dict().items() if 'proj' not in k}, str(ckpt))
+        print(f"  [SAVED] {ckpt}")
+
+    # Audio
+    ckpt = SSL_DIR / "audio_ssl.pt"
+    if not ckpt.exists():
+        print("  Training Audio SSL...")
+        class AudioSSLDS(Dataset):
+            def __init__(self, df): self.df = df
+            def __len__(self): return len(self.df)
+            def __getitem__(self, i):
+                p = resolve_audio_path(self.df.iloc[i])
+                try:
+                    y,_ = librosa.load(str(p), sr=16000)
+                    y,_ = librosa.effects.trim(y, top_db=25)
+                    y = y[:80000] if len(y)>80000 else np.pad(y,(0,80000-len(y)))
+                except: y = np.zeros(80000)
+                v1, v2 = audio_augment(y)
+                return torch.tensor(v1, dtype=torch.float32), torch.tensor(v2, dtype=torch.float32)
+        dl = DataLoader(AudioSSLDS(pool), batch_size=8, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
+        m = AudioSSLModel().to(DEVICE)
+        opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, m.parameters()), lr=1e-4, weight_decay=1e-2)
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
+        loss_fn = InfoNCELoss(SSL_TEMP)
+        scaler = GradScaler()
+        for ep in range(1, SSL_EPOCHS+1):
+            m.train(); ep_loss=0; opt.zero_grad()
+            for step, (v1, v2) in enumerate(dl):
+                v1, v2 = v1.to(DEVICE), v2.to(DEVICE)
+                with autocast("cuda"): loss = loss_fn(m(v1), m(v2)) / GRAD_ACC
+                scaler.scale(loss).backward(); ep_loss += loss.item() * GRAD_ACC
+                if (step+1)%GRAD_ACC==0 or (step+1)==len(dl):
+                    scaler.step(opt); scaler.update(); opt.zero_grad()
+            sch.step()
+        torch.save({'backbone': m.backbone.state_dict(), 'lw': m.lw.data}, str(ckpt))
+        print(f"  [SAVED] {ckpt}")
 
 # ─────────────────────────────────────────────────────────
 # PHASE 2 MODELS
@@ -346,8 +434,10 @@ def train_audio_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
     vl = DataLoader(AudioFTDS(va), batch_size=8, num_workers=2)
     el = DataLoader(AudioFTDS(te), batch_size=8, num_workers=2)
     m = AudioFTModel().to(DEVICE)
-    if use_ssl and (SSL_DIR/"audio_ssl.pt").exists():
-        sd = torch.load(SSL_DIR/"audio_ssl.pt", map_location=DEVICE)
+    if use_ssl:
+        ckpt = SSL_DIR/"audio_ssl.pt"
+        assert ckpt.exists(), f"CRITICAL: SSL weight {ckpt} missing!"
+        sd = torch.load(ckpt, map_location=DEVICE)
         m.backbone.backbone.load_state_dict(sd['backbone'], strict=False)
         m.backbone.lw.data = sd['lw']
         
@@ -377,7 +467,7 @@ def train_audio_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
             with autocast("cuda"):
                 lo, pr = m(x)
                 loss = F.cross_entropy(lo, y, weight=cw_tensor, label_smoothing=0.1)
-                if use_supcon: loss += 0.3 * supcon_fn(pr, y)
+                if use_supcon: loss += 0.5 * supcon_fn(pr, y)  # Boosted from 0.3 to 0.5
             scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         m.eval(); ps,ts=[],[]
         with torch.no_grad():
@@ -403,8 +493,10 @@ def train_video_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
     for seed in [42, 1337, 2024]:
         set_seed(seed)
         m = VideoFTModel(drop=0.5).to(DEVICE)
-        if use_ssl and (SSL_DIR/"video_ssl.pt").exists():
-            m.backbone.load_state_dict(torch.load(SSL_DIR/"video_ssl.pt", map_location=DEVICE), strict=False)
+        if use_ssl:
+            ckpt = SSL_DIR/"video_ssl.pt"
+            assert ckpt.exists(), f"CRITICAL: SSL weight {ckpt} missing!"
+            m.backbone.load_state_dict(torch.load(ckpt, map_location=DEVICE), strict=False)
         opt = Lookahead(torch.optim.AdamW(m.parameters(), lr=7e-5, weight_decay=5e-2))
         sch = torch.optim.lr_scheduler.OneCycleLR(opt.opt, max_lr=8.4e-5, steps_per_epoch=len(tl), epochs=25)
         best_f1, ckpt = 0, SAVE_DIR/f"vid_{sc_name.replace(' ','_')}_{seed}.pt"
@@ -414,7 +506,7 @@ def train_video_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
                 x,y = x.to(DEVICE), y.to(DEVICE); opt.zero_grad()
                 lo, pr = m(x)
                 loss = F.cross_entropy(lo, y, weight=cw_tensor, label_smoothing=0.1)
-                if use_supcon: loss += 0.3 * supcon_fn(pr, y)
+                if use_supcon: loss += 0.5 * supcon_fn(pr, y) # Boosted to 0.5
                 loss.backward(); opt.step(); sch.step()
             m.eval(); ps,ts = [],[]
             with torch.no_grad():
@@ -450,8 +542,10 @@ def train_text_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
         tl = DataLoader(TextFTDS(texts[t_idx], [list(LID.keys())[l] for l in labels[t_idx]], tok), batch_size=16, shuffle=True)
         vl = DataLoader(TextFTDS(texts[v_idx], [list(LID.keys())[l] for l in labels[v_idx]], tok), batch_size=16)
         m = TextFTModel().to(DEVICE)
-        if use_ssl and (SSL_DIR/"text_ssl.pt").exists():
-            m.backbone.load_state_dict(torch.load(SSL_DIR/"text_ssl.pt", map_location=DEVICE), strict=False)
+        if use_ssl:
+            ckpt = SSL_DIR/"text_ssl.pt"
+            assert ckpt.exists(), f"CRITICAL: SSL weight {ckpt} missing!"
+            m.backbone.load_state_dict(torch.load(ckpt, map_location=DEVICE), strict=False)
         opt = torch.optim.AdamW([
             {'params':[p for n,p in m.named_parameters() if 'bert' in n], 'lr':2e-5},
             {'params':[p for n,p in m.named_parameters() if 'bert' not in n], 'lr':8e-4}
@@ -464,7 +558,7 @@ def train_text_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
                 ids, mask, y = bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE), bl.to(DEVICE)
                 lo, pr = m(ids, mask)
                 loss = F.cross_entropy(lo, y, weight=cw_tensor, label_smoothing=0.08)
-                if use_supcon: loss += 0.3 * supcon_fn(pr, y)
+                if use_supcon: loss += 0.5 * supcon_fn(pr, y) # Boosted to 0.5
                 loss.backward(); opt.step()
             m.eval(); ps,ts=[],[]
             with torch.no_grad():
@@ -534,5 +628,5 @@ if __name__ == "__main__":
     sep(f"CONTRASTIVE PIPELINE v2 (HIGH ACCURACY ABLATION) | Device: {DEVICE}")
     tr, va, te = load_splits()
     
-    # Assume Phase 1 SSL is already done or run it if needed (skipped here to jump to ablation)
+    train_ssl_phase(pd.concat([tr, va]).reset_index(drop=True))
     run_ablation(tr, va, te)
