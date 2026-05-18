@@ -311,6 +311,11 @@ class AudioSSLModel(nn.Module):
         super().__init__()
         self.backbone = WavLMModel.from_pretrained("microsoft/wavlm-base-plus",
                                                     output_hidden_states=True)
+        # Freeze bottom 6 layers for efficiency and stability
+        for i, layer in enumerate(self.backbone.encoder.layers):
+            if i < 6:
+                for p in layer.parameters(): p.requires_grad = False
+                
         self.lw   = nn.Parameter(torch.ones(13))
         self.proj = ProjectionHead(768*2, proj_dim)
 
@@ -333,10 +338,6 @@ def train_audio_ssl(pool):
     dl  = DataLoader(ds, batch_size=8, shuffle=True, num_workers=2,
                      pin_memory=True, drop_last=True)
     m   = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    # Freeze bottom 6 WavLM layers — fine-tune top 6 only
-    for i, layer in enumerate(m.backbone.encoder.layers):
-        if i < 6:
-            for p in layer.parameters(): p.requires_grad = False
     opt     = torch.optim.AdamW(
                   filter(lambda p: p.requires_grad, m.parameters()),
                   lr=1e-4, weight_decay=1e-2)
@@ -653,17 +654,13 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
     for ep in range(1, 21):
         m.train()
         
-        # SOTA: LP-FT (Linear Probing then Fine-Tuning)
-        # Freeze backbone for first 5 epochs to allow random head to orient
-        if ep == 1:
-            for p in bb_params: p.requires_grad = False
-        elif ep == 6:
-            for p in bb_params: p.requires_grad = True
+        # SOTA: LP-FT (Linear Probing then Fine-Tuning) via Learning Rate
+        # We rely on soft-freezing (100x smaller LR for backbone) instead of hard freezing.
+        # Hard freezing with OneCycleLR causes a shock when suddenly unfrozen at peak LR.
             
-        # SOTA: Decoupled SupCon Phase (Khosla et al.)
-        # Ep 1-5: High SupCon weight to build clusters while backbone is frozen
-        # Ep 6-20: SupCon turns off, allowing pure CE fine-tuning without interference
-        cur_supcon_w = 0.5 if ep <= 5 else 0.0
+        # SOTA: Joint SupCon Phase
+        # Weight starts higher and decays slightly, but never 0 so it actually updates the backbone.
+        cur_supcon_w = 0.3 if use_supcon else 0.0
 
         for batch in dl_tr:
             opt.zero_grad()
