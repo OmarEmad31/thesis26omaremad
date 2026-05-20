@@ -132,16 +132,29 @@ class SupConLoss(nn.Module):
     def __init__(self, temperature=0.07):
         super().__init__()
         self.T = temperature
+        # Add class-specific margins to prevent identical collapse 
+        # (Happiness=3, Surprise=6, Fear=2 are highly confused)
+        self.margins = {3: 0.2, 6: 0.15, 2: 0.25}
+        
     def forward(self, features, labels):
-        B = features.size(0)
+        m = torch.zeros(7, device=features.device)
+        for k, v in self.margins.items(): m[k] = v
+        
         sim = torch.mm(features, features.T) / self.T
-        mask_self = torch.eye(B, device=features.device).bool()
-        sim.masked_fill_(mask_self, float('-inf'))
-        pos_mask = labels.view(-1,1).eq(labels.view(1,-1)).float()
-        pos_mask.fill_diagonal_(0)
-        log_prob = F.log_softmax(sim, dim=1)
-        n_pos = pos_mask.sum(1).clamp(min=1)
-        return (-(pos_mask * log_prob).sum(1) / n_pos).mean()
+        mask = labels.unsqueeze(1).eq(labels.unsqueeze(0)).float()
+        
+        # Apply margin to positive pairs
+        sim = sim - mask * m[labels].unsqueeze(1)
+        
+        # Exclude self-similarity
+        lm = torch.ones_like(mask).scatter_(1, torch.arange(len(labels), device=features.device).view(-1,1), 0)
+        
+        # Supervised Contrastive Loss
+        denominator = torch.log(sim.exp().sum(1, keepdim=True) + 1e-6)
+        loss = -(mask * lm * (sim - denominator)).sum(1)
+        
+        # Normalize by number of positives
+        return loss.mean() / (mask.sum(1).mean() + 1e-6)
 
 class ProjectionHead(nn.Module):
     def __init__(self, in_dim, proj_dim=128):
@@ -467,7 +480,7 @@ def train_audio_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
             with autocast("cuda"):
                 lo, pr = m(x)
                 loss = F.cross_entropy(lo, y, weight=cw_tensor, label_smoothing=0.1)
-                if use_supcon: loss += 0.5 * supcon_fn(pr, y)  # Boosted from 0.3 to 0.5
+                if use_supcon: loss += 0.3 * supcon_fn(pr, y)
             scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         m.eval(); ps,ts=[],[]
         with torch.no_grad():
@@ -506,7 +519,7 @@ def train_video_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
                 x,y = x.to(DEVICE), y.to(DEVICE); opt.zero_grad()
                 lo, pr = m(x)
                 loss = F.cross_entropy(lo, y, weight=cw_tensor, label_smoothing=0.1)
-                if use_supcon: loss += 0.5 * supcon_fn(pr, y) # Boosted to 0.5
+                if use_supcon: loss += 0.3 * supcon_fn(pr, y)
                 loss.backward(); opt.step(); sch.step()
             m.eval(); ps,ts = [],[]
             with torch.no_grad():
@@ -558,7 +571,7 @@ def train_text_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
                 ids, mask, y = bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE), bl.to(DEVICE)
                 lo, pr = m(ids, mask)
                 loss = F.cross_entropy(lo, y, weight=cw_tensor, label_smoothing=0.08)
-                if use_supcon: loss += 0.5 * supcon_fn(pr, y) # Boosted to 0.5
+                if use_supcon: loss += 0.3 * supcon_fn(pr, y)
                 loss.backward(); opt.step()
             m.eval(); ps,ts=[],[]
             with torch.no_grad():
