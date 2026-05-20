@@ -581,29 +581,21 @@ def train_audio_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
         sd = torch.load(ckpt_ssl, map_location=DEVICE)
         m.backbone.backbone.load_state_dict(sd['backbone'], strict=False)
         m.backbone.lw.data = sd['lw']
-        # Freeze entire backbone initially; unfreeze top-6 at epoch 3
-        for p in m.backbone.backbone.parameters(): p.requires_grad = False
-        m.backbone.lw.requires_grad = True
-    else:
-        # FIX: baseline had ALL 12 WavLM layers frozen (6 from AudioSSLModel.__init__
-        # + 6 more that were unconditionally frozen here). Now give baseline full
-        # fine-tuning access to all WavLM layers.
-        for p in m.backbone.backbone.parameters(): p.requires_grad = True
 
-    # Build optimizer for epochs 1-2
-    if use_ssl:
-        opt = torch.optim.AdamW([
-            {'params': m.classifier.parameters(), 'lr': 1e-3},
-            {'params': m.proj_ft.parameters(),    'lr': 1e-3},
-            {'params': [m.backbone.lw],            'lr': 1e-3},
-        ])
-    else:
-        opt = torch.optim.AdamW([
-            {'params': m.backbone.backbone.parameters(), 'lr': 4e-5},
-            {'params': m.classifier.parameters(),        'lr': 1e-3},
-            {'params': m.proj_ft.parameters(),           'lr': 1e-3},
-            {'params': [m.backbone.lw],                  'lr': 1e-3},
-        ])
+    # ALL scenarios: freeze upper 6 WavLM layers initially (layers 0-5 already
+    # frozen in AudioSSLModel.__init__). Unfreeze top-6 at epoch 3 for all.
+    # On a small dataset (502 samples), training as a feature extractor first
+    # then gradually unfreezing is more stable than full fine-tuning from epoch 1.
+    # SSL/baseline differ only in what the backbone is initialised with.
+    for i, layer in enumerate(m.backbone.backbone.encoder.layers):
+        if i >= 6:
+            for p in layer.parameters(): p.requires_grad = False
+
+    opt = torch.optim.AdamW([
+        {'params': m.classifier.parameters(), 'lr': 1e-3},
+        {'params': m.proj_ft.parameters(),    'lr': 1e-3},
+        {'params': [m.backbone.lw],            'lr': 1e-3},
+    ])
 
     scaler    = GradScaler()
     supcon_fn = SupConLoss(SSL_TEMP)
@@ -611,8 +603,8 @@ def train_audio_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
     ckpt      = SAVE_DIR / f"aud_{sc_name.replace(' ','_').replace('+','plus')}.pt"
 
     for ep in range(1, 16):
-        # Progressive unfreeze at epoch 3 (SSL only)
-        if ep == 3 and use_ssl:
+        # Progressive unfreeze at epoch 3 for ALL scenarios
+        if ep == 3:
             for i, layer in enumerate(m.backbone.backbone.encoder.layers):
                 if i >= 6:
                     for p in layer.parameters(): p.requires_grad = True
@@ -720,21 +712,29 @@ def train_video_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
 
 
 def train_text_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
-    """Returns (test_probs, val_probs) both shape [N, 7]."""
+    """Returns (test_probs, val_probs) both shape [N, 7].
+
+    val_probs uses out-of-fold (OOF) predictions: each va sample is predicted
+    only by the fold where it was in the held-out set, so no fold has seen that
+    sample during training. This prevents data leakage into the fusion weight search.
+    """
     print(f"\n  [TEXT] {sc_name} | CV pool={len(tr)+len(va)} test={len(te)}")
     set_seed(42)
-    tok         = AutoTokenizer.from_pretrained(MODEL_NAME)
-    pool        = pd.concat([tr, va]).reset_index(drop=True)
-    texts       = pool['transcript'].values
-    labels      = np.array([LID[e] for e in pool['emotion_final']])
-    cw          = compute_class_weight('balanced', classes=np.arange(7), y=labels)
-    cw_tensor   = torch.tensor(cw, dtype=torch.float).to(DEVICE)
-    te_loader   = DataLoader(TextFTDS(te['transcript'].values, te['emotion_final'].values, tok), batch_size=16)
-    va_loader   = DataLoader(TextFTDS(va['transcript'].values, va['emotion_final'].values, tok), batch_size=16)
-    supcon_fn   = SupConLoss(SSL_TEMP)
+    tok       = AutoTokenizer.from_pretrained(MODEL_NAME)
+    pool      = pd.concat([tr, va]).reset_index(drop=True)
+    texts     = pool['transcript'].values
+    labels    = np.array([LID[e] for e in pool['emotion_final']])
+    cw        = compute_class_weight('balanced', classes=np.arange(7), y=labels)
+    cw_tensor = torch.tensor(cw, dtype=torch.float).to(DEVICE)
+    te_loader = DataLoader(TextFTDS(te['transcript'].values, te['emotion_final'].values, tok), batch_size=16)
+    supcon_fn = SupConLoss(SSL_TEMP)
+
+    # va samples sit at the END of pool (pool = concat([tr, va]))
+    va_start = len(tr)
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    fold_test_p, fold_val_p = [], []
+    fold_test_p  = []
+    oof_probs    = np.zeros((len(pool), 7))   # out-of-fold predictions over full pool
 
     for fold, (t_idx, v_idx) in enumerate(skf.split(texts, labels)):
         tl      = DataLoader(TextFTDS(texts[t_idx], [list(LID.keys())[l] for l in labels[t_idx]], tok),
@@ -751,8 +751,7 @@ def train_text_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
             {'params': [p for n,p in m.named_parameters() if 'bert' in n], 'lr': 2e-5},
             {'params': [p for n,p in m.named_parameters() if 'bert' not in n], 'lr': 8e-4},
         ], weight_decay=0.01)
-        # FIX: scheduler was missing for text fine-tuning
-        sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=40)
+        sch      = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=40)
         best_acc = 0
         ckpt     = SAVE_DIR / f"txt_{sc_name.replace(' ','_').replace('+','plus')}_f{fold}.pt"
         pat      = 0
@@ -788,16 +787,25 @@ def train_text_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
 
         print(f"    [Fold {fold}] Best CV Val Acc: {best_acc:.4f}")
         m.load_state_dict(torch.load(str(ckpt), weights_only=True, map_location=DEVICE)); m.eval()
-        tp, vp = [], []
+
+        # Test predictions (all folds averaged)
+        tp = []
         with torch.no_grad():
             for bd,_ in te_loader:
                 tp.append(F.softmax(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE))[0], 1).cpu().numpy())
-            for bd,_ in va_loader:
-                vp.append(F.softmax(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE))[0], 1).cpu().numpy())
         fold_test_p.append(np.vstack(tp))
-        fold_val_p.append( np.vstack(vp))
 
-    return np.mean(fold_test_p, 0), np.mean(fold_val_p, 0)
+        # OOF predictions: store this fold's held-out predictions into oof_probs
+        oof_loader = DataLoader(TextFTDS(texts[v_idx], [list(LID.keys())[l] for l in labels[v_idx]], tok), batch_size=16)
+        oof_preds  = []
+        with torch.no_grad():
+            for bd,_ in oof_loader:
+                oof_preds.append(F.softmax(m(bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE))[0], 1).cpu().numpy())
+        oof_probs[v_idx] = np.vstack(oof_preds)
+
+    # val_probs: OOF predictions for the va portion of pool (unbiased)
+    val_probs = oof_probs[va_start:]
+    return np.mean(fold_test_p, 0), val_probs
 
 # ─────────────────────────────────────────────────────────
 # ABLATION RUNNER
