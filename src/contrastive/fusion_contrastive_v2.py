@@ -358,6 +358,7 @@ def train_ssl_phase(pool):
     print(f"             to near-zero and degrades strong pretrained representations.")
 
     # ── TEXT SSL ──────────────────────────────────────────
+    torch.cuda.empty_cache()
     ckpt = SSL_DIR / "text_ssl.pt"
     if not ckpt.exists():
         class TextSSLDS(Dataset):
@@ -401,6 +402,7 @@ def train_ssl_phase(pool):
         print(f"  [SKIP] Text SSL checkpoint found: {ckpt}")
 
     # ── VIDEO SSL ─────────────────────────────────────────
+    torch.cuda.empty_cache()
     ckpt = SSL_DIR / "video_ssl.pt"
     if not ckpt.exists():
         class VideoSSLDS(Dataset):
@@ -443,6 +445,7 @@ def train_ssl_phase(pool):
             print("  *** WARNING: video_ssl.pt missing proj_in weights. Delete and re-run. ***")
 
     # ── AUDIO SSL ─────────────────────────────────────────
+    torch.cuda.empty_cache()
     ckpt = SSL_DIR / "audio_ssl.pt"
     if not ckpt.exists():
         class AudioSSLDS(Dataset):
@@ -466,8 +469,8 @@ def train_ssl_phase(pool):
         # Only lw (layer weighting) and proj (contrastive head) are updated.
         for p in m.backbone.parameters(): p.requires_grad = False
         trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
-        # With no backbone gradients batch_size can be much larger → more negatives
-        dl  = DataLoader(AudioSSLDS(pool), batch_size=32, shuffle=True,
+        # WavLM forward on 80k samples is ~3GB peak even frozen — keep batch_size=8
+        dl  = DataLoader(AudioSSLDS(pool), batch_size=8, shuffle=True,
                          num_workers=2, pin_memory=True, drop_last=True)
         print(f"\n  [AUDIO SSL] {len(pool)} samples | {len(dl)} batches/epoch | {_ep} epochs")
         print(f"  [AUDIO SSL] Trainable: {trainable:,} params (lw + projection head; backbone frozen)")
