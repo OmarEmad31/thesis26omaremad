@@ -825,13 +825,17 @@ def train_text_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
 # ─────────────────────────────────────────────────────────
 # ABLATION RUNNER
 # ─────────────────────────────────────────────────────────
-def run_ablation(tr, va, te):
+def run_ablation(tr, va, te, start_from="Baseline"):
     scenarios = [
         {"name": "Baseline",     "ssl": False, "supcon": False},
         {"name": "SupCon only",  "ssl": False, "supcon": True},
         {"name": "SSL only",     "ssl": True,  "supcon": False},
         {"name": "SSL + SupCon", "ssl": True,  "supcon": True},
     ]
+    names = [s["name"] for s in scenarios]
+    if start_from not in names:
+        raise ValueError(f"start_from must be one of {names}")
+    scenarios = scenarios[names.index(start_from):]
     results   = []
     t_labels  = [LID[e] for e in te['emotion_final'].values]
     v_labels  = [LID[e] for e in va['emotion_final'].values]
@@ -880,7 +884,16 @@ def run_ablation(tr, va, te):
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start_from", default="Baseline",
+                    choices=["Baseline", "SupCon only", "SSL only", "SSL + SupCon"])
+    ap.add_argument("--skip_ssl", action="store_true",
+                    help="Skip SSL phase (use existing checkpoints)")
+    args = ap.parse_args()
+
     sep(f"CONTRASTIVE PIPELINE v2 (HIGH ACCURACY ABLATION) | Device: {DEVICE}")
     tr, va, te = load_splits()
-    train_ssl_phase(pd.concat([tr, va]).reset_index(drop=True))
-    run_ablation(tr, va, te)
+    if not args.skip_ssl:
+        train_ssl_phase(pd.concat([tr, va]).reset_index(drop=True))
+    run_ablation(tr, va, te, start_from=args.start_from)

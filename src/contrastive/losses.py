@@ -76,6 +76,9 @@ class SupConLoss(nn.Module):
 
         # Log-softmax over all non-self pairs
         log_prob = F.log_softmax(sim, dim=1)
+        # Diagonal is -inf after masked_fill_; pos_mask diagonal is 0.
+        # 0 * (-inf) = NaN in IEEE 754 — zero out diagonal before multiplication.
+        log_prob = log_prob.masked_fill(mask_self, 0.0)
 
         # Mean over positive pairs
         n_pos = pos_mask.sum(1).clamp(min=1)
