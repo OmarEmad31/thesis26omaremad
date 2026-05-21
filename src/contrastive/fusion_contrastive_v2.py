@@ -350,6 +350,9 @@ class VideoSSLModel(nn.Module):
 def train_ssl_phase(pool):
     sep("PHASE 1: SELF-SUPERVISED PRE-TRAINING (SAVING TO GOOGLE DRIVE)")
     print(f"  SSL pool: {len(pool)} samples (train + val combined)")
+    print(f"  Strategy: conservative SSL — only top-2 transformer layers updated")
+    print(f"  Rationale: with 606 samples, training many layers collapses InfoNCE")
+    print(f"             to near-zero and degrades strong pretrained representations.")
 
     # ── TEXT SSL ──────────────────────────────────────────
     ckpt = SSL_DIR / "text_ssl.pt"
@@ -362,17 +365,24 @@ def train_ssl_phase(pool):
             def __len__(self): return self.enc['input_ids'].size(0)
             def __getitem__(self, i): return {k: v[i] for k,v in self.enc.items()}
 
-        ds = TextSSLDS(pool['transcript'].values, AutoTokenizer.from_pretrained(MODEL_NAME))
-        dl = DataLoader(ds, batch_size=16, shuffle=True, drop_last=True)
-        print(f"\n  [TEXT SSL] {len(ds)} samples | {len(dl)} batches/epoch")
-        m = TextSSLModel().to(DEVICE)
+        ds  = TextSSLDS(pool['transcript'].values, AutoTokenizer.from_pretrained(MODEL_NAME))
+        dl  = DataLoader(ds, batch_size=16, shuffle=True, drop_last=True)
+        _ep = 20
+        print(f"\n  [TEXT SSL] {len(ds)} samples | {len(dl)} batches/epoch | {_ep} epochs")
+        m   = TextSSLModel().to(DEVICE)
+        # TextSSLModel freezes layers 0-7; also freeze 8-9 → only top-2 (10-11) trainable
+        for i, layer in enumerate(m.bert.encoder.layer):
+            if i < 10:
+                for p in layer.parameters(): p.requires_grad = False
+        trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+        print(f"  [TEXT SSL] Trainable params: {trainable:,} (top-2 BERT layers + projection)")
         opt = torch.optim.AdamW([
-            {'params': [p for n,p in m.named_parameters() if 'bert' in n and p.requires_grad], 'lr': 3e-5},
-            {'params': [p for n,p in m.named_parameters() if 'proj' in n], 'lr': 1e-3},
+            {'params': [p for n,p in m.named_parameters() if 'bert' in n and p.requires_grad], 'lr': 1e-5},
+            {'params': m.proj.parameters(), 'lr': 5e-4},
         ], weight_decay=0.01)
-        sch      = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
-        loss_fn  = InfoNCELoss(0.1)   # higher T for NLP (SimCSE convention)
-        for ep in range(1, SSL_EPOCHS+1):
+        sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=_ep)
+        loss_fn = InfoNCELoss(0.15)   # softer than 0.07/0.1 — prevents sharp collapse
+        for ep in range(1, _ep+1):
             m.train(); ep_loss = 0
             for bd in dl:
                 ids, mask = bd['input_ids'].to(DEVICE), bd['attention_mask'].to(DEVICE)
@@ -381,8 +391,8 @@ def train_ssl_phase(pool):
                 loss.backward(); opt.step()
                 ep_loss += loss.item()
             sch.step()
-            if ep == 1 or ep % 10 == 0:
-                print(f"    Ep {ep:2d}/{SSL_EPOCHS} | Loss: {ep_loss/len(dl):.4f} | LR: {sch.get_last_lr()[0]:.2e}")
+            if ep == 1 or ep % 5 == 0:
+                print(f"    Ep {ep:2d}/{_ep} | Loss: {ep_loss/len(dl):.4f} | LR: {sch.get_last_lr()[0]:.2e}")
         torch.save({k:v for k,v in m.state_dict().items() if 'proj' not in k}, str(ckpt))
         print(f"  [SAVED] Text SSL → {ckpt}")
     else:
@@ -400,13 +410,17 @@ def train_ssl_phase(pool):
                 seq = np.concatenate([np.load(pc), np.load(pd_path), np.load(pr)], -1)
                 return video_augment(seq)
 
-        dl = DataLoader(VideoSSLDS(pool), batch_size=32, shuffle=True, drop_last=True)
-        print(f"\n  [VIDEO SSL] {len(pool)} samples | {len(dl)} batches/epoch")
-        m       = VideoSSLModel().to(DEVICE)
+        dl  = DataLoader(VideoSSLDS(pool), batch_size=32, shuffle=True, drop_last=True)
+        _ep = 30
+        print(f"\n  [VIDEO SSL] {len(pool)} samples | {len(dl)} batches/epoch | {_ep} epochs")
+        # Video backbone is fully custom (no massive pretraining) → full training OK
+        m   = VideoSSLModel().to(DEVICE)
+        trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+        print(f"  [VIDEO SSL] Trainable params: {trainable:,} (full custom backbone)")
         opt     = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=1e-2)
-        sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
-        loss_fn = InfoNCELoss(SSL_TEMP)
-        for ep in range(1, SSL_EPOCHS+1):
+        sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=_ep)
+        loss_fn = InfoNCELoss(0.12)   # slightly softer than 0.07
+        for ep in range(1, _ep+1):
             m.train(); ep_loss = 0
             for v1, v2 in dl:
                 opt.zero_grad()
@@ -414,21 +428,15 @@ def train_ssl_phase(pool):
                 loss.backward(); opt.step()
                 ep_loss += loss.item()
             sch.step()
-            if ep == 1 or ep % 10 == 0:
-                print(f"    Ep {ep:2d}/{SSL_EPOCHS} | Loss: {ep_loss/len(dl):.4f} | LR: {sch.get_last_lr()[0]:.2e}")
-
-        # FIX: was `if 'proj' not in k` which also excluded proj_in (3584→512).
-        # proj_in is the input projection — critical to transfer. Only exclude
-        # the SSL-specific contrastive head (keys that start with 'proj.').
+            if ep == 1 or ep % 5 == 0:
+                print(f"    Ep {ep:2d}/{_ep} | Loss: {ep_loss/len(dl):.4f} | LR: {sch.get_last_lr()[0]:.2e}")
         torch.save({k:v for k,v in m.state_dict().items() if not k.startswith('proj.')}, str(ckpt))
         print(f"  [SAVED] Video SSL → {ckpt}")
     else:
         print(f"  [SKIP] Video SSL checkpoint found: {ckpt}")
-        # Warn if the checkpoint was saved with the old buggy filter
         _sd = torch.load(ckpt, map_location='cpu')
         if 'proj_in.0.weight' not in _sd:
-            print("  *** WARNING: video_ssl.pt is missing proj_in weights (saved with old code).")
-            print("  *** Delete it from Drive and re-run to retrain with the correct save. ***")
+            print("  *** WARNING: video_ssl.pt missing proj_in weights. Delete and re-run. ***")
 
     # ── AUDIO SSL ─────────────────────────────────────────
     ckpt = SSL_DIR / "audio_ssl.pt"
@@ -447,16 +455,23 @@ def train_ssl_phase(pool):
                 v1, v2 = audio_augment(y)
                 return torch.tensor(v1, dtype=torch.float32), torch.tensor(v2, dtype=torch.float32)
 
-        dl = DataLoader(AudioSSLDS(pool), batch_size=8, shuffle=True,
-                        num_workers=2, pin_memory=True, drop_last=True)
-        print(f"\n  [AUDIO SSL] {len(pool)} samples | {len(dl)} batches/epoch (eff. batch={8*GRAD_ACC})")
-        m       = AudioSSLModel().to(DEVICE)
+        dl  = DataLoader(AudioSSLDS(pool), batch_size=8, shuffle=True,
+                         num_workers=2, pin_memory=True, drop_last=True)
+        _ep = 20
+        print(f"\n  [AUDIO SSL] {len(pool)} samples | {len(dl)} batches/epoch | {_ep} epochs (eff. batch={8*GRAD_ACC})")
+        m   = AudioSSLModel().to(DEVICE)
+        # AudioSSLModel freezes layers 0-5; also freeze 6-8 → only layers 9-11 trainable
+        for i, layer in enumerate(m.backbone.encoder.layers):
+            if i < 9:
+                for p in layer.parameters(): p.requires_grad = False
+        trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+        print(f"  [AUDIO SSL] Trainable params: {trainable:,} (top-3 WavLM layers + lw + projection)")
         opt     = torch.optim.AdamW(filter(lambda p: p.requires_grad, m.parameters()),
-                                    lr=1e-4, weight_decay=1e-2)
-        sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
-        loss_fn = InfoNCELoss(SSL_TEMP)
+                                    lr=5e-5, weight_decay=1e-2)
+        sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=_ep)
+        loss_fn = InfoNCELoss(0.15)   # softer temperature → less prone to memorisation
         scaler  = GradScaler()
-        for ep in range(1, SSL_EPOCHS+1):
+        for ep in range(1, _ep+1):
             m.train(); ep_loss = 0; opt.zero_grad()
             for step, (v1, v2) in enumerate(dl):
                 v1, v2 = v1.to(DEVICE), v2.to(DEVICE)
@@ -467,8 +482,8 @@ def train_ssl_phase(pool):
                 if (step+1) % GRAD_ACC == 0 or (step+1) == len(dl):
                     scaler.step(opt); scaler.update(); opt.zero_grad()
             sch.step()
-            if ep == 1 or ep % 10 == 0:
-                print(f"    Ep {ep:2d}/{SSL_EPOCHS} | Loss: {ep_loss/len(dl):.4f} | LR: {sch.get_last_lr()[0]:.2e}")
+            if ep == 1 or ep % 5 == 0:
+                print(f"    Ep {ep:2d}/{_ep} | Loss: {ep_loss/len(dl):.4f} | LR: {sch.get_last_lr()[0]:.2e}")
         torch.save({'backbone': m.backbone.state_dict(), 'lw': m.lw.data}, str(ckpt))
         print(f"  [SAVED] Audio SSL → {ckpt}")
     else:
