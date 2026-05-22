@@ -618,11 +618,13 @@ def train_audio_ablation(tr, va, te, use_ssl, use_supcon, sc_name):
     ])
 
     scaler    = GradScaler()
-    supcon_fn = SupConLoss(SSL_TEMP)
+    # batch_size=8 → only 7 negatives; SSL_TEMP=0.07 is too aggressive at this scale.
+    # Temperature 0.1 stabilises SupCon without softening margins too much.
+    supcon_fn = SupConLoss(0.1 if use_supcon else SSL_TEMP)
     best_f1   = 0
     ckpt      = SAVE_DIR / f"aud_{sc_name.replace(' ','_').replace('+','plus')}.pt"
 
-    for ep in range(1, 16):
+    for ep in range(1, 21):   # 15→20: CE+SupCon dual loss needs more epochs to converge
         # Progressive unfreeze at epoch 3 for ALL scenarios
         if ep == 3:
             for i, layer in enumerate(m.backbone.backbone.encoder.layers):
