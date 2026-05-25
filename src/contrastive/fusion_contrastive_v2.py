@@ -367,40 +367,9 @@ class AudioSSLModel(nn.Module):
     def forward(self, x):
         return self.proj(self.encode(x))
 
-def train_audio_ssl(pool):
-    sep("PHASE 1-A -- AUDIO SSL (SimCLR | WavLM-Base-Plus)")
-    ckpt = SSL_DIR / "audio_ssl.pt"
-    if ckpt.exists():
-        print("  [SKIP] audio_ssl.pt already cached — delete to retrain.")
-        return
-    set_seed(42)
-    ds  = AudioSSLDS(pool)
-    dl  = DataLoader(ds, batch_size=8, shuffle=True, num_workers=2,
-                     pin_memory=True, drop_last=True)
-    m   = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    opt     = torch.optim.AdamW(
-                  filter(lambda p: p.requires_grad, m.parameters()),
-                  lr=1e-4, weight_decay=1e-2)
-    sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
-    loss_fn = InfoNCELoss(SSL_TEMP)
-    scaler  = GradScaler()
-    print(f"  Pool: {len(pool)} | EffBatch: {8*GRAD_ACC} | Epochs: {SSL_EPOCHS}")
-    for ep in range(1, SSL_EPOCHS+1):
-        m.train(); ep_loss = 0.0; opt.zero_grad()
-        for step, (v1, v2) in enumerate(dl):
-            v1, v2 = v1.to(DEVICE), v2.to(DEVICE)
-            with autocast("cuda"):
-                loss = loss_fn(m(v1), m(v2)) / GRAD_ACC
-            scaler.scale(loss).backward()
-            ep_loss += loss.item() * GRAD_ACC
-            if (step+1) % GRAD_ACC == 0 or (step+1) == len(dl):
-                scaler.step(opt); scaler.update(); opt.zero_grad()
-        sch.step()
-        if ep % 5 == 0 or ep == 1:
-            print(f"  Ep {ep:02d}/{SSL_EPOCHS} | InfoNCE: {ep_loss/len(dl):.4f}")
-    # Save encoder only (no projection head)
-    torch.save({'backbone': m.backbone.state_dict(), 'lw': m.lw.data}, str(ckpt))
-    print(f"  [SAVED] {ckpt}")
+# train_audio_ssl removed: WavLM-Base-Plus is already pretrained on 94k hrs of speech.
+# Per-modal SimCLR on 606 samples degrades these representations rather than improving them.
+# Audio is instead aligned via cross-modal SSL (Phase 1-D) which is more data-efficient.
 
 # ─────────────────────────────────────────────────────────
 # PHASE 1-B — TEXT SSL (SimCSE)
@@ -447,42 +416,8 @@ class TextSSLModel(nn.Module):
     def forward(self, ids, mask):
         return self.proj(self.encode(ids, mask))
 
-def train_text_ssl(pool):
-    sep("PHASE 1-B -- TEXT SSL (SimCSE | MARBERT)")
-    ckpt = SSL_DIR / "text_ssl.pt"
-    if ckpt.exists():
-        print("  [SKIP] text_ssl.pt already cached — delete to retrain.")
-        return
-    set_seed(42)
-    tok     = AutoTokenizer.from_pretrained(MODEL_NAME)
-    ds      = TextSSLDS(pool['transcript'].values, tok)
-    dl      = DataLoader(ds, batch_size=16, shuffle=True, drop_last=True)
-    m       = TextSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    opt     = torch.optim.AdamW([
-        {'params': [p for n,p in m.named_parameters() if 'bert' in n and p.requires_grad], 'lr': 2e-5},
-        {'params': [p for n,p in m.named_parameters() if 'proj' in n],                    'lr': 1e-3}
-    ], weight_decay=0.01)
-    sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
-    loss_fn = InfoNCELoss(SSL_TEMP)
-    print(f"  Pool: {len(pool)} | Batches/ep: {len(dl)} | Epochs: {SSL_EPOCHS}")
-    for ep in range(1, SSL_EPOCHS+1):
-        m.train(); ep_loss = 0.0
-        for batch in dl:
-            ids  = batch['input_ids'].to(DEVICE)
-            mask = batch['attention_mask'].to(DEVICE)
-            opt.zero_grad()
-            # SimCSE: same tokens, two forward passes — dropout is the augmentation
-            z1 = m(ids, mask)
-            z2 = m(ids, mask)
-            loss = loss_fn(z1, z2)
-            loss.backward(); opt.step()
-            ep_loss += loss.item()
-        sch.step()
-        if ep % 5 == 0 or ep == 1:
-            print(f"  Ep {ep:02d}/{SSL_EPOCHS} | InfoNCE: {ep_loss/len(dl):.4f}")
-    # Save bert weights only (drop projection head)
-    torch.save({k: v for k,v in m.state_dict().items() if 'proj' not in k}, str(ckpt))
-    print(f"  [SAVED] {ckpt}")
+# train_text_ssl removed: same reason as audio — MARBERT is pretrained on 1B+ Arabic tokens.
+# SimCSE on 606 sentences provides negligible benefit and risks degrading representations.
 
 # ─────────────────────────────────────────────────────────
 # PHASE 1-C — VIDEO SSL (Feature SimCLR)
@@ -605,8 +540,8 @@ def train_cross_modal_ssl(pool):
     """Phase 1-D: align audio and video encoders via cross-modal InfoNCE.
 
     Positive pair = (audio_i, video_i) from the SAME utterance.
-    Starts from per-modal SSL checkpoints; saves to *_cm_ssl.pt.
-    Falls back gracefully if pool is too small or per-modal SSL not done.
+    Audio starts from WavLM pretrained (no per-modal SSL needed).
+    Video starts from video_ssl.pt (required — VideoSSLModel has no pretrained weights).
     """
     sep("PHASE 1-D -- CROSS-MODAL SSL (Audio ↔ Video InfoNCE)")
     ckpt_a = SSL_DIR / "audio_cm_ssl.pt"
@@ -614,11 +549,18 @@ def train_cross_modal_ssl(pool):
     if ckpt_a.exists() and ckpt_v.exists():
         print("  [SKIP] Cross-modal SSL checkpoints cached — delete to retrain.")
         return
-    if not (SSL_DIR/"audio_ssl.pt").exists() or not (SSL_DIR/"video_ssl.pt").exists():
-        print("  [SKIP] Per-modal SSL checkpoints not found — run Phase 1-A and 1-C first.")
+    if not (SSL_DIR/"video_ssl.pt").exists():
+        print("  [SKIP] video_ssl.pt not found — run Phase 1-C first.")
         return
     set_seed(42)
+
+    # CrossModalSSLDS filters to samples with BOTH audio and video features.
+    # Unlabelled samples (audio-only) are excluded here — they lack video features.
+    n_total = len(pool)
     ds = CrossModalSSLDS(pool)
+    n_audio_only = n_total - len(ds)
+    print(f"  Pool breakdown: {len(ds)} paired (audio+video) | "
+          f"{n_audio_only} audio-only (excluded — no video features)")
     if len(ds) < 16:
         print(f"  [SKIP] Only {len(ds)} paired samples — need ≥16 for cross-modal SSL.")
         return
@@ -626,14 +568,14 @@ def train_cross_modal_ssl(pool):
     dl = DataLoader(ds, batch_size=16, shuffle=True, num_workers=2,
                     pin_memory=True, drop_last=True)
 
-    # Load per-modal encoders as starting point
+    # Audio: start from WavLM pretrained weights directly (no per-modal SSL)
     a_enc = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    sd_a  = torch.load(SSL_DIR/"audio_ssl.pt", map_location=DEVICE)
-    a_enc.backbone.load_state_dict(sd_a['backbone'])
-    a_enc.lw.data = sd_a['lw']
+    print(f"  Audio encoder: WavLM-Base-Plus pretrained (HuggingFace)")
 
+    # Video: start from video SSL checkpoint (randomly initialised model needs it)
     v_enc = VideoSSLModel(proj_dim=SSL_PROJ_DIM).to(DEVICE)
     v_enc.load_state_dict(torch.load(SSL_DIR/"video_ssl.pt", map_location=DEVICE), strict=False)
+    print(f"  Video encoder: video_ssl.pt")
 
     # Cross-modal projection heads (separate from the per-modal SSL heads)
     a_cm_proj = ProjectionHead(768 * 2, SSL_PROJ_DIM).to(DEVICE)
@@ -844,7 +786,8 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
     sch       = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[lr_bb, lr_hd],
                                                      steps_per_epoch=len(dl_tr), epochs=20)
     supcon_fn = SupConLoss(SSL_TEMP)
-    best_acc, ckpt = 0, SAVE_DIR / f"{name.lower()}_ft.pt"
+    best_f1, no_improve, patience = 0.0, 0, 5
+    ckpt = SAVE_DIR / f"{name.lower()}_ft.pt"
 
     for ep in range(1, 21):
         m.train()
@@ -878,6 +821,7 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
 
             loss.backward(); opt.step(); sch.step()
 
+        # ── Validation: accuracy + macro F1 + minority class F1 ──
         m.eval(); ps, ts = [], []
         with torch.no_grad():
             for batch in dl_va:
@@ -886,9 +830,25 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
                 else:
                     logits, _ = m(batch[0].to(DEVICE))
                 ps.extend(logits.argmax(1).cpu().numpy()); ts.extend(batch[1].numpy())
-        acc = accuracy_score(ts, ps)
-        if acc > best_acc: best_acc = acc; torch.save(m.state_dict(), str(ckpt))
-        if ep % 2 == 0 or ep == 1: print(f"  Ep {ep:02d} | Val Acc: {acc:.4f}")
+
+        acc      = accuracy_score(ts, ps)
+        f1_macro = f1_score(ts, ps, average='macro',  zero_division=0)
+        f1_cls   = f1_score(ts, ps, average=None,     zero_division=0, labels=list(range(7)))
+
+        improved = f1_macro > best_f1
+        if improved:
+            best_f1 = f1_macro; no_improve = 0
+            torch.save(m.state_dict(), str(ckpt))
+        else:
+            no_improve += 1
+
+        print(f"  Ep {ep:02d} | Acc {acc:.3f} | F1 {f1_macro:.3f} "
+              f"| Fear {f1_cls[2]:.2f} Hap {f1_cls[3]:.2f} Sur {f1_cls[6]:.2f} "
+              f"{'✓' if improved else f'({no_improve}/{patience})'}")
+
+        if no_improve >= patience:
+            print(f"  [EARLY STOP] F1 flat for {patience} epochs → stopping at ep {ep}")
+            break
 
     m.load_state_dict(torch.load(str(ckpt), map_location=DEVICE))
     m.eval(); probs = []
@@ -964,36 +924,30 @@ if __name__ == "__main__":
     labelled_pool  = pd.concat([tr, va]).reset_index(drop=True)
 
     if len(unlabelled_df) > 0:
-        u_audio = unlabelled_df[unlabelled_df.apply(_ok_audio, axis=1)]
-        u_text  = unlabelled_df[unlabelled_df.apply(_ok_text,  axis=1)]
         u_video = unlabelled_df[unlabelled_df.apply(_ok_video, axis=1)]
-        audio_pool = pd.concat([labelled_pool, u_audio]).reset_index(drop=True)
-        text_pool  = pd.concat([labelled_pool, u_text ]).reset_index(drop=True)
         video_pool = pd.concat([labelled_pool, u_video]).reset_index(drop=True)
-        cm_pool    = pd.concat([labelled_pool, unlabelled_df]).reset_index(drop=True)
-        sep("SSL POOL SIZES (labelled + unlabelled)")
-        print(f"  Labelled  (train+val) : {len(labelled_pool)}")
-        print(f"  Unlabelled total      : {len(unlabelled_df)}"
-              f"  →  audio={len(u_audio)} | text={len(u_text)} | video={len(u_video)}")
-        print(f"  {'─'*44}")
-        print(f"  Audio SSL pool : {len(audio_pool)} samples")
-        print(f"  Text  SSL pool : {len(text_pool)} samples")
-        print(f"  Video SSL pool : {len(video_pool)} samples")
-        print(f"  CM    SSL pool : {len(cm_pool)} samples  (audio+video pairs filtered inside DS)")
+        # Cross-modal SSL needs audio+video pairs; unlabelled has audio-only (no video features).
+        # CrossModalSSLDS will report the exact paired count at runtime.
+        cm_pool = pd.concat([labelled_pool, unlabelled_df]).reset_index(drop=True)
+        sep("SSL POOL SIZES")
+        print(f"  Labelled  (train+val)         : {len(labelled_pool)}")
+        print(f"  Unlabelled (audio-only, no video features): {len(unlabelled_df)}")
+        print(f"  Video SSL pool                : {len(video_pool)}")
+        print(f"  CM SSL input pool             : {len(cm_pool)}  "
+              f"(cross-modal DS will filter to paired samples)")
     else:
-        audio_pool = text_pool = video_pool = cm_pool = labelled_pool
-        print(f"  SSL training pool : {len(labelled_pool)} samples (train + val, no unlabelled CSV found)")
-        print(f"  TIP: add data/processed/splits/unlabelled.csv to use the full ~5k pool")
+        video_pool = cm_pool = labelled_pool
+        print(f"  SSL pool: {len(labelled_pool)} labelled samples (train + val)")
 
-    # ── PHASE 1: Per-modality SSL ─────────────────────────
-    train_audio_ssl(audio_pool)
-    train_text_ssl(text_pool)
+    # ── PHASE 1-C: Video SSL (necessary — VideoSSLModel has no pretrained weights) ──
     train_video_ssl(video_pool)
 
-    # ── PHASE 1-D: Cross-modal SSL (audio ↔ video) ───────
+    # ── PHASE 1-D: Cross-modal SSL (WavLM pretrained ↔ video SSL) ────────────────
+    # Audio and Text SSL removed: pretrained WavLM/MARBERT already encode Arabic
+    # speech/text well; per-modal SimCLR on ~600 samples degraded representations.
     train_cross_modal_ssl(cm_pool)
 
-    sep("PHASE 1 COMPLETE -- All encoders pre-trained.")
+    sep("PHASE 1 COMPLETE -- Video SSL + Cross-modal SSL done.")
 
     # ── PHASE 2: Supervised fine-tuning ablation ──────────
     run_ablation(tr, va, te)
