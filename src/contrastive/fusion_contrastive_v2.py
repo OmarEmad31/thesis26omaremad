@@ -575,15 +575,23 @@ def train_cross_modal_ssl(pool):
     n_total = len(pool)
     ds     = CrossModalSSLDS(pool, tok=tok)
     n_excl = n_total - len(ds)
-    print(f"  Pool breakdown: {len(ds)} paired (audio+video+text) | "
-          f"{n_excl} audio-only excluded (no video features)")
+    print(f"  Paired pool  (audio+video+text): {len(ds)} samples")
+    print(f"  Audio-only unlabelled           : {n_excl} samples  "
+          f"→ used via auxiliary SimCLR loss")
+    print(f"  Total audio  seen per epoch     : {len(pool)} samples")
     if len(ds) < 8:
         print(f"  [SKIP] Only {len(ds)} paired samples — need ≥8.")
         return
 
-    # Batch size 8: three encoders (WavLM + VideoTransformer + MARBERT) in VRAM simultaneously
+    # Cross-modal DataLoader (paired samples only)
     dl = DataLoader(ds, batch_size=8, shuffle=True, num_workers=2,
                     pin_memory=True, drop_last=True)
+
+    # Audio-only DataLoader: full 5k+ pool — one batch interleaved per CM step
+    audio_ds  = AudioSSLDS(pool)          # 5285 samples
+    audio_dl  = DataLoader(audio_ds, batch_size=8, shuffle=True,
+                           num_workers=2, pin_memory=True, drop_last=True)
+    audio_iter = iter(audio_dl)
 
     # Audio: WavLM pretrained, top-6 layers trainable
     a_enc = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
@@ -603,7 +611,8 @@ def train_cross_modal_ssl(pool):
     # Separate cross-modal projection heads
     a_cm_proj = ProjectionHead(768 * 2, SSL_PROJ_DIM).to(DEVICE)   # audio → shared space
     v_cm_proj = ProjectionHead(512,     SSL_PROJ_DIM).to(DEVICE)   # video → shared space
-    t_cm_proj = ProjectionHead(768 * 3, SSL_PROJ_DIM).to(DEVICE)   # text  → shared space
+    t_cm_proj  = ProjectionHead(768 * 3, SSL_PROJ_DIM).to(DEVICE)  # text  → shared space
+    a_aux_proj = ProjectionHead(768 * 2, SSL_PROJ_DIM).to(DEVICE)  # audio SimCLR (full pool)
 
     trainable_params = (
         [p for p in a_enc.parameters() if p.requires_grad] +
@@ -614,48 +623,66 @@ def train_cross_modal_ssl(pool):
         {'params': [p for p in a_enc.parameters() if p.requires_grad], 'lr': 2e-6},
         {'params': v_enc.parameters(),                                   'lr': 1e-5},
         {'params': list(a_cm_proj.parameters()) + list(v_cm_proj.parameters()) +
-                   list(t_cm_proj.parameters()),                         'lr': 1e-3},
+                   list(t_cm_proj.parameters()) + list(a_aux_proj.parameters()), 'lr': 1e-3},
     ], weight_decay=0.01)
     sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CM_SSL_EPOCHS)
     loss_fn = InfoNCELoss(CM_SSL_TEMP)
     scaler  = GradScaler()
     clip_params = (list(a_enc.parameters()) + list(v_enc.parameters()) +
                    list(a_cm_proj.parameters()) + list(v_cm_proj.parameters()) +
-                   list(t_cm_proj.parameters()))
+                   list(t_cm_proj.parameters()) + list(a_aux_proj.parameters()))
 
     print(f"  Epochs: {CM_SSL_EPOCHS} | Batch: 8 | "
-          f"Loss: InfoNCE(A↔V) + 0.5×InfoNCE(A↔T)")
+          f"Loss: InfoNCE(A↔V) + 0.5×InfoNCE(A↔T) + 0.2×SimCLR(A_aux {len(pool)} samples)")
     for ep in range(1, CM_SSL_EPOCHS + 1):
-        a_enc.train(); v_enc.train(); a_cm_proj.train(); v_cm_proj.train(); t_cm_proj.train()
-        ep_av = ep_at = 0.0
+        a_enc.train(); v_enc.train()
+        a_cm_proj.train(); v_cm_proj.train(); t_cm_proj.train(); a_aux_proj.train()
+        ep_av = ep_at = ep_aux = 0.0
         for batch in dl:
             aud, vid, ids, mask = batch[0].to(DEVICE), batch[1].to(DEVICE), \
                                   batch[2].to(DEVICE), batch[3].to(DEVICE)
             opt.zero_grad()
+
+            # ── Cross-modal step (paired 606 samples) ──
             with autocast("cuda"):
-                z_a  = a_cm_proj(a_enc.encode(aud))          # [B,128]
-                z_v  = v_cm_proj(v_enc.encode(vid))           # [B,128]
+                z_a  = a_cm_proj(a_enc.encode(aud))
+                z_v  = v_cm_proj(v_enc.encode(vid))
                 with torch.no_grad():                          # MARBERT backbone frozen
                     t_feat = t_enc.encode(ids, mask)
-                z_t  = t_cm_proj(t_feat)                      # [B,128]
+                z_t  = t_cm_proj(t_feat)
                 l_av = loss_fn(z_a, z_v)
                 l_at = loss_fn(z_a, z_t)
                 loss = l_av + 0.5 * l_at
             scaler.scale(loss).backward()
+
+            # ── Audio auxiliary SimCLR (full 5k pool) ──
+            try:
+                a1, a2 = next(audio_iter)
+            except StopIteration:
+                audio_iter = iter(audio_dl)
+                a1, a2 = next(audio_iter)
+            a1, a2 = a1.to(DEVICE), a2.to(DEVICE)
+            with autocast("cuda"):
+                l_aux = loss_fn(a_aux_proj(a_enc.encode(a1)),
+                                a_aux_proj(a_enc.encode(a2)))
+            scaler.scale(0.2 * l_aux).backward()
+
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
             scaler.step(opt); scaler.update()
-            ep_av += l_av.item(); ep_at += l_at.item()
+            ep_av += l_av.item(); ep_at += l_at.item(); ep_aux += l_aux.item()
         sch.step()
         if ep % 5 == 0 or ep == 1:
             print(f"  Ep {ep:02d}/{CM_SSL_EPOCHS} | "
-                  f"A↔V: {ep_av/len(dl):.4f}  A↔T: {ep_at/len(dl):.4f}")
+                  f"A↔V: {ep_av/len(dl):.4f}  "
+                  f"A↔T: {ep_at/len(dl):.4f}  "
+                  f"A_aux: {ep_aux/len(dl):.4f}")
 
     torch.save({'backbone': a_enc.backbone.state_dict(), 'lw': a_enc.lw.data}, str(ckpt_a))
     torch.save({k: v for k,v in v_enc.state_dict().items() if not k.startswith('proj.')}, str(ckpt_v))
     torch.save({k: v for k,v in t_enc.state_dict().items() if 'bert' in k}, str(ckpt_t))
     print(f"  [SAVED] {ckpt_a.name}, {ckpt_v.name}, {ckpt_t.name}")
-    del a_enc, v_enc, t_enc, a_cm_proj, v_cm_proj, t_cm_proj; torch.cuda.empty_cache()
+    del a_enc, v_enc, t_enc, a_cm_proj, v_cm_proj, t_cm_proj, a_aux_proj; torch.cuda.empty_cache()
 
 
 # ─────────────────────────────────────────────────────────
