@@ -138,6 +138,43 @@ def resolve_audio_path(row):
         
     return None
 
+def resolve_video_path(row):
+    """Return the raw .mp4 path for a sample, or None if not found.
+
+    Works for both labelled rows (video_relpath column) and unlabelled rows
+    (video_relpath inferred from audio_relpath).
+    """
+    video_rel = str(row.get('video_relpath', ''))
+    if not video_rel:
+        audio_rel = str(row.get('audio_relpath', ''))
+        if audio_rel:
+            video_rel = audio_rel.replace('audios/', 'videos/').replace('.wav', '.mp4')
+        else:
+            return None
+    folder = str(row.get('folder', ''))
+
+    bases = [
+        AUDIO_BASE,
+        Path("/content/audio/Thesis Project/dataset/Final Modalink Dataset MERGED"),
+        Path("/content/audio"),
+        Path("/content/Thesis_Audio_Full"),
+        Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED"),
+        Path("/content/drive/MyDrive/Thesis Project"),
+        Path("/content/drive/MyDrive"),
+    ]
+
+    for base in bases:
+        p = base / folder / video_rel if folder else base / video_rel
+        if p.exists(): return p
+        if folder:
+            bs_name = f"{folder}\\{video_rel.replace('/', '\\')}"
+            p_bs = base / bs_name
+            if p_bs.exists(): return p_bs
+        p_flat = base / Path(video_rel).name
+        if p_flat.exists(): return p_flat
+    return None
+
+
 def get_vid_paths(sid):
     # Check normal paths
     p1 = VID_DIR / f"{sid}_clip_seq.npy"
@@ -205,14 +242,23 @@ def load_splits():
     return tr_f, va_f, te_f
 
 
-def load_unlabelled():
-    """Load unlabelled audio segments for SSL pre-training (no emotion label needed).
+def load_unlabelled(known_audio_relpaths=None):
+    """Find unlabelled audio segments for SSL pre-training (no emotion label needed).
 
-    Returns an empty DataFrame with a message if no unlabelled CSV is found.
-    Create data/processed/splits/unlabelled.csv with columns:
-        sample_id, folder, audio_relpath, transcript (can be empty)
-    to unlock the full 5k+ unlabelled pool.
+    Steps:
+      1. Check for an explicit unlabelled.csv (fastest, user-supplied).
+      2. Auto-scan known Colab audio directories for all .wav files and exclude
+         any already in the labelled splits (identified by audio_relpath).
+
+    WAV files must live under a path of the form:
+        .../{folder}/audios/{speaker}/{file}.wav
+    which is the standard structure of the Final Modalink Dataset.
+
+    Args:
+        known_audio_relpaths: set of 'audios/{speaker}/{file}.wav' strings that
+            belong to the labelled pool — these are excluded from the result.
     """
+    # 1. Check for an explicit CSV first
     candidates = [
         SPLIT_DIR.parent / "unlabelled.csv",
         REPO / "data" / "processed" / "unlabelled.csv",
@@ -228,9 +274,55 @@ def load_unlabelled():
                     df[col] = ''
             print(f"  Unlabelled pool loaded: {len(df)} samples from {p.name}")
             return df.reset_index(drop=True)
-    print("  [INFO] No unlabelled CSV found — SSL pool = labelled train+val only.")
-    print(f"  [INFO] Expected: {candidates[0]}")
-    return pd.DataFrame()
+
+    # 2. Auto-discover WAV files in known Colab audio roots
+    print("  [INFO] No unlabelled CSV found — scanning audio directories for unlabelled segments...")
+    known = set(known_audio_relpaths or [])
+
+    # Directories to scan (order matters: local /content preferred over Drive)
+    audio_roots = [
+        Path("/content/audio"),
+        Path("/content/Thesis_Audio_Full"),
+        Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED"),
+    ]
+
+    rows = []
+    seen = set()
+    for base in audio_roots:
+        if not base.exists():
+            continue
+        for wav in base.rglob("*.wav"):
+            try:
+                parts = wav.parts
+                # Find the 'audios' directory in the path; the folder above it is the video folder
+                for i, part in enumerate(parts):
+                    if part == "audios" and i >= 1:
+                        folder       = parts[i - 1]
+                        speaker      = parts[i + 1] if i + 1 < len(parts) else ""
+                        audio_relpath = f"audios/{speaker}/{wav.name}"
+                        # Skip if already labelled or already seen from another root
+                        if audio_relpath in known or audio_relpath in seen:
+                            break
+                        seen.add(audio_relpath)
+                        video_relpath = audio_relpath.replace('audios/', 'videos/').replace('.wav', '.mp4')
+                        rows.append({
+                            'sample_id'   : f"{folder}::{video_relpath}",
+                            'folder'      : folder,
+                            'audio_relpath': audio_relpath,
+                            'video_relpath': video_relpath,
+                            'transcript'  : '',
+                        })
+                        break
+            except Exception:
+                pass
+
+    if not rows:
+        print("  [INFO] No unlabelled audio found — SSL pool = labelled train+val only.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).reset_index(drop=True)
+    print(f"  Auto-discovered {len(df)} unlabelled audio segments.")
+    return df
 
 
 def _ok_audio(row): return resolve_audio_path(row) is not None
@@ -367,12 +459,8 @@ class AudioSSLModel(nn.Module):
     def forward(self, x):
         return self.proj(self.encode(x))
 
-# train_audio_ssl removed: WavLM-Base-Plus is already pretrained on 94k hrs of speech.
-# Per-modal SimCLR on 606 samples degrades these representations rather than improving them.
-# Audio is instead aligned via cross-modal SSL (Phase 1-D) which is more data-efficient.
-
 # ─────────────────────────────────────────────────────────
-# PHASE 1-B — TEXT SSL (SimCSE)
+# TEXT ENCODER (MARBERT)
 # ─────────────────────────────────────────────────────────
 MODEL_NAME = "UBC-NLP/MARBERT"
 _FILLERS   = re.compile(
@@ -416,11 +504,8 @@ class TextSSLModel(nn.Module):
     def forward(self, ids, mask):
         return self.proj(self.encode(ids, mask))
 
-# train_text_ssl removed: same reason as audio — MARBERT is pretrained on 1B+ Arabic tokens.
-# SimCSE on 606 sentences provides negligible benefit and risks degrading representations.
-
 # ─────────────────────────────────────────────────────────
-# PHASE 1-C — VIDEO SSL (Feature SimCLR)
+# VIDEO ENCODER (Transformer over CLIP+DINOv2+ResNet50 features)
 # ─────────────────────────────────────────────────────────
 class SEBlock(nn.Module):
     def __init__(self, c):
@@ -431,20 +516,6 @@ class SEBlock(nn.Module):
     def forward(self, x):
         b,n,c = x.shape
         return x * self.fc(self.pool(x.transpose(1,2)).view(b,c)).view(b,1,c)
-
-class VideoSSLDS(Dataset):
-    def __init__(self, df):
-        self.df = df.reset_index(drop=True)
-    def __len__(self): return len(self.df)
-    def __getitem__(self, i):
-        r   = self.df.iloc[i]
-        sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-        try:
-            pc, pd_, pr = get_vid_paths(sid)
-            seq = np.concatenate([np.load(pc), np.load(pd_), np.load(pr)], -1)  # [16, 3584]
-        except: seq = np.zeros((16, 3584), dtype=np.float32)
-        v1, v2 = video_augment(seq)
-        return v1, v2
 
 class VideoSSLModel(nn.Module):
     def __init__(self, d=512, proj_dim=128, drop=0.3):
@@ -470,37 +541,119 @@ class VideoSSLModel(nn.Module):
     def forward(self, x):
         return self.proj(self.encode(x))
 
-def train_video_ssl(pool):
-    sep("PHASE 1-C -- VIDEO SSL (SimCLR | MSW Transformer)")
-    ckpt = SSL_DIR / "video_ssl.pt"
-    if ckpt.exists():
-        print("  [SKIP] video_ssl.pt already cached — delete to retrain.")
+# ─────────────────────────────────────────────────────────
+# VIDEO FEATURE EXTRACTION (for unlabelled samples)
+# ─────────────────────────────────────────────────────────
+def extract_unlabelled_video_features(pool):
+    """Extract CLIP+DINOv2+ResNet50 sequence features for pool samples that
+    have a raw .mp4 file but no pre-extracted .npy sequences in VID_DIR.
+
+    Uses the same timm pipeline as video_stage3_extract_sequences.py.
+    Saves {sid}_clip_seq.npy, {sid}_dinov2_seq.npy, {sid}_resnet50_seq.npy
+    to VID_DIR so that CrossModalSSLDS can pick them up immediately after.
+    GPU memory is freed before returning.
+    """
+    try:
+        import timm, cv2
+        from torchvision import transforms as tvt
+        from PIL import Image as PILImage
+    except ImportError as e:
+        print(f"  [VID FEAT] Skipping extraction — missing dependency: {e}")
         return
-    set_seed(42)
-    ds      = VideoSSLDS(pool)
-    dl      = DataLoader(ds, batch_size=32, shuffle=True, drop_last=True)
-    m       = VideoSSLModel(proj_dim=SSL_PROJ_DIM).to(DEVICE)
-    opt     = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=1e-2)
-    sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
-    loss_fn = InfoNCELoss(SSL_TEMP)
-    print(f"  Pool: {len(pool)} | Batches/ep: {len(dl)} | Epochs: {SSL_EPOCHS}")
-    for ep in range(1, SSL_EPOCHS+1):
-        m.train(); ep_loss = 0.0
-        for v1, v2 in dl:
-            v1, v2 = v1.to(DEVICE), v2.to(DEVICE)
-            opt.zero_grad()
-            loss = loss_fn(m(v1), m(v2))
-            loss.backward(); opt.step()
-            ep_loss += loss.item()
-        sch.step()
-        if ep % 5 == 0 or ep == 1:
-            print(f"  Ep {ep:02d}/{SSL_EPOCHS} | InfoNCE: {ep_loss/len(dl):.4f}")
-    # Save encoder weights; exclude contrastive proj head but keep proj_in (input projection)
-    torch.save({k: v for k,v in m.state_dict().items() if not k.startswith('proj.')}, str(ckpt))
-    print(f"  [SAVED] {ckpt}")
+
+    N_FRAMES = 16
+    MODELS = [
+        ("clip",     "vit_base_patch32_clip_224"),
+        ("dinov2",   "vit_base_patch14_dinov2"),
+        ("resnet50", "resnet50"),
+    ]
+
+    # Identify samples that have a raw video file but no extracted features
+    missing = []
+    for _, row in pool.iterrows():
+        sid = (str(row.get('sample_id', ''))
+               .replace("::", "__").replace("/", "_").replace(".mp4", ""))
+        pc, _, _ = get_vid_paths(sid)
+        if pc is not None and pc.exists():
+            continue                          # features already extracted
+        vp = resolve_video_path(row)
+        if vp is not None:
+            missing.append((sid, vp))
+
+    if not missing:
+        print(f"  [VID FEAT] All {len(pool)} pool samples already have features — skipping extraction.")
+        return
+
+    print(f"  [VID FEAT] Extracting features for {len(missing)} samples (saving to VID_DIR)...")
+    VID_DIR.mkdir(exist_ok=True)
+
+    def _sample_frames(v_path):
+        cap = cv2.VideoCapture(str(v_path))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total < 1:
+            cap.release()
+            return []
+        idxs = set(np.linspace(0, total - 1, N_FRAMES, dtype=int).tolist())
+        frames_dict, fi = {}, 0
+        while fi <= max(idxs):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if fi in idxs:
+                frames_dict[fi] = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            fi += 1
+        cap.release()
+        ordered = [frames_dict[i] for i in sorted(idxs) if i in frames_dict]
+        return ordered
+
+    for tag, model_id in MODELS:
+        print(f"  [VID FEAT]   {model_id} ...")
+        try:
+            model = timm.create_model(model_id, pretrained=True, num_classes=0).to(DEVICE)
+            model.eval()
+            cfg = timm.data.resolve_model_data_config(model)
+            tf  = tvt.Compose([
+                tvt.Resize(cfg['input_size'][1:]),
+                tvt.CenterCrop(cfg['input_size'][1:]),
+                tvt.ToTensor(),
+                tvt.Normalize(mean=cfg['mean'], std=cfg['std']),
+            ])
+            done = 0
+            for sid, vp in missing:
+                out = VID_DIR / f"{sid}_{tag}_seq.npy"
+                if out.exists():
+                    done += 1
+                    continue
+                frames = _sample_frames(vp)
+                if len(frames) < N_FRAMES:
+                    continue
+                batch = torch.stack([tf(f) for f in frames]).to(DEVICE)
+                with torch.no_grad():
+                    feat = model(batch)
+                    if feat.dim() > 2:
+                        feat = feat.mean(dim=list(range(2, feat.dim())))
+                    feat = feat.cpu().numpy()       # [N_FRAMES, D]
+                np.save(str(out), feat)
+                done += 1
+            print(f"    → {done}/{len(missing)} samples saved.")
+        except Exception as e:
+            print(f"    [WARN] {model_id} extraction failed: {e}")
+        finally:
+            try:
+                del model
+            except NameError:
+                pass
+            torch.cuda.empty_cache()
+
+    complete = sum(
+        1 for sid, _ in missing
+        if all((VID_DIR / f"{sid}_{t}_seq.npy").exists() for t, _ in MODELS)
+    )
+    print(f"  [VID FEAT] Done — {complete}/{len(missing)} unlabelled samples now have all 3 feature files.")
+
 
 # ─────────────────────────────────────────────────────────
-# PHASE 1-D — CROSS-MODAL SSL  (Audio ↔ Video InfoNCE)
+# CROSS-MODAL SSL  (Audio ↔ Video ↔ Text InfoNCE)
 # ─────────────────────────────────────────────────────────
 CM_SSL_EPOCHS = 20
 CM_SSL_TEMP   = 0.07
@@ -527,7 +680,11 @@ class CrossModalSSLDS(Dataset):
         else:
             self.input_ids = self.attn_mask = None
         modalities = "audio+video+text" if tok is not None else "audio+video"
+        n_real_text = int((self.attn_mask.sum(1) > 2).sum()) if self.attn_mask is not None else 0
+        n_no_text   = len(self.df) - n_real_text
         print(f"  Cross-modal pool ({modalities}): {len(self.df)} samples")
+        print(f"    ├─ with real transcript (A↔T eligible) : {n_real_text}")
+        print(f"    └─ audio+video only (A↔V only)         : {n_no_text}")
 
     def __len__(self): return len(self.df)
 
@@ -553,136 +710,108 @@ class CrossModalSSLDS(Dataset):
 
 
 def train_cross_modal_ssl(pool):
-    """Phase 1-D: align audio and video encoders via cross-modal InfoNCE.
+    """Cross-modal SSL: align audio, video, and text encoders via InfoNCE.
 
-    Positive pair = (audio_i, video_i) from the SAME utterance.
-    Audio starts from WavLM pretrained (no per-modal SSL needed).
-    Video starts from video_ssl.pt (required — VideoSSLModel has no pretrained weights).
+    Positive pair = (audio_i, video_i) or (audio_i, text_i) from the SAME utterance.
+    Audio starts from WavLM pretrained weights.
+    Video starts from random init — aligned by cross-modal InfoNCE (no per-modal pre-training).
+    Text MARBERT backbone is frozen; only the projection head trains (avoids OOM on T4).
+    Loss = InfoNCE(A↔V) + 0.5 × InfoNCE(A↔T)
     """
-    sep("PHASE 1-D -- CROSS-MODAL SSL (Audio ↔ Video + Audio ↔ Text)")
+    sep("CROSS-MODAL SSL (Audio ↔ Video + Audio ↔ Text)")
     ckpt_a = SSL_DIR / "audio_cm_ssl.pt"
     ckpt_v = SSL_DIR / "video_cm_ssl.pt"
     ckpt_t = SSL_DIR / "text_cm_ssl.pt"
     if ckpt_a.exists() and ckpt_v.exists() and ckpt_t.exists():
         print("  [SKIP] Cross-modal SSL checkpoints cached — delete to retrain.")
         return
-    if not (SSL_DIR/"video_ssl.pt").exists():
-        print("  [SKIP] video_ssl.pt not found — run Phase 1-C first.")
-        return
     set_seed(42)
 
-    tok    = AutoTokenizer.from_pretrained(MODEL_NAME)
-    n_total = len(pool)
-    ds     = CrossModalSSLDS(pool, tok=tok)
-    n_excl = n_total - len(ds)
-    print(f"  Paired pool  (audio+video+text): {len(ds)} samples")
-    print(f"  Audio-only unlabelled           : {n_excl} samples  "
-          f"→ used via auxiliary SimCLR loss")
-    print(f"  Total audio  seen per epoch     : {len(pool)} samples")
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+    ds  = CrossModalSSLDS(pool, tok=tok)
+    print(f"  Pool supplied : {len(pool)} samples")
+    print(f"  Paired A+V+T  : {len(ds)} samples (pool filtered to those with all 3 modalities)")
     if len(ds) < 8:
         print(f"  [SKIP] Only {len(ds)} paired samples — need ≥8.")
         return
 
-    # Cross-modal DataLoader (paired samples only)
     dl = DataLoader(ds, batch_size=8, shuffle=True, num_workers=2,
                     pin_memory=True, drop_last=True)
 
-    # Audio-only DataLoader: full 5k+ pool — one batch interleaved per CM step
-    audio_ds  = AudioSSLDS(pool)          # 5285 samples
-    audio_dl  = DataLoader(audio_ds, batch_size=8, shuffle=True,
-                           num_workers=2, pin_memory=True, drop_last=True)
-    audio_iter = iter(audio_dl)
-
-    # Audio: WavLM pretrained, top-6 layers trainable
+    # Audio: WavLM pretrained, top-6 layers trainable (frozen layers 0-5 in AudioSSLModel.__init__)
     a_enc = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
     print("  Audio  : WavLM-Base-Plus pretrained")
 
-    # Video: video_ssl.pt (random init needs this warmup)
+    # Video: random init — cross-modal InfoNCE drives alignment from scratch
     v_enc = VideoSSLModel(proj_dim=SSL_PROJ_DIM).to(DEVICE)
-    v_enc.load_state_dict(torch.load(SSL_DIR/"video_ssl.pt", map_location=DEVICE), strict=False)
-    print("  Video  : video_ssl.pt")
+    print("  Video  : random init (aligned via cross-modal InfoNCE)")
 
-    # Text: MARBERT pretrained — backbone FROZEN, only projection head trains.
-    # Backpropagating through MARBERT alongside WavLM would OOM on T4.
+    # Text: MARBERT pretrained backbone FROZEN; only projection head trains
     t_enc = TextSSLModel(SSL_PROJ_DIM).to(DEVICE)
     for p in t_enc.bert.parameters(): p.requires_grad = False
     print("  Text   : MARBERT pretrained (backbone frozen, projection head trains)")
 
-    # Separate cross-modal projection heads
-    a_cm_proj = ProjectionHead(768 * 2, SSL_PROJ_DIM).to(DEVICE)   # audio → shared space
-    v_cm_proj = ProjectionHead(512,     SSL_PROJ_DIM).to(DEVICE)   # video → shared space
-    t_cm_proj  = ProjectionHead(768 * 3, SSL_PROJ_DIM).to(DEVICE)  # text  → shared space
-    a_aux_proj = ProjectionHead(768 * 2, SSL_PROJ_DIM).to(DEVICE)  # audio SimCLR (full pool)
+    # Per-modality cross-modal projection heads (each modality → shared 128-dim space)
+    a_cm_proj = ProjectionHead(768 * 2, SSL_PROJ_DIM).to(DEVICE)
+    v_cm_proj = ProjectionHead(512,     SSL_PROJ_DIM).to(DEVICE)
+    t_cm_proj = ProjectionHead(768 * 3, SSL_PROJ_DIM).to(DEVICE)
 
-    trainable_params = (
-        [p for p in a_enc.parameters() if p.requires_grad] +
-        list(v_enc.parameters()) +
-        list(t_cm_proj.parameters())   # t_enc backbone frozen; only head
-    )
     opt = torch.optim.AdamW([
         {'params': [p for p in a_enc.parameters() if p.requires_grad], 'lr': 2e-6},
         {'params': v_enc.parameters(),                                   'lr': 1e-5},
         {'params': list(a_cm_proj.parameters()) + list(v_cm_proj.parameters()) +
-                   list(t_cm_proj.parameters()) + list(a_aux_proj.parameters()), 'lr': 1e-3},
+                   list(t_cm_proj.parameters()),                         'lr': 1e-3},
     ], weight_decay=0.01)
     sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CM_SSL_EPOCHS)
     loss_fn = InfoNCELoss(CM_SSL_TEMP)
     scaler  = GradScaler()
     clip_params = (list(a_enc.parameters()) + list(v_enc.parameters()) +
                    list(a_cm_proj.parameters()) + list(v_cm_proj.parameters()) +
-                   list(t_cm_proj.parameters()) + list(a_aux_proj.parameters()))
+                   list(t_cm_proj.parameters()))
 
     print(f"  Epochs: {CM_SSL_EPOCHS} | Batch: 8 | "
-          f"Loss: InfoNCE(A↔V) + 0.5×InfoNCE(A↔T) + 0.2×SimCLR(A_aux {len(pool)} samples)")
+          f"A↔V: all A+V samples | A↔T: labelled-only (non-empty transcripts)")
     for ep in range(1, CM_SSL_EPOCHS + 1):
         a_enc.train(); v_enc.train()
-        a_cm_proj.train(); v_cm_proj.train(); t_cm_proj.train(); a_aux_proj.train()
-        ep_av = ep_at = ep_aux = 0.0
+        a_cm_proj.train(); v_cm_proj.train(); t_cm_proj.train()
+        ep_av = ep_at = 0.0; n_at_batches = 0
         for batch in dl:
-            aud, vid, ids, mask = batch[0].to(DEVICE), batch[1].to(DEVICE), \
-                                  batch[2].to(DEVICE), batch[3].to(DEVICE)
+            aud, vid, ids, mask = (batch[0].to(DEVICE), batch[1].to(DEVICE),
+                                   batch[2].to(DEVICE), batch[3].to(DEVICE))
             opt.zero_grad()
-
-            # ── Cross-modal step (paired 606 samples) ──
             with autocast("cuda"):
                 z_a  = a_cm_proj(a_enc.encode(aud))
                 z_v  = v_cm_proj(v_enc.encode(vid))
-                with torch.no_grad():                          # MARBERT backbone frozen
-                    t_feat = t_enc.encode(ids, mask)
-                z_t  = t_cm_proj(t_feat)
                 l_av = loss_fn(z_a, z_v)
-                l_at = loss_fn(z_a, z_t)
-                loss = l_av + 0.5 * l_at
+
+                # A↔T only for samples with a real transcript (more than CLS+SEP active)
+                has_text = mask.sum(1) > 2          # [B] bool
+                if has_text.sum() >= 2:
+                    with torch.no_grad():
+                        t_feat = t_enc.encode(ids[has_text], mask[has_text])
+                    z_t  = t_cm_proj(t_feat)
+                    l_at = loss_fn(z_a[has_text], z_t)
+                    loss = l_av + 0.5 * l_at
+                    ep_at += l_at.item(); n_at_batches += 1
+                else:
+                    loss = l_av
+
             scaler.scale(loss).backward()
-
-            # ── Audio auxiliary SimCLR (full 5k pool) ──
-            try:
-                a1, a2 = next(audio_iter)
-            except StopIteration:
-                audio_iter = iter(audio_dl)
-                a1, a2 = next(audio_iter)
-            a1, a2 = a1.to(DEVICE), a2.to(DEVICE)
-            with autocast("cuda"):
-                l_aux = loss_fn(a_aux_proj(a_enc.encode(a1)),
-                                a_aux_proj(a_enc.encode(a2)))
-            scaler.scale(0.2 * l_aux).backward()
-
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
             scaler.step(opt); scaler.update()
-            ep_av += l_av.item(); ep_at += l_at.item(); ep_aux += l_aux.item()
+            ep_av += l_av.item()
         sch.step()
         if ep % 5 == 0 or ep == 1:
+            at_str = f"{ep_at/n_at_batches:.4f}" if n_at_batches else "n/a"
             print(f"  Ep {ep:02d}/{CM_SSL_EPOCHS} | "
-                  f"A↔V: {ep_av/len(dl):.4f}  "
-                  f"A↔T: {ep_at/len(dl):.4f}  "
-                  f"A_aux: {ep_aux/len(dl):.4f}")
+                  f"A↔V: {ep_av/len(dl):.4f}  A↔T: {at_str} ({n_at_batches} batches)")
 
     torch.save({'backbone': a_enc.backbone.state_dict(), 'lw': a_enc.lw.data}, str(ckpt_a))
     torch.save({k: v for k,v in v_enc.state_dict().items() if not k.startswith('proj.')}, str(ckpt_v))
     torch.save({k: v for k,v in t_enc.state_dict().items() if 'bert' in k}, str(ckpt_t))
     print(f"  [SAVED] {ckpt_a.name}, {ckpt_v.name}, {ckpt_t.name}")
-    del a_enc, v_enc, t_enc, a_cm_proj, v_cm_proj, t_cm_proj, a_aux_proj; torch.cuda.empty_cache()
+    del a_enc, v_enc, t_enc, a_cm_proj, v_cm_proj, t_cm_proj; torch.cuda.empty_cache()
 
 
 # ─────────────────────────────────────────────────────────
@@ -829,9 +958,11 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
         m = VideoFTModel(SSL_PROJ_DIM).to(DEVICE)
         if use_ssl:
             cm_ckpt = SSL_DIR / "video_cm_ssl.pt"
-            ckpt_path = cm_ckpt if cm_ckpt.exists() else SSL_DIR/"video_ssl.pt"
-            m.backbone.load_state_dict(torch.load(str(ckpt_path), map_location=DEVICE), strict=False)
-            print(f"  [SSL] video encoder: {'cross-modal' if cm_ckpt.exists() else 'per-modal'}")
+            if cm_ckpt.exists():
+                m.backbone.load_state_dict(torch.load(str(cm_ckpt), map_location=DEVICE), strict=False)
+                print("  [SSL] video encoder: cross-modal (video_cm_ssl.pt)")
+            else:
+                print("  [SSL] video encoder: random init (no cross-modal checkpoint found)")
         lr_bb, lr_hd = 3e-5, 1e-3
         bs = 32
 
@@ -987,38 +1118,43 @@ if __name__ == "__main__":
     sep(f"CONTRASTIVE PIPELINE v2 | Device: {DEVICE}")
     tr, va, te = load_splits()
 
-    # ── Build per-modality SSL pools ──────────────────────
-    # Each modality's SSL phase only requires its own data to be present.
-    # Unlabelled data expands the pool substantially (up to 5k+ segments)
-    # without any annotation cost.
-    unlabelled_df  = load_unlabelled()
+    # ── Build SSL pool ────────────────────────────────────
+    # SSL is unsupervised so we use train+val (test kept out to avoid any leakage).
+    # Unlabelled audio discovered from the Colab audio directory expands the pool;
+    # CrossModalSSLDS automatically filters to samples that have all 3 modalities
+    # (audio + video features + transcript) — unlabelled audio-only samples that
+    # lack video features or transcripts are reported but not forced in.
     labelled_pool  = pd.concat([tr, va]).reset_index(drop=True)
+    known_relpaths = set(labelled_pool['audio_relpath'].dropna().tolist())
+    unlabelled_df  = load_unlabelled(known_relpaths)
 
     if len(unlabelled_df) > 0:
-        u_video = unlabelled_df[unlabelled_df.apply(_ok_video, axis=1)]
-        video_pool = pd.concat([labelled_pool, u_video]).reset_index(drop=True)
-        # Cross-modal SSL needs audio+video pairs; unlabelled has audio-only (no video features).
-        # CrossModalSSLDS will report the exact paired count at runtime.
-        cm_pool = pd.concat([labelled_pool, unlabelled_df]).reset_index(drop=True)
+        ssl_pool = pd.concat([labelled_pool, unlabelled_df]).reset_index(drop=True)
         sep("SSL POOL SIZES")
-        print(f"  Labelled  (train+val)         : {len(labelled_pool)}")
-        print(f"  Unlabelled (audio-only, no video features): {len(unlabelled_df)}")
-        print(f"  Video SSL pool                : {len(video_pool)}")
-        print(f"  CM SSL input pool             : {len(cm_pool)}  "
-              f"(cross-modal DS will filter to paired samples)")
+        print(f"  Labelled   (train+val)  : {len(labelled_pool)}")
+        print(f"  Unlabelled (audio scan) : {len(unlabelled_df)}")
+        print(f"  Total SSL input pool    : {len(ssl_pool)}  "
+              f"(cross-modal DS will filter to samples with A+V+T)")
     else:
-        video_pool = cm_pool = labelled_pool
+        ssl_pool = labelled_pool
         print(f"  SSL pool: {len(labelled_pool)} labelled samples (train + val)")
 
-    # ── PHASE 1-C: Video SSL (necessary — VideoSSLModel has no pretrained weights) ──
-    train_video_ssl(video_pool)
+    # ── PHASE 1-A: Extract video features for unlabelled samples ─────────────
+    # Unlabelled segments that have raw .mp4 files get CLIP+DINOv2+ResNet50
+    # features extracted here (same timm pipeline as video_stage3_extract_sequences.py).
+    # After this step they can join the A↔V cross-modal SSL pool.
+    # GPU is freed before loading audio/text models.
+    if len(unlabelled_df) > 0:
+        extract_unlabelled_video_features(ssl_pool)
 
-    # ── PHASE 1-D: Cross-modal SSL (WavLM pretrained ↔ video SSL) ────────────────
-    # Audio and Text SSL removed: pretrained WavLM/MARBERT already encode Arabic
-    # speech/text well; per-modal SimCLR on ~600 samples degraded representations.
-    train_cross_modal_ssl(cm_pool)
+    # ── PHASE 1-B: Cross-modal SSL ───────────────────────
+    # Per-modal SSL removed: WavLM/MARBERT are already pretrained on large corpora;
+    # individual SimCLR on ~600-5k samples degraded those representations.
+    # VideoSSLModel starts from random init and is aligned to audio+text via
+    # cross-modal InfoNCE — no separate per-modal video SSL warmup needed.
+    train_cross_modal_ssl(ssl_pool)
 
-    sep("PHASE 1 COMPLETE -- Video SSL + Cross-modal SSL done.")
+    sep("PHASE 1 COMPLETE -- Cross-modal SSL done.")
 
     # ── PHASE 2: Supervised fine-tuning ablation ──────────
     run_ablation(tr, va, te)
