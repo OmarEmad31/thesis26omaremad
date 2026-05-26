@@ -153,12 +153,19 @@ def resolve_video_path(row):
             return None
     folder = str(row.get('folder', ''))
 
+    # Mirror the same comprehensive base list used by resolve_audio_path so that
+    # any folder structure that yields a valid audio path also yields a valid video path.
     bases = [
         AUDIO_BASE,
         Path("/content/audio/Thesis Project/dataset/Final Modalink Dataset MERGED"),
+        Path("/content/audio/Thesis Project/data/raw"),
+        Path("/content/audio/data/processed"),
         Path("/content/audio"),
+        Path("/content/audio/Thesis_Audio_Full"),
         Path("/content/Thesis_Audio_Full"),
+        Path("/content/drive/MyDrive/Thesis_Audio_Full"),
         Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED"),
+        Path("/content/drive/MyDrive/Thesis Project/data/raw"),
         Path("/content/drive/MyDrive/Thesis Project"),
         Path("/content/drive/MyDrive"),
     ]
@@ -570,18 +577,24 @@ def extract_unlabelled_video_features(pool):
 
     # Identify samples that have a raw video file but no extracted features
     missing = []
+    n_already = 0
+    n_no_mp4  = 0
     for _, row in pool.iterrows():
         sid = (str(row.get('sample_id', ''))
                .replace("::", "__").replace("/", "_").replace(".mp4", ""))
         pc, _, _ = get_vid_paths(sid)
         if pc is not None and pc.exists():
+            n_already += 1
             continue                          # features already extracted
         vp = resolve_video_path(row)
         if vp is not None:
             missing.append((sid, vp))
+        else:
+            n_no_mp4 += 1
 
+    print(f"  [VID FEAT] Pool: {len(pool)} | already have npy: {n_already} | "
+          f"mp4 found (need extraction): {len(missing)} | no mp4 found: {n_no_mp4}")
     if not missing:
-        print(f"  [VID FEAT] All {len(pool)} pool samples already have features — skipping extraction.")
         return
 
     print(f"  [VID FEAT] Extracting features for {len(missing)} samples (saving to VID_DIR)...")
