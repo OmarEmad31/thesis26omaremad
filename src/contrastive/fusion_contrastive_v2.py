@@ -672,18 +672,26 @@ CM_SSL_EPOCHS = 20
 CM_SSL_TEMP   = 0.07
 
 class CrossModalSSLDS(Dataset):
-    """Loads paired (audio, video, text) for three-way cross-modal InfoNCE.
-    Filters to samples that have audio AND video features.
-    Text (transcript) is pre-tokenised in __init__ if a tokenizer is supplied.
+    """Unified SSL dataset — all pool samples included.
+
+    All samples with audio contribute to audio SimCLR (two WavLM dropout views).
+    Samples that also have video features contribute to A↔V InfoNCE.
+    Samples with non-empty transcripts contribute to A↔T InfoNCE.
+    A has_video flag is returned per item so the training loop can gate each loss.
     """
     def __init__(self, df, tok=None, sr=16000, maxlen=80000):
         self.sr = sr; self.maxlen = maxlen
-        def has_av(row):
+        # Include every sample that has audio — no video requirement
+        self.df = df[df.apply(lambda r: resolve_audio_path(r) is not None,
+                              axis=1)].reset_index(drop=True)
+        # Precompute per-sample video availability
+        hv = []
+        for _, row in self.df.iterrows():
             sid = str(row.get('sample_id','')).replace("::","__").replace("/","_").replace(".mp4","")
             pc, _, _ = get_vid_paths(sid)
-            return resolve_audio_path(row) is not None and pc is not None and pc.exists()
-        self.df = df[df.apply(has_av, axis=1)].reset_index(drop=True)
-        # Pre-tokenise all transcripts once (fast, in-memory)
+            hv.append(pc is not None and pc.exists())
+        self.has_video = hv
+        # Pre-tokenise all transcripts once
         if tok is not None:
             texts = [clean(str(t)) for t in self.df['transcript'].fillna('').tolist()]
             enc = tok(texts, truncation=True, padding='max_length',
@@ -692,12 +700,12 @@ class CrossModalSSLDS(Dataset):
             self.attn_mask = enc['attention_mask']
         else:
             self.input_ids = self.attn_mask = None
-        modalities = "audio+video+text" if tok is not None else "audio+video"
-        n_real_text = int((self.attn_mask.sum(1) > 2).sum()) if self.attn_mask is not None else 0
-        n_no_text   = len(self.df) - n_real_text
-        print(f"  Cross-modal pool ({modalities}): {len(self.df)} samples")
-        print(f"    ├─ with real transcript (A↔T eligible) : {n_real_text}")
-        print(f"    └─ audio+video only (A↔V only)         : {n_no_text}")
+        n_av = sum(hv)
+        n_at = int((self.attn_mask.sum(1) > 2).sum()) if self.attn_mask is not None else 0
+        print(f"  Unified SSL pool: {len(self.df)} samples")
+        print(f"    ├─ audio+video+text (A↔V + A↔T) : {min(n_av, n_at)}")
+        print(f"    ├─ audio+video only (A↔V)        : {n_av}")
+        print(f"    └─ audio only (SimCLR)            : {len(self.df) - n_av}")
 
     def __len__(self): return len(self.df)
 
@@ -710,28 +718,34 @@ class CrossModalSSLDS(Dataset):
             y, _ = librosa.effects.trim(y, top_db=25)
             y = y[:self.maxlen] if len(y) > self.maxlen else np.pad(y, (0, self.maxlen - len(y)))
         except: y = np.zeros(self.maxlen, dtype=np.float32)
-        # Video
+        # Video — zeros when no features available
         sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-        try:
-            pc, pd_, pr = get_vid_paths(sid)
-            seq = np.concatenate([np.load(pc), np.load(pd_), np.load(pr)], -1).astype(np.float32)
-        except: seq = np.zeros((16, 3584), dtype=np.float32)
-        out = (torch.tensor(y, dtype=torch.float32), torch.tensor(seq, dtype=torch.float32))
+        if self.has_video[i]:
+            try:
+                pc, pd_, pr = get_vid_paths(sid)
+                seq = np.concatenate([np.load(pc), np.load(pd_), np.load(pr)], -1).astype(np.float32)
+            except: seq = np.zeros((16, 3584), dtype=np.float32)
+        else:
+            seq = np.zeros((16, 3584), dtype=np.float32)
+        has_vid = torch.tensor(self.has_video[i], dtype=torch.bool)
+        aud_t   = torch.tensor(y,   dtype=torch.float32)
+        vid_t   = torch.tensor(seq, dtype=torch.float32)
         if self.input_ids is not None:
-            out = out + (self.input_ids[i], self.attn_mask[i])
-        return out
+            return aud_t, vid_t, self.input_ids[i], self.attn_mask[i], has_vid
+        dummy = torch.zeros(64, dtype=torch.long)
+        return aud_t, vid_t, dummy, dummy, has_vid
 
 
 def train_cross_modal_ssl(pool):
-    """Cross-modal SSL: align audio, video, and text encoders via InfoNCE.
+    """Unified SSL: audio SimCLR on all samples + cross-modal A↔V/A↔T on paired subsets.
 
-    Positive pair = (audio_i, video_i) or (audio_i, text_i) from the SAME utterance.
-    Audio starts from WavLM pretrained weights.
-    Video starts from random init — aligned by cross-modal InfoNCE (no per-modal pre-training).
-    Text MARBERT backbone is frozen; only the projection head trains (avoids OOM on T4).
-    Loss = InfoNCE(A↔V) + 0.5 × InfoNCE(A↔T)
+    All pool samples contribute audio SimCLR (two WavLM dropout views → InfoNCE).
+    The ~618 samples with video additionally contribute A↔V InfoNCE.
+    The ~606 with non-empty transcripts additionally contribute A↔T InfoNCE.
+    Loss = InfoNCE(A↔V) + 0.5*InfoNCE(A↔T) + 0.3*SimCLR(audio)
+    Audio starts from WavLM pretrained; video from random init; text backbone frozen.
     """
-    sep("CROSS-MODAL SSL (Audio ↔ Video + Audio ↔ Text)")
+    sep("CROSS-MODAL SSL (SimCLR-audio + A↔V + A↔T) — full pool")
     ckpt_a = SSL_DIR / "audio_cm_ssl.pt"
     ckpt_v = SSL_DIR / "video_cm_ssl.pt"
     ckpt_t = SSL_DIR / "text_cm_ssl.pt"
@@ -742,89 +756,97 @@ def train_cross_modal_ssl(pool):
 
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
     ds  = CrossModalSSLDS(pool, tok=tok)
-    print(f"  Pool supplied : {len(pool)} samples")
-    print(f"  Paired A+V+T  : {len(ds)} samples (pool filtered to those with all 3 modalities)")
+    print(f"  Pool supplied : {len(pool)} | In dataset (audio OK): {len(ds)}")
     if len(ds) < 8:
-        print(f"  [SKIP] Only {len(ds)} paired samples — need ≥8.")
+        print(f"  [SKIP] Only {len(ds)} samples — need ≥8.")
         return
 
     dl = DataLoader(ds, batch_size=8, shuffle=True, num_workers=2,
                     pin_memory=True, drop_last=True)
 
-    # Audio: WavLM pretrained, top-6 layers trainable (frozen layers 0-5 in AudioSSLModel.__init__)
     a_enc = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
     print("  Audio  : WavLM-Base-Plus pretrained")
 
-    # Video: random init — cross-modal InfoNCE drives alignment from scratch
     v_enc = VideoSSLModel(proj_dim=SSL_PROJ_DIM).to(DEVICE)
     print("  Video  : random init (aligned via cross-modal InfoNCE)")
 
-    # Text: MARBERT pretrained backbone FROZEN; only projection head trains
     t_enc = TextSSLModel(SSL_PROJ_DIM).to(DEVICE)
     for p in t_enc.bert.parameters(): p.requires_grad = False
     print("  Text   : MARBERT pretrained (backbone frozen, projection head trains)")
 
-    # Per-modality cross-modal projection heads (each modality → shared 128-dim space)
-    a_cm_proj = ProjectionHead(768 * 2, SSL_PROJ_DIM).to(DEVICE)
-    v_cm_proj = ProjectionHead(512,     SSL_PROJ_DIM).to(DEVICE)
-    t_cm_proj = ProjectionHead(768 * 3, SSL_PROJ_DIM).to(DEVICE)
+    # Cross-modal projection heads
+    a_cm_proj     = ProjectionHead(768 * 2, SSL_PROJ_DIM).to(DEVICE)
+    v_cm_proj     = ProjectionHead(512,     SSL_PROJ_DIM).to(DEVICE)
+    t_cm_proj     = ProjectionHead(768 * 3, SSL_PROJ_DIM).to(DEVICE)
+    # Separate head for audio SimCLR so its gradient doesn't mix with cross-modal heads
+    a_simclr_proj = ProjectionHead(768 * 2, SSL_PROJ_DIM).to(DEVICE)
 
+    all_proj_params = (list(a_cm_proj.parameters()) + list(v_cm_proj.parameters()) +
+                       list(t_cm_proj.parameters()) + list(a_simclr_proj.parameters()))
     opt = torch.optim.AdamW([
         {'params': [p for p in a_enc.parameters() if p.requires_grad], 'lr': 2e-6},
         {'params': v_enc.parameters(),                                   'lr': 1e-5},
-        {'params': list(a_cm_proj.parameters()) + list(v_cm_proj.parameters()) +
-                   list(t_cm_proj.parameters()),                         'lr': 1e-3},
+        {'params': all_proj_params,                                      'lr': 1e-3},
     ], weight_decay=0.01)
-    sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CM_SSL_EPOCHS)
-    loss_fn = InfoNCELoss(CM_SSL_TEMP)
-    scaler  = GradScaler()
-    clip_params = (list(a_enc.parameters()) + list(v_enc.parameters()) +
-                   list(a_cm_proj.parameters()) + list(v_cm_proj.parameters()) +
-                   list(t_cm_proj.parameters()))
+    sch      = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CM_SSL_EPOCHS)
+    loss_fn  = InfoNCELoss(CM_SSL_TEMP)
+    scaler   = GradScaler()
+    clip_params = (list(a_enc.parameters()) + list(v_enc.parameters()) + all_proj_params)
 
     print(f"  Epochs: {CM_SSL_EPOCHS} | Batch: 8 | "
-          f"A↔V: all A+V samples | A↔T: labelled-only (non-empty transcripts)")
+          f"SimCLR: all {len(ds)} | A↔V: ~618 | A↔T: ~606")
     for ep in range(1, CM_SSL_EPOCHS + 1):
         a_enc.train(); v_enc.train()
-        a_cm_proj.train(); v_cm_proj.train(); t_cm_proj.train()
-        ep_av = ep_at = 0.0; n_at_batches = 0
+        a_cm_proj.train(); v_cm_proj.train(); t_cm_proj.train(); a_simclr_proj.train()
+        ep_simclr = ep_av = ep_at = 0.0
+        n_av_batches = n_at_batches = 0
         for batch in dl:
-            aud, vid, ids, mask = (batch[0].to(DEVICE), batch[1].to(DEVICE),
-                                   batch[2].to(DEVICE), batch[3].to(DEVICE))
+            aud, vid, ids, mask, has_vid = [b.to(DEVICE) for b in batch]
             opt.zero_grad()
             with autocast("cuda"):
-                z_a  = a_cm_proj(a_enc.encode(aud))
-                z_v  = v_cm_proj(v_enc.encode(vid))
-                l_av = loss_fn(z_a, z_v)
+                # Two WavLM forward passes → two dropout views for audio SimCLR (all samples)
+                a_feat1 = a_enc.encode(aud)
+                a_feat2 = a_enc.encode(aud)
+                l_simclr = loss_fn(a_simclr_proj(a_feat1), a_simclr_proj(a_feat2))
+                loss = 0.3 * l_simclr
+                ep_simclr += l_simclr.item()
 
-                # A↔T only for samples with a real transcript (more than CLS+SEP active)
-                has_text = mask.sum(1) > 2          # [B] bool
+                # A↔V — only for samples with video features
+                if has_vid.sum() >= 2:
+                    z_a_v = a_cm_proj(a_feat1[has_vid])
+                    z_v   = v_cm_proj(v_enc.encode(vid[has_vid]))
+                    l_av  = loss_fn(z_a_v, z_v)
+                    loss  = loss + l_av
+                    ep_av += l_av.item(); n_av_batches += 1
+
+                # A↔T — only for samples with a real transcript
+                has_text = mask.sum(1) > 2
                 if has_text.sum() >= 2:
                     with torch.no_grad():
                         t_feat = t_enc.encode(ids[has_text], mask[has_text])
-                    z_t  = t_cm_proj(t_feat)
-                    l_at = loss_fn(z_a[has_text], z_t)
-                    loss = l_av + 0.5 * l_at
+                    z_a_t = a_cm_proj(a_feat1[has_text])
+                    z_t   = t_cm_proj(t_feat)
+                    l_at  = loss_fn(z_a_t, z_t)
+                    loss  = loss + 0.5 * l_at
                     ep_at += l_at.item(); n_at_batches += 1
-                else:
-                    loss = l_av
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
             scaler.step(opt); scaler.update()
-            ep_av += l_av.item()
         sch.step()
         if ep % 5 == 0 or ep == 1:
+            av_str = f"{ep_av/n_av_batches:.4f}" if n_av_batches else "n/a"
             at_str = f"{ep_at/n_at_batches:.4f}" if n_at_batches else "n/a"
             print(f"  Ep {ep:02d}/{CM_SSL_EPOCHS} | "
-                  f"A↔V: {ep_av/len(dl):.4f}  A↔T: {at_str} ({n_at_batches} batches)")
+                  f"SimCLR: {ep_simclr/len(dl):.4f}  A↔V: {av_str}  A↔T: {at_str}")
 
     torch.save({'backbone': a_enc.backbone.state_dict(), 'lw': a_enc.lw.data}, str(ckpt_a))
     torch.save({k: v for k,v in v_enc.state_dict().items() if not k.startswith('proj.')}, str(ckpt_v))
     torch.save({k: v for k,v in t_enc.state_dict().items() if 'bert' in k}, str(ckpt_t))
     print(f"  [SAVED] {ckpt_a.name}, {ckpt_v.name}, {ckpt_t.name}")
-    del a_enc, v_enc, t_enc, a_cm_proj, v_cm_proj, t_cm_proj; torch.cuda.empty_cache()
+    del a_enc, v_enc, t_enc, a_cm_proj, v_cm_proj, t_cm_proj, a_simclr_proj
+    torch.cuda.empty_cache()
 
 
 # ─────────────────────────────────────────────────────────
