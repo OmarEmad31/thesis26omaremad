@@ -110,10 +110,11 @@ CLASSES = list(LID.keys())
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 
 # SSL hyper-parameters
-SSL_EPOCHS   = 40
-SSL_TEMP     = 0.07
-SSL_PROJ_DIM = 128
-GRAD_ACC     = 4      # effective audio batch = 8 * 4 = 32
+SSL_EPOCHS        = 40
+SSL_TEMP          = 0.07
+SSL_PROJ_DIM      = 128
+GRAD_ACC          = 4      # effective audio batch = 8 * 4 = 32
+SSL_UNLABELLED_CAP = 610   # max unlabelled samples drawn from all_segments.xlsx
 
 def set_seed(s=42):
     random.seed(s); np.random.seed(s)
@@ -317,8 +318,12 @@ def load_unlabelled(known_sample_ids=None):
                             & (df_unl['audio_relpath'].str.strip() != '')
                             ].reset_index(drop=True)
             n_tx = (df_unl['transcript'].str.strip() != '').sum()
-            print(f"  Unlabelled pool: {len(df_unl)} segments "
+            print(f"  Unlabelled pool (full): {len(df_unl)} segments "
                   f"({n_tx} with transcript) from {xlsx.name}")
+            if len(df_unl) > SSL_UNLABELLED_CAP:
+                df_unl = df_unl.sample(SSL_UNLABELLED_CAP, random_state=42)
+                print(f"  Unlabelled pool (capped): {SSL_UNLABELLED_CAP} samples "
+                      f"(set SSL_UNLABELLED_CAP to use more)")
             return df_unl[['sample_id', 'folder', 'audio_relpath',
                            'video_relpath', 'transcript']].reset_index(drop=True)
         except Exception as e:
