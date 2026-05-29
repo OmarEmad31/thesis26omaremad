@@ -41,23 +41,49 @@ SSL_DIR    = Path("/content/ssl_pretrained")
 for d in [SAVE_DIR, SSL_DIR]: d.mkdir(exist_ok=True)
 
 def auto_detect():
+    import zipfile as _zf
     print("  Smart-detecting data locations...")
-    v_dir, a_dir = None, None
-    
-    # 1. Search /content first (fast)
-    for p in Path("/content").rglob("*_clip_seq.npy"):
-        if "drive" not in str(p):
-            v_dir = p.parent
-            break
-            
-    # 2. Fallback to Drive
-    if not v_dir:
+
+    # 1. Try to extract video_sequences_v1.zip to local /content/ (fast SSD)
+    #    This ensures VID_DIR has features for all segments including unlabelled.
+    zip_candidates = [
+        Path("/content/drive/MyDrive/Thesis Project/data/processed/features/video_sequences_v1.zip"),
+        Path("/content/drive/MyDrive/Thesis Project/data/processed/video_sequences_v1.zip"),
+        Path("/content/drive/MyDrive/Thesis Project/video_sequences_v1.zip"),
+    ]
+    local_vid = Path("/content/video_sequences_v1")
+    v_dir = None
+    for zip_path in zip_candidates:
+        if not zip_path.exists():
+            continue
+        with _zf.ZipFile(zip_path) as zf:
+            zip_npy = sum(1 for n in zf.namelist() if n.endswith("_clip_seq.npy"))
+        existing = len(list(local_vid.glob("*_clip_seq.npy"))) if local_vid.exists() else 0
+        if existing < zip_npy:
+            print(f"  [ZIP] Extracting {zip_path.name} ({zip_npy} clip_seq files → {local_vid}) ...")
+            local_vid.mkdir(exist_ok=True)
+            with _zf.ZipFile(zip_path) as zf:
+                zf.extractall(local_vid.parent)
+            print(f"  [ZIP] Done — {len(list(local_vid.glob('*_clip_seq.npy')))} clip_seq files now in {local_vid}")
+        else:
+            print(f"  [ZIP] {local_vid.name} already extracted ({existing} clip_seq files).")
+        v_dir = local_vid
+        break
+
+    # 2. Fallback: search /content for already-extracted npy files
+    if v_dir is None:
+        for p in Path("/content").rglob("*_clip_seq.npy"):
+            if "drive" not in str(p):
+                v_dir = p.parent
+                break
+
+    # 3. Final fallback: Drive path
+    if v_dir is None:
         v_dir = Path("/content/drive/MyDrive/Thesis Project/data/processed/features/video_sequences_v1")
-        if not v_dir.exists(): v_dir = Path("/content/drive/MyDrive/Thesis Project/data/processed/features")
-        
-    # 3. Audio
+        if not v_dir.exists():
+            v_dir = Path("/content/drive/MyDrive/Thesis Project/data/processed/features")
+
     a_dir = Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED")
-    
     return v_dir, a_dir
 
 VID_DIR, AUDIO_BASE = auto_detect()
@@ -249,76 +275,86 @@ def load_splits():
     return tr_f, va_f, te_f
 
 
-def load_unlabelled(known_audio_relpaths=None):
-    """Find unlabelled audio segments for SSL pre-training (no emotion label needed).
+def load_unlabelled(known_sample_ids=None):
+    """Load unlabelled segments for SSL pre-training.
 
-    Steps:
-      1. Check for an explicit unlabelled.csv (fastest, user-supplied).
-      2. Auto-scan known Colab audio directories for all .wav files and exclude
-         any already in the labelled splits (identified by audio_relpath).
-
-    WAV files must live under a path of the form:
-        .../{folder}/audios/{speaker}/{file}.wav
-    which is the standard structure of the Final Modalink Dataset.
+    Primary source: all_segments.xlsx at AUDIO_BASE.
+      - Contains all ~5471 segments (annotated + unlabelled) with transcripts.
+      - Rows not in known_sample_ids are returned as the unlabelled pool.
+    Fallback: audio-directory scan (no transcripts, as before).
 
     Args:
-        known_audio_relpaths: set of 'audios/{speaker}/{file}.wav' strings that
-            belong to the labelled pool — these are excluded from the result.
+        known_sample_ids: set of sample_id strings for ALL labelled splits
+            (train + val + test) — excluded from unlabelled pool to prevent leakage.
     """
-    # 1. Check for an explicit CSV first
-    candidates = [
-        SPLIT_DIR.parent / "unlabelled.csv",
-        REPO / "data" / "processed" / "unlabelled.csv",
-        REPO / "annotations" / "unlabelled.csv",
-        Path("/content/drive/MyDrive/Thesis Project/data/processed/unlabelled.csv"),
-        Path("/content/unlabelled.csv"),
+    known = set(known_sample_ids or [])
+
+    # ── Primary: all_segments.xlsx ──────────────────────────────────────────
+    xlsx_candidates = [
+        AUDIO_BASE / "all_segments.xlsx",
+        Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED/all_segments.xlsx"),
     ]
-    for p in candidates:
-        if p.exists():
-            df = pd.read_csv(p)
-            for col in ('sample_id', 'folder', 'audio_relpath', 'transcript'):
-                if col not in df.columns:
-                    df[col] = ''
-            print(f"  Unlabelled pool loaded: {len(df)} samples from {p.name}")
-            return df.reset_index(drop=True)
+    for xlsx in xlsx_candidates:
+        if not xlsx.exists():
+            continue
+        print(f"  [INFO] Loading unlabelled from {xlsx.name} ...")
+        try:
+            df_all = pd.read_excel(xlsx, engine='openpyxl')
+            # Normalise to standard column names used throughout the pipeline
+            df_all = df_all.rename(columns={
+                'Folder':     'folder',
+                'audio_file': 'audio_relpath',
+                'video_file': 'video_relpath',
+            })
+            df_all['sample_id'] = (df_all['folder'].astype(str)
+                                   + '::'
+                                   + df_all['video_relpath'].astype(str))
+            df_all['transcript'] = df_all['transcript'].fillna('')
+            # Drop rows already in any labelled split (train / val / test)
+            df_unl = df_all[~df_all['sample_id'].isin(known)].copy()
+            # Keep only rows that have an audio path
+            df_unl = df_unl[df_unl['audio_relpath'].notna()
+                            & (df_unl['audio_relpath'].str.strip() != '')
+                            ].reset_index(drop=True)
+            n_tx = (df_unl['transcript'].str.strip() != '').sum()
+            print(f"  Unlabelled pool: {len(df_unl)} segments "
+                  f"({n_tx} with transcript) from {xlsx.name}")
+            return df_unl[['sample_id', 'folder', 'audio_relpath',
+                           'video_relpath', 'transcript']].reset_index(drop=True)
+        except Exception as e:
+            print(f"  [WARN] Could not read {xlsx.name}: {e}")
 
-    # 2. Auto-discover WAV files in known Colab audio roots
-    print("  [INFO] No unlabelled CSV found — scanning audio directories for unlabelled segments...")
-    known = set(known_audio_relpaths or [])
-
-    # Directories to scan (order matters: local /content preferred over Drive)
+    # ── Fallback: audio-directory scan (no transcripts) ─────────────────────
+    print("  [INFO] all_segments.xlsx not found — scanning audio directories ...")
     audio_roots = [
         Path("/content/audio"),
         Path("/content/Thesis_Audio_Full"),
-        Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED"),
+        AUDIO_BASE,
     ]
-
-    rows = []
-    seen = set()
+    # Build a relpath-based known set for the audio-scan deduplication
+    known_relpaths: set = set()
+    rows: list = []
+    seen: set = set()
     for base in audio_roots:
         if not base.exists():
             continue
         for wav in base.rglob("*.wav"):
             try:
                 parts = wav.parts
-                # Find the 'audios' directory in the path; the folder above it is the video folder
                 for i, part in enumerate(parts):
                     if part == "audios" and i >= 1:
-                        folder       = parts[i - 1]
-                        speaker      = parts[i + 1] if i + 1 < len(parts) else ""
+                        folder        = parts[i - 1]
+                        speaker       = parts[i + 1] if i + 1 < len(parts) else ""
                         audio_relpath = f"audios/{speaker}/{wav.name}"
-                        # Skip if already labelled or already seen from another root
-                        if audio_relpath in known or audio_relpath in seen:
+                        sid           = f"{folder}::videos/{speaker}/{wav.stem}.mp4"
+                        if sid in known or audio_relpath in seen:
                             break
                         seen.add(audio_relpath)
                         video_relpath = audio_relpath.replace('audios/', 'videos/').replace('.wav', '.mp4')
-                        rows.append({
-                            'sample_id'   : f"{folder}::{video_relpath}",
-                            'folder'      : folder,
-                            'audio_relpath': audio_relpath,
-                            'video_relpath': video_relpath,
-                            'transcript'  : '',
-                        })
+                        rows.append({'sample_id': sid, 'folder': folder,
+                                     'audio_relpath': audio_relpath,
+                                     'video_relpath': video_relpath,
+                                     'transcript': ''})
                         break
             except Exception:
                 pass
@@ -1154,31 +1190,28 @@ if __name__ == "__main__":
     tr, va, te = load_splits()
 
     # ── Build SSL pool ────────────────────────────────────
-    # SSL is unsupervised so we use train+val (test kept out to avoid any leakage).
-    # Unlabelled audio discovered from the Colab audio directory expands the pool;
-    # CrossModalSSLDS automatically filters to samples that have all 3 modalities
-    # (audio + video features + transcript) — unlabelled audio-only samples that
-    # lack video features or transcripts are reported but not forced in.
-    labelled_pool  = pd.concat([tr, va]).reset_index(drop=True)
-    known_relpaths = set(labelled_pool['audio_relpath'].dropna().tolist())
-    unlabelled_df  = load_unlabelled(known_relpaths)
+    # Labelled pool = train + val only (test excluded from SSL to prevent leakage).
+    # All three split IDs are passed to load_unlabelled so test samples are also
+    # excluded from the unlabelled pool.
+    labelled_pool = pd.concat([tr, va]).reset_index(drop=True)
+    all_split_ids = set(
+        pd.concat([tr, va, te])['sample_id'].dropna().tolist()
+    )
+    unlabelled_df = load_unlabelled(all_split_ids)
 
     if len(unlabelled_df) > 0:
         ssl_pool = pd.concat([labelled_pool, unlabelled_df]).reset_index(drop=True)
         sep("SSL POOL SIZES")
-        print(f"  Labelled   (train+val)  : {len(labelled_pool)}")
-        print(f"  Unlabelled (audio scan) : {len(unlabelled_df)}")
-        print(f"  Total SSL input pool    : {len(ssl_pool)}  "
-              f"(cross-modal DS will filter to samples with A+V+T)")
+        print(f"  Labelled   (train+val)     : {len(labelled_pool)}")
+        print(f"  Unlabelled (all_segments)  : {len(unlabelled_df)}")
+        print(f"  Total SSL input pool       : {len(ssl_pool)}")
     else:
         ssl_pool = labelled_pool
         print(f"  SSL pool: {len(labelled_pool)} labelled samples (train + val)")
 
-    # ── PHASE 1-A: Extract video features for unlabelled samples ─────────────
-    # Unlabelled segments that have raw .mp4 files get CLIP+DINOv2+ResNet50
-    # features extracted here (same timm pipeline as video_stage3_extract_sequences.py).
-    # After this step they can join the A↔V cross-modal SSL pool.
-    # GPU is freed before loading audio/text models.
+    # ── PHASE 1-A: Ensure video features exist for all pool samples ──────────
+    # Zip extraction already handled in auto_detect(); this step catches any
+    # remaining pool samples that have a raw .mp4 but no npy features yet.
     if len(unlabelled_df) > 0:
         extract_unlabelled_video_features(ssl_pool)
 
