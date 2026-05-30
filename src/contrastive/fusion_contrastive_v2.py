@@ -782,7 +782,7 @@ class VideoFTModel(nn.Module):
 def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=True):
     sep(f"PHASE 2 -- {name} FT (SSL={use_ssl}, SupCon={use_supcon})")
     set_seed(42)
-    
+
     if name == "AUDIO":
         ds_tr, ds_va, ds_te = AudioFTDS(train_df), AudioFTDS(val_df), AudioFTDS(test_df)
         m = AudioFTModel(SSL_PROJ_DIM).to(DEVICE)
@@ -796,6 +796,9 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
                 print(f"  [SSL] loaded {sd_path.name}")
         lr_bb, lr_hd = 1e-5, 1e-3
         bs = 8
+        n_epochs     = 25
+        supcon_temp  = 0.1   # T=0.07 is too aggressive for batch=8 (7 negatives); 0.1 stabilises
+        supcon_start = 4     # let CE establish class structure first; SupCon on random feats is noisy
     elif name == "TEXT":
         tok = AutoTokenizer.from_pretrained(MODEL_NAME)
         ds_tr = TextFTDS(train_df['transcript'].values, train_df['emotion_final'].values, tok)
@@ -807,7 +810,10 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
             print("  [SSL] loaded text_ssl.pt")
         lr_bb, lr_hd = 1e-5, 5e-4
         bs = 16
-    else: # VIDEO
+        n_epochs     = 40
+        supcon_temp  = 0.12  # T=0.12 for batch=16 (15 negatives)
+        supcon_start = 4
+    else:  # VIDEO
         ds_tr, VideoFTDS_va, ds_te = VideoFTDS(train_df), VideoFTDS(val_df), VideoFTDS(test_df)
         m = VideoFTModel(SSL_PROJ_DIM).to(DEVICE)
         if use_ssl:
@@ -818,38 +824,35 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
                 print(f"  [SSL] loaded {sd_path.name}")
         lr_bb, lr_hd = 3e-5, 1e-3
         bs = 32
+        n_epochs     = 25
+        supcon_temp  = 0.07  # T=0.07 fine for batch=32 (31 negatives)
+        supcon_start = 3
 
-    # Prevent head from destroying backbone
     bb_params = [p for n, p in m.named_parameters() if 'backbone' in n]
     hd_params = [p for n, p in m.named_parameters() if 'backbone' not in n]
-    
     opt = torch.optim.AdamW([
         {'params': bb_params, 'lr': lr_bb},
         {'params': hd_params, 'lr': lr_hd}
     ], weight_decay=0.05)
 
-    dl_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True)
+    # WeightedRandomSampler: ensures minority classes (Fear/Happiness/Surprise) appear every epoch
+    y_tr = np.array([LID[e] for e in train_df['emotion_final']])
+    cw   = compute_class_weight('balanced', classes=np.arange(7), y=y_tr)
+    cw_tensor = torch.tensor(cw, dtype=torch.float).to(DEVICE)
+    samp_w    = torch.tensor([cw[l] for l in y_tr], dtype=torch.float)
+    sampler   = torch.utils.data.WeightedRandomSampler(samp_w, len(samp_w), replacement=True)
+    dl_tr = DataLoader(ds_tr, batch_size=bs, sampler=sampler)
     dl_va = DataLoader(VideoFTDS_va if name=="VIDEO" else ds_va, batch_size=bs)
     dl_te = DataLoader(ds_te, batch_size=bs)
-    
-    sch = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[lr_bb, lr_hd], steps_per_epoch=len(dl_tr), epochs=20)
-    supcon_fn = SupConLoss(SSL_TEMP)
-    best_acc, ckpt = 0, SAVE_DIR/f"{name.lower()}_ft.pt"
-    # SOTA: Compute Class Weights for Imbalanced Dataset
-    y_tr = np.array([LID[e] for e in train_df['emotion_final']])
-    cw = compute_class_weight('balanced', classes=np.arange(7), y=y_tr)
-    cw_tensor = torch.tensor(cw, dtype=torch.float).to(DEVICE)
 
-    for ep in range(1, 21):
+    sch       = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[lr_bb, lr_hd],
+                                                     steps_per_epoch=len(dl_tr), epochs=n_epochs)
+    supcon_fn = SupConLoss(supcon_temp)
+    best_acc, ckpt = 0, SAVE_DIR/f"{name.lower()}_ft.pt"
+
+    for ep in range(1, n_epochs+1):
         m.train()
-        
-        # SOTA: LP-FT (Linear Probing then Fine-Tuning) via Learning Rate
-        # We rely on soft-freezing (100x smaller LR for backbone) instead of hard freezing.
-        # Hard freezing with OneCycleLR causes a shock when suddenly unfrozen at peak LR.
-            
-        # SOTA: Joint SupCon Phase
-        # Weight starts higher and decays slightly, but never 0 so it actually updates the backbone.
-        cur_supcon_w = 0.3 if use_supcon else 0.0
+        cur_supcon_w = 0.3 if (use_supcon and ep >= supcon_start) else 0.0
 
         for batch in dl_tr:
             opt.zero_grad()
@@ -858,13 +861,10 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
             else:
                 logits, proj = m(batch[0].to(DEVICE))
             labels = batch[1].to(DEVICE)
-            
-            # SOTA: Weighted Cross-Entropy
             loss = F.cross_entropy(logits, labels, weight=cw_tensor, label_smoothing=0.1)
-            if use_supcon: loss += cur_supcon_w * supcon_fn(proj, labels)
-            
+            if cur_supcon_w > 0: loss += cur_supcon_w * supcon_fn(proj, labels)
             loss.backward(); opt.step(); sch.step()
-        
+
         m.eval(); ps, ts = [], []
         with torch.no_grad():
             for batch in dl_va:
@@ -876,13 +876,18 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
         if ep % 2 == 0 or ep == 1: print(f"  Ep {ep:02d} | Val Acc: {acc:.4f}")
 
     m.load_state_dict(torch.load(str(ckpt), map_location=DEVICE))
-    m.eval(); probs = []
-    with torch.no_grad():
-        for batch in dl_te:
-            if name == "TEXT": logits, _ = m(batch[0]['input_ids'].to(DEVICE), batch[0]['attention_mask'].to(DEVICE))
-            else: logits, _ = m(batch[0].to(DEVICE))
-            probs.append(F.softmax(logits, 1).cpu().numpy())
-    return np.vstack(probs)
+    m.eval()
+
+    def _get_probs(dl):
+        out = []
+        with torch.no_grad():
+            for batch in dl:
+                if name == "TEXT": logits, _ = m(batch[0]['input_ids'].to(DEVICE), batch[0]['attention_mask'].to(DEVICE))
+                else: logits, _ = m(batch[0].to(DEVICE))
+                out.append(F.softmax(logits, 1).cpu().numpy())
+        return np.vstack(out)
+
+    return _get_probs(dl_te), _get_probs(dl_va)
 
 # ─────────────────────────────────────────────────────────
 # ABLATION RUNNER
@@ -894,38 +899,40 @@ def run_ablation(tr, va, te):
         {"name": "SSL only",     "ssl": True,  "supcon": False},
         {"name": "SSL + SupCon", "ssl": True,  "supcon": True},
     ]
-    results = []
-    t_labels = [LID[e] for e in te['emotion_final'].values]
-    
+    results  = []
+    v_labels = np.array([LID[e] for e in va['emotion_final'].values])
+    t_labels = np.array([LID[e] for e in te['emotion_final'].values])
+
     for sc in scenarios:
         sep(f"RUNNING SCENARIO: {sc['name']}")
-        vp = train_modality_ft("VIDEO", tr, va, te, sc['ssl'], sc['supcon'])
-        ap = train_modality_ft("AUDIO", tr, va, te, sc['ssl'], sc['supcon'])
-        tp = train_modality_ft("TEXT",  tr, va, te, sc['ssl'], sc['supcon'])
-        
-        # Grid Search Fusion for Optimal Weights
-        best_acc, best_f1, best_w = 0, 0, (0.33, 0.33, 0.34)
+        vp_te, vp_va = train_modality_ft("VIDEO", tr, va, te, sc['ssl'], sc['supcon'])
+        ap_te, ap_va = train_modality_ft("AUDIO", tr, va, te, sc['ssl'], sc['supcon'])
+        tp_te, tp_va = train_modality_ft("TEXT",  tr, va, te, sc['ssl'], sc['supcon'])
+
+        # Grid search on VAL (no data leakage), optimise macro F1 (better for 7-class imbalance)
+        best_f1_val, best_w = 0.0, (0.33, 0.33, 0.34)
         for w_v in np.linspace(0, 1, 11):
             for w_a in np.linspace(0, 1, 11):
-                w_t = 1.0 - w_v - w_a
+                w_t = round(1.0 - w_v - w_a, 10)
                 if w_t < 0 or w_t > 1: continue
-                
-                fp = w_v * vp + w_a * ap + w_t * tp
-                preds = fp.argmax(1)
-                acc = accuracy_score(t_labels, preds)
-                
-                if acc > best_acc:
-                    best_acc = acc
-                    best_f1 = f1_score(t_labels, preds, average='macro')
-                    best_w = (w_v, w_a, w_t)
-                    
+                fp_va = w_v * vp_va + w_a * ap_va + w_t * tp_va
+                f1 = f1_score(v_labels, fp_va.argmax(1), average='macro', zero_division=0)
+                if f1 > best_f1_val:
+                    best_f1_val = f1
+                    best_w      = (w_v, w_a, w_t)
+
+        # Apply best val-tuned weights to test set
+        fp_te    = best_w[0] * vp_te + best_w[1] * ap_te + best_w[2] * tp_te
+        test_acc = accuracy_score(t_labels, fp_te.argmax(1))
+        test_f1  = f1_score(t_labels, fp_te.argmax(1), average='macro', zero_division=0)
+
         results.append({
-            "Scenario": sc['name'], 
-            "Acc": best_acc, 
-            "F1": best_f1,
-            "Weights (V,A,T)": f"{best_w[0]:.2f}, {best_w[1]:.2f}, {best_w[2]:.2f}"
+            "Scenario":       sc['name'],
+            "Acc":            test_acc,
+            "F1":             test_f1,
+            "Weights (V,A,T)": f"{best_w[0]:.2f}, {best_w[1]:.2f}, {best_w[2]:.2f}",
         })
-        print(f"\n  >>> {sc['name']} Result: Acc={best_acc:.4f}, F1={best_f1:.4f} | Weights: {best_w}")
+        print(f"\n  >>> {sc['name']} Result: Acc={test_acc:.4f}, F1={test_f1:.4f} | Weights: {best_w}")
 
     sep("FINAL ABLATION RESULTS")
     df = pd.DataFrame(results)
