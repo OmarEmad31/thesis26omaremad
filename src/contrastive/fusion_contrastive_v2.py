@@ -27,6 +27,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from sklearn.utils.class_weight import compute_class_weight
 from transformers import WavLMModel, AutoTokenizer, AutoModel
 warnings.filterwarnings("ignore")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # ─────────────────────────────────────────────────────────
 # PATHS & GLOBAL CONFIG (Smart Auto-Detection)
@@ -94,6 +95,8 @@ GRAD_ACC          = 4       # effective audio batch = 8 * 4 = 32
 CM_SSL_EPOCHS     = 20
 CM_TEMP           = 0.07
 CM_UNLABELLED_CAP = 610     # max unlabelled samples added to cross-modal pool
+CM_BATCH_SIZE     = 8       # reduced from 16 to avoid T4 OOM; grad_acc=2 keeps effective batch=16
+CM_GRAD_ACC       = 2       # effective batch = CM_BATCH_SIZE * CM_GRAD_ACC
 
 def set_seed(s=42):
     random.seed(s); np.random.seed(s)
@@ -206,20 +209,27 @@ def load_unlabelled():
     Returns empty DataFrame if neither file is found.
     """
     xlsx_paths = [
+        Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED/all_segments.xlsx"),
         REPO / "data/processed/all_segments.xlsx",
         REPO / "data/all_segments.xlsx",
+        SPLIT_DIR / "all_segments.xlsx",
+        REPO / "data/processed/splits/all_segments.xlsx",
         Path("/content/drive/MyDrive/Thesis Project/data/processed/all_segments.xlsx"),
+        Path("/content/drive/MyDrive/Thesis Project/data/all_segments.xlsx"),
+        Path("/content/drive/MyDrive/Thesis Project/data/processed/splits/all_segments.xlsx"),
         Path("/content/drive/MyDrive/Thesis Project/all_segments.xlsx"),
+        Path("/content/drive/MyDrive/all_segments.xlsx"),
     ]
     csv_paths = [
         REPO / "data/processed/splits/unlabelled.csv",
         SPLIT_DIR / "unlabelled.csv",
+        Path("/content/drive/MyDrive/Thesis Project/data/processed/splits/unlabelled.csv"),
     ]
 
     df = None
     for p in xlsx_paths:
         if p.exists():
-            print(f"  [Unlabelled] Loading from {p.name} ...")
+            print(f"  [Unlabelled] Loading from {p} ...")
             df = pd.read_excel(p)
             print(f"  [Unlabelled] {len(df)} segments loaded")
             break
@@ -227,13 +237,16 @@ def load_unlabelled():
     if df is None:
         for p in csv_paths:
             if p.exists():
-                print(f"  [Unlabelled] Loading from {p.name} ...")
+                print(f"  [Unlabelled] Loading from {p} ...")
                 df = pd.read_csv(p)
                 print(f"  [Unlabelled] {len(df)} segments loaded")
                 break
 
     if df is None:
-        print("  [Unlabelled] No all_segments.xlsx or unlabelled.csv found — cross-modal SSL uses labelled pool only")
+        print("  [Unlabelled] File not found. Searched:")
+        for p in xlsx_paths: print(f"    {'OK' if p.exists() else '--'} {p}")
+        for p in csv_paths:  print(f"    {'OK' if p.exists() else '--'} {p}")
+        print("  [Unlabelled] Cross-modal SSL will use labelled pool only.")
         return pd.DataFrame()
 
     if len(df) > CM_UNLABELLED_CAP:
@@ -525,6 +538,7 @@ def train_cross_modal_ssl(pool, unlabelled_df=None):
     if ckpt_a.exists() and ckpt_v.exists():
         print("  [SKIP] Cross-modal checkpoints cached — delete to retrain.")
         return
+    torch.cuda.empty_cache()
     set_seed(42)
 
     # Combine labelled pool with small unlabelled sample
@@ -539,8 +553,8 @@ def train_cross_modal_ssl(pool, unlabelled_df=None):
     if len(ds) < 8:
         print(f"  [SKIP] Only {len(ds)} valid pairs — need >= 8.")
         return
-    dl = DataLoader(ds, batch_size=16, shuffle=True, drop_last=True,
-                    num_workers=2, pin_memory=True)
+    dl = DataLoader(ds, batch_size=CM_BATCH_SIZE, shuffle=True, drop_last=True,
+                    num_workers=0, pin_memory=False)
 
     # ── Audio encoder: start from per-modal SSL checkpoint ─────────────────
     a_enc = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
@@ -586,22 +600,23 @@ def train_cross_modal_ssl(pool, unlabelled_df=None):
     scaler     = GradScaler()
     clip_params = a_top3 + [a_enc.lw] + list(v_enc.parameters()) + proj_params
 
-    print(f"  Pairs: {len(ds)} | Batch: 16 | Epochs: {CM_SSL_EPOCHS} | Temp: {CM_TEMP}")
+    eff_batch = CM_BATCH_SIZE * CM_GRAD_ACC
+    print(f"  Pairs: {len(ds)} | Batch: {CM_BATCH_SIZE} (x{CM_GRAD_ACC} acc = {eff_batch} eff) | Epochs: {CM_SSL_EPOCHS} | Temp: {CM_TEMP}")
     for ep in range(1, CM_SSL_EPOCHS+1):
         a_enc.train(); v_enc.train(); a_cm_proj.train(); v_cm_proj.train()
-        ep_loss = 0.0
-        for aud, vid in dl:
+        ep_loss = 0.0; opt.zero_grad()
+        for step, (aud, vid) in enumerate(dl):
             aud, vid = aud.to(DEVICE), vid.to(DEVICE)
-            opt.zero_grad()
             with autocast("cuda"):
                 z_a = a_cm_proj(a_enc.encode(aud))
                 z_v = v_cm_proj(v_enc.encode(vid))
-                loss = loss_fn(z_a, z_v)
+                loss = loss_fn(z_a, z_v) / CM_GRAD_ACC
             scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
-            scaler.step(opt); scaler.update()
-            ep_loss += loss.item()
+            ep_loss += loss.item() * CM_GRAD_ACC
+            if (step + 1) % CM_GRAD_ACC == 0 or (step + 1) == len(dl):
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+                scaler.step(opt); scaler.update(); opt.zero_grad()
         sch.step()
         if ep % 5 == 0 or ep == 1:
             print(f"  Ep {ep:02d}/{CM_SSL_EPOCHS} | A-V InfoNCE: {ep_loss/len(dl):.4f}")
