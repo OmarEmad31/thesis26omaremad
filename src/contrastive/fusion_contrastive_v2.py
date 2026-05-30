@@ -93,7 +93,7 @@ GRAD_ACC          = 4       # effective audio batch = 8 * 4 = 32
 # Cross-modal SSL (Phase 1-D)
 CM_SSL_EPOCHS     = 20
 CM_TEMP           = 0.07
-CM_UNLABELLED_CAP = 200     # max unlabelled samples added to cross-modal pool
+CM_UNLABELLED_CAP = 610     # max unlabelled samples added to cross-modal pool
 
 def set_seed(s=42):
     random.seed(s); np.random.seed(s)
@@ -201,23 +201,45 @@ def load_splits():
 
 def load_unlabelled():
     """Load up to CM_UNLABELLED_CAP unlabelled samples for cross-modal SSL.
-    Expects columns: sample_id, folder, audio_relpath (emotion_final not needed).
-    Returns empty DataFrame if file not found.
+    Reads from all_segments.xlsx (primary) or unlabelled.csv (fallback).
+    No emotion_final column needed — only sample_id, folder, audio_relpath.
+    Returns empty DataFrame if neither file is found.
     """
-    paths = [
+    xlsx_paths = [
+        REPO / "data/processed/all_segments.xlsx",
+        REPO / "data/all_segments.xlsx",
+        Path("/content/drive/MyDrive/Thesis Project/data/processed/all_segments.xlsx"),
+        Path("/content/drive/MyDrive/Thesis Project/all_segments.xlsx"),
+    ]
+    csv_paths = [
         REPO / "data/processed/splits/unlabelled.csv",
         SPLIT_DIR / "unlabelled.csv",
     ]
-    for p in paths:
+
+    df = None
+    for p in xlsx_paths:
         if p.exists():
-            df = pd.read_csv(p)
-            print(f"  [Unlabelled] Loaded {len(df)} raw samples from {p.name}")
-            if len(df) > CM_UNLABELLED_CAP:
-                df = df.sample(CM_UNLABELLED_CAP, random_state=42).reset_index(drop=True)
-                print(f"  [Unlabelled] Sampled down to {CM_UNLABELLED_CAP}")
-            return df
-    print("  [Unlabelled] No unlabelled.csv found — cross-modal SSL uses labelled pool only")
-    return pd.DataFrame()
+            print(f"  [Unlabelled] Loading from {p.name} ...")
+            df = pd.read_excel(p)
+            print(f"  [Unlabelled] {len(df)} segments loaded")
+            break
+
+    if df is None:
+        for p in csv_paths:
+            if p.exists():
+                print(f"  [Unlabelled] Loading from {p.name} ...")
+                df = pd.read_csv(p)
+                print(f"  [Unlabelled] {len(df)} segments loaded")
+                break
+
+    if df is None:
+        print("  [Unlabelled] No all_segments.xlsx or unlabelled.csv found — cross-modal SSL uses labelled pool only")
+        return pd.DataFrame()
+
+    if len(df) > CM_UNLABELLED_CAP:
+        df = df.sample(CM_UNLABELLED_CAP, random_state=42).reset_index(drop=True)
+        print(f"  [Unlabelled] Capped to {CM_UNLABELLED_CAP} samples (CM_UNLABELLED_CAP)")
+    return df
 
 
 # ─────────────────────────────────────────────────────────
