@@ -90,12 +90,12 @@ SSL_TEMP     = 0.07
 SSL_PROJ_DIM = 128
 GRAD_ACC     = 4      # effective audio batch = 8 * 4 = 32
 
-# Cross-modal SSL (Phase 1-D)
-CM_SSL_EPOCHS     = 20
+# Cross-modal SSL hyper-parameters (Phase 1-D)
+CM_EPOCHS         = 40    # video needs many steps from random init
 CM_TEMP           = 0.07
-CM_BATCH_SIZE     = 8       # T4 OOM fix: batch=8, grad_acc=2 → effective 16
-CM_GRAD_ACC       = 2
-CM_UNLABELLED_CAP = 610     # max unlabelled rows added to cross-modal pool
+CM_BATCH_SIZE     = 8     # T4 OOM limit with WavLM; grad_acc=4 gives effective 32
+CM_GRAD_ACC       = 4     # 31 negatives per anchor — strong InfoNCE signal
+CM_UNLABELLED_CAP = 610   # max rows from all_segments.xlsx
 
 def set_seed(s=42):
     random.seed(s); np.random.seed(s)
@@ -213,25 +213,20 @@ def load_splits():
     return tr_f, va_f, te_f
 
 def load_unlabelled():
-    """Load up to CM_UNLABELLED_CAP rows from all_segments.xlsx for SSL.
-    No emotion_final column needed — only sample_id, folder, audio_relpath.
-    """
     paths = [
         Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED/all_segments.xlsx"),
         REPO / "data/processed/all_segments.xlsx",
-        REPO / "data/all_segments.xlsx",
         Path("/content/drive/MyDrive/Thesis Project/data/processed/all_segments.xlsx"),
         Path("/content/drive/MyDrive/Thesis Project/all_segments.xlsx"),
     ]
     for p in paths:
         if p.exists():
             df = pd.read_excel(p)
-            print(f"  [Unlabelled] Loaded {len(df)} rows from {p.name}")
             if len(df) > CM_UNLABELLED_CAP:
                 df = df.sample(CM_UNLABELLED_CAP, random_state=42).reset_index(drop=True)
-                print(f"  [Unlabelled] Capped to {CM_UNLABELLED_CAP}")
+            print(f"  [Unlabelled] {len(df)} rows from {p.name}")
             return df
-    print("  [Unlabelled] all_segments.xlsx not found — SSL uses labelled pool only")
+    print("  [Unlabelled] all_segments.xlsx not found — using labelled pool only")
     return pd.DataFrame()
 
 # ─────────────────────────────────────────────────────────
@@ -560,8 +555,9 @@ def train_video_ssl(pool):
 # ─────────────────────────────────────────────────────────
 class CrossModalTripletDS(Dataset):
     """Triplet (audio, video, text) for the same utterance.
-    Filters to rows where all three modalities are accessible.
-    Works with labelled or unlabelled rows — no emotion column needed.
+    Text MARBERT backbone is the semantic anchor — it is FROZEN during SSL;
+    audio (WavLM top-3) and video (full encoder) align toward it.
+    Filters to rows where all three modalities are present.
     """
     def __init__(self, df, sr=16000, maxlen=80000):
         self.tok = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -605,16 +601,19 @@ class CrossModalTripletDS(Dataset):
 
 
 def train_cross_modal_ssl(pool, unlabelled_df=None):
-    """Phase 1-D: 3-way Audio↔Video↔Text cross-modal InfoNCE.
-    Loss = (InfoNCE(A,V) + InfoNCE(A,T) + InfoNCE(V,T)) / 3
-    All encoders start from pretrained weights; top-3 layers unfrozen.
-    Saves audio_cm_ssl.pt, video_cm_ssl.pt, text_cm_ssl.pt.
+    """Phase 1-D: 3-way cross-modal InfoNCE (Audio ↔ Video ↔ Text).
+    Loss = InfoNCE(A,V) + InfoNCE(A,T) + InfoNCE(V,T)
+
+    Text (MARBERT) is FULLY FROZEN — it anchors the shared semantic space.
+    Audio (WavLM top-3) and Video (full encoder) adapt toward that anchor.
+    This prevents MARBERT degradation while still using text as the teacher.
+
+    Saves audio_cm_ssl.pt + video_cm_ssl.pt for FT.
     """
-    sep("PHASE 1-D -- CROSS-MODAL SSL (Audio ↔ Video ↔ Text)")
+    sep("PHASE 1-D -- CROSS-MODAL SSL (Audio x Video x Text)")
     ckpt_a = SSL_DIR / "audio_cm_ssl.pt"
     ckpt_v = SSL_DIR / "video_cm_ssl.pt"
-    ckpt_t = SSL_DIR / "text_cm_ssl.pt"
-    if ckpt_a.exists() and ckpt_v.exists() and ckpt_t.exists():
+    if ckpt_a.exists() and ckpt_v.exists():
         print("  [SKIP] Cross-modal checkpoints cached — delete to retrain.")
         return
     torch.cuda.empty_cache()
@@ -628,38 +627,34 @@ def train_cross_modal_ssl(pool, unlabelled_df=None):
         print(f"  Pool: {len(pool)} labelled only")
 
     ds = CrossModalTripletDS(combined)
-    if len(ds) < 8:
-        print(f"  [SKIP] Only {len(ds)} valid triplets — need >= 8."); return
+    if len(ds) < CM_BATCH_SIZE:
+        print(f"  [SKIP] Only {len(ds)} triplets — need >= {CM_BATCH_SIZE}."); return
     dl = DataLoader(ds, batch_size=CM_BATCH_SIZE, shuffle=True, drop_last=True,
                     num_workers=0, pin_memory=False)
 
-    # ── Audio encoder: WavLM pretrained, unfreeze top-3 layers ────────────────
+    # ── Audio: WavLM pretrained, unfreeze top-3 layers only ──────────────────
     a_enc = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    print("  Audio: WavLM pretrained weights")
     for p in a_enc.backbone.parameters(): p.requires_grad = False
     a_enc.lw.requires_grad = True
     a_top3 = []
     for i in [9, 10, 11]:
         for p in a_enc.backbone.encoder.layers[i].parameters():
             p.requires_grad = True; a_top3.append(p)
+    print("  Audio: WavLM pretrained (top-3 layers trainable)")
 
-    # ── Video encoder: random init (no separate video SSL) ────────────────────
+    # ── Video: random init, full encoder trainable, high LR ──────────────────
     v_enc = VideoSSLModel(proj_dim=SSL_PROJ_DIM, drop=0.1).to(DEVICE)
-    print("  Video: random init")
+    print("  Video: random init (full encoder, lr=1e-4)")
 
-    # ── Text encoder: MARBERT pretrained, unfreeze top-3 layers ──────────────
+    # ── Text: MARBERT FULLY FROZEN — semantic anchor only ────────────────────
     t_enc = TextSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    print("  Text: MARBERT pretrained weights")
-    for p in t_enc.bert.parameters(): p.requires_grad = False
-    t_top3 = []
-    for i in [9, 10, 11]:
-        for p in t_enc.bert.encoder.layer[i].parameters():
-            p.requires_grad = True; t_top3.append(p)
+    for p in t_enc.parameters(): p.requires_grad = False
+    print("  Text: MARBERT fully frozen (semantic anchor)")
 
-    # ── Per-modality projection heads into shared cross-modal space ───────────
+    # ── Per-modality cross-modal projection heads (all trainable) ─────────────
     a_cm_proj = ProjectionHead(768*2, SSL_PROJ_DIM).to(DEVICE)
     v_cm_proj = ProjectionHead(512,   SSL_PROJ_DIM).to(DEVICE)
-    t_cm_proj = ProjectionHead(768*3, SSL_PROJ_DIM).to(DEVICE)
+    t_cm_proj = ProjectionHead(768*3, SSL_PROJ_DIM).to(DEVICE)  # trainable even though t_enc frozen
     proj_params = (list(a_cm_proj.parameters()) +
                    list(v_cm_proj.parameters()) +
                    list(t_cm_proj.parameters()))
@@ -667,19 +662,18 @@ def train_cross_modal_ssl(pool, unlabelled_df=None):
     opt = torch.optim.AdamW([
         {'params': [a_enc.lw],        'lr': 1e-3,  'weight_decay': 0.01},
         {'params': a_top3,             'lr': 2e-6,  'weight_decay': 0.01},
-        {'params': v_enc.parameters(), 'lr': 1e-5,  'weight_decay': 0.01},
-        {'params': t_top3,             'lr': 2e-6,  'weight_decay': 0.01},
+        {'params': v_enc.parameters(), 'lr': 1e-4,  'weight_decay': 0.01},  # high LR: random init
         {'params': proj_params,        'lr': 1e-3,  'weight_decay': 0.01},
     ])
-    sch        = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CM_SSL_EPOCHS)
+    sch        = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CM_EPOCHS)
     loss_fn    = InfoNCELoss(CM_TEMP)
     scaler     = GradScaler()
-    clip_params = a_top3 + t_top3 + [a_enc.lw] + list(v_enc.parameters()) + proj_params
+    clip_params = a_top3 + [a_enc.lw] + list(v_enc.parameters()) + proj_params
 
     eff = CM_BATCH_SIZE * CM_GRAD_ACC
-    print(f"  Triplets: {len(ds)} | Batch: {CM_BATCH_SIZE} (x{CM_GRAD_ACC}={eff} eff) | Epochs: {CM_SSL_EPOCHS}")
-    for ep in range(1, CM_SSL_EPOCHS+1):
-        a_enc.train(); v_enc.train(); t_enc.train()
+    print(f"  Triplets: {len(ds)} | Batch: {CM_BATCH_SIZE} x acc{CM_GRAD_ACC} = {eff} eff | Epochs: {CM_EPOCHS}")
+    for ep in range(1, CM_EPOCHS+1):
+        a_enc.train(); v_enc.train()          # t_enc stays eval (frozen)
         a_cm_proj.train(); v_cm_proj.train(); t_cm_proj.train()
         ep_loss = 0.0; opt.zero_grad()
         for step, (aud, vid, ids, mask) in enumerate(dl):
@@ -688,7 +682,9 @@ def train_cross_modal_ssl(pool, unlabelled_df=None):
             with autocast("cuda"):
                 z_a = a_cm_proj(a_enc.encode(aud))
                 z_v = v_cm_proj(v_enc.encode(vid))
-                z_t = t_cm_proj(t_enc.encode(ids, mask))
+                with torch.no_grad():
+                    t_feat = t_enc.encode(ids, mask)  # frozen — no grad needed
+                z_t = t_cm_proj(t_feat)
                 loss = (loss_fn(z_a, z_v) + loss_fn(z_a, z_t) + loss_fn(z_v, z_t)) / (3 * CM_GRAD_ACC)
             scaler.scale(loss).backward()
             ep_loss += loss.item() * 3 * CM_GRAD_ACC
@@ -698,17 +694,14 @@ def train_cross_modal_ssl(pool, unlabelled_df=None):
                 scaler.step(opt); scaler.update(); opt.zero_grad()
         sch.step()
         if ep % 5 == 0 or ep == 1:
-            print(f"  Ep {ep:02d}/{CM_SSL_EPOCHS} | 3-way InfoNCE: {ep_loss/len(dl):.4f}")
+            print(f"  Ep {ep:02d}/{CM_EPOCHS} | 3-way InfoNCE: {ep_loss/len(dl):.4f}")
 
     torch.save({'backbone': a_enc.backbone.state_dict(), 'lw': a_enc.lw.data}, str(ckpt_a))
     torch.save({k: v for k,v in v_enc.state_dict().items()
                 if not k.startswith('proj.')}, str(ckpt_v))
-    torch.save({k: v for k,v in t_enc.state_dict().items()
-                if not k.startswith('proj.')}, str(ckpt_t))
-    print(f"  [SAVED] {ckpt_a.name}, {ckpt_v.name}, {ckpt_t.name}")
+    print(f"  [SAVED] {ckpt_a.name}, {ckpt_v.name}")
     del a_enc, v_enc, t_enc, a_cm_proj, v_cm_proj, t_cm_proj
     torch.cuda.empty_cache()
-
 
 # ─────────────────────────────────────────────────────────
 # PHASE 2 — SUPERVISED FINE-TUNING (FT) WITH SUPCON
@@ -809,14 +802,9 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
         ds_va = TextFTDS(val_df['transcript'].values, val_df['emotion_final'].values, tok)
         ds_te = TextFTDS(test_df['transcript'].values, test_df['emotion_final'].values, tok)
         m = TextFTModel(SSL_PROJ_DIM).to(DEVICE)
-        if use_ssl:
-            sd_path = (SSL_DIR/"text_cm_ssl.pt" if (SSL_DIR/"text_cm_ssl.pt").exists()
-                       else SSL_DIR/"text_ssl.pt")
-            if sd_path.exists():
-                m.backbone.load_state_dict(torch.load(sd_path, map_location=DEVICE), strict=False)
-                print(f"  [SSL] loaded {sd_path.name}")
-            else:
-                print("  [SSL] no text checkpoint — using pretrained MARBERT")
+        if use_ssl and (SSL_DIR/"text_ssl.pt").exists():
+            m.backbone.load_state_dict(torch.load(SSL_DIR/"text_ssl.pt", map_location=DEVICE), strict=False)
+            print("  [SSL] loaded text_ssl.pt")
         lr_bb, lr_hd = 1e-5, 5e-4
         bs = 16
     else: # VIDEO
@@ -828,8 +816,6 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
             if sd_path.exists():
                 m.backbone.load_state_dict(torch.load(sd_path, map_location=DEVICE), strict=False)
                 print(f"  [SSL] loaded {sd_path.name}")
-            else:
-                print("  [SSL] no video checkpoint — using random init")
         lr_bb, lr_hd = 3e-5, 1e-3
         bs = 32
 
@@ -953,20 +939,12 @@ if __name__ == "__main__":
     sep(f"CONTRASTIVE PIPELINE v2 | Device: {DEVICE}")
     tr, va, te = load_splits()
     
-    # PHASE 1: SELF-SUPERVISED PRE-TRAINING
+    # PHASE 1: CROSS-MODAL SSL ONLY (no individual modality SSL)
     pool = pd.concat([tr, va]).reset_index(drop=True)
     print(f"  SSL labelled pool: {len(pool)} samples (train + val)")
-
     unlabelled_df = load_unlabelled()
-
-    # No individual modality SSL — all adaptation via 3-way cross-modal SSL
-    # 1-A Audio SSL  : SKIPPED
-    # 1-B Text SSL   : SKIPPED
-    # 1-C Video SSL  : SKIPPED
-    # 1-D Cross-modal SSL (Audio ↔ Video ↔ Text) on labelled + unlabelled
     train_cross_modal_ssl(pool, unlabelled_df)
+    sep("PHASE 1 COMPLETE -- Cross-modal encoders pre-trained.")
 
-    sep("PHASE 1 COMPLETE -- Encoders pre-trained.")
-
-    # PHASE 2: ABLATION (Fine-tuning) — unchanged
+    # PHASE 2: ABLATION (Fine-tuning) — baseline/SupCon unchanged
     run_ablation(tr, va, te)
