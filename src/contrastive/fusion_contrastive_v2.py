@@ -2,10 +2,10 @@
 fusion_contrastive_v2.py — 2-Phase Contrastive Pipeline (Colab)
 ================================================================
 PHASE 1  Self-Supervised Pre-training  (InfoNCE, NO labels)
-  1-A : Audio  SimCLR  (WavLM-Base-Plus, waveform augmentation)
-  1-B : Text   SimCSE  (MARBERT, dropout augmentation)
   1-C : Video  SimCLR  (MSW Transformer on CLIP+DINOv2+ResNet50)
   1-D : Cross-modal    (Audio-Video InfoNCE, labelled + small unlabelled pool)
+  [Audio/Text per-modal SSL removed — cross-modal SSL covers audio adaptation;
+   MARBERT already knows Egyptian Arabic so text SSL adds negligible value]
 
 PHASE 2  Supervised Fine-tuning  (CE + SupCon, WITH labels)
   4 ablation scenarios: Baseline / SupCon-only / SSL-only / SSL+SupCon
@@ -327,25 +327,8 @@ def video_augment(seq): return _video_one_view(seq), _video_one_view(seq)
 
 
 # ─────────────────────────────────────────────────────────
-# PHASE 1-A — AUDIO SSL (SimCLR)
+# AUDIO ENCODER MODEL  (used for cross-modal SSL + FT)
 # ─────────────────────────────────────────────────────────
-class AudioSSLDS(Dataset):
-    def __init__(self, df, sr=16000, maxlen=80000):
-        self.df = df.reset_index(drop=True)
-        self.sr = sr; self.maxlen = maxlen
-    def __len__(self): return len(self.df)
-    def __getitem__(self, i):
-        r = self.df.iloc[i]
-        try:
-            p = resolve_audio_path(r)
-            if p is None: raise FileNotFoundError
-            y, _ = librosa.load(str(p), sr=self.sr)
-            y, _ = librosa.effects.trim(y, top_db=25)
-            y    = y[:self.maxlen] if len(y)>self.maxlen else np.pad(y,(0,self.maxlen-len(y)))
-        except: y = np.zeros(self.maxlen)
-        v1, v2 = audio_augment(y)
-        return torch.tensor(v1, dtype=torch.float32), torch.tensor(v2, dtype=torch.float32)
-
 class AudioSSLModel(nn.Module):
     def __init__(self, proj_dim=128):
         super().__init__()
@@ -366,45 +349,9 @@ class AudioSSLModel(nn.Module):
     def forward(self, x):
         return self.proj(self.encode(x))
 
-def train_audio_ssl(pool):
-    sep("PHASE 1-A -- AUDIO SSL (SimCLR | WavLM-Base-Plus)")
-    ckpt = SSL_DIR / "audio_ssl.pt"
-    if ckpt.exists():
-        print("  [SKIP] audio_ssl.pt already cached — delete to retrain.")
-        return
-    set_seed(42)
-    ds  = AudioSSLDS(pool)
-    dl  = DataLoader(ds, batch_size=8, shuffle=True, num_workers=2,
-                     pin_memory=True, drop_last=True)
-    m       = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    opt     = torch.optim.AdamW(
-                  filter(lambda p: p.requires_grad, m.parameters()),
-                  lr=1e-4, weight_decay=1e-2)
-    sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
-    loss_fn = InfoNCELoss(SSL_TEMP)
-    scaler  = GradScaler()
-    print(f"  Pool: {len(pool)} | EffBatch: {8*GRAD_ACC} | Epochs: {SSL_EPOCHS}")
-    for ep in range(1, SSL_EPOCHS+1):
-        m.train(); ep_loss = 0.0; opt.zero_grad()
-        for step, (v1, v2) in enumerate(dl):
-            v1, v2 = v1.to(DEVICE), v2.to(DEVICE)
-            with autocast("cuda"):
-                loss = loss_fn(m(v1), m(v2)) / GRAD_ACC
-            scaler.scale(loss).backward()
-            ep_loss += loss.item() * GRAD_ACC
-            if (step+1) % GRAD_ACC == 0 or (step+1) == len(dl):
-                scaler.step(opt); scaler.update(); opt.zero_grad()
-        sch.step()
-        if ep % 5 == 0 or ep == 1:
-            print(f"  Ep {ep:02d}/{SSL_EPOCHS} | InfoNCE: {ep_loss/len(dl):.4f}")
-    # Save encoder only (no projection head)
-    torch.save({'backbone': m.backbone.state_dict(), 'lw': m.lw.data}, str(ckpt))
-    print(f"  [SAVED] {ckpt}")
-    del m; torch.cuda.empty_cache()
-
 
 # ─────────────────────────────────────────────────────────
-# PHASE 1-B — TEXT SSL (SimCSE)
+# TEXT ENCODER MODEL  (used for FT; no per-modal SSL)
 # ─────────────────────────────────────────────────────────
 MODEL_NAME = "UBC-NLP/MARBERT"
 _FILLERS   = re.compile(
@@ -420,14 +367,6 @@ def clean(t):
     t = _FILLERS.sub(' ', t)
     t = re.sub(r'(.)\1+', r'\1\1', t)
     return re.sub(r'\s+', ' ', t).strip()
-
-class TextSSLDS(Dataset):
-    def __init__(self, texts, tok):
-        self.enc = tok([clean(str(t)) for t in texts],
-                       truncation=True, padding="max_length",
-                       max_length=64, return_tensors="pt")
-    def __len__(self): return self.enc['input_ids'].size(0)
-    def __getitem__(self, i): return {k: v[i] for k,v in self.enc.items()}
 
 class TextSSLModel(nn.Module):
     def __init__(self, proj_dim=128):
@@ -448,46 +387,6 @@ class TextSSLModel(nn.Module):
 
     def forward(self, ids, mask):
         return self.proj(self.encode(ids, mask))
-
-def train_text_ssl(pool):
-    sep("PHASE 1-B -- TEXT SSL (SimCSE | MARBERT)")
-    ckpt = SSL_DIR / "text_ssl.pt"
-    if ckpt.exists():
-        print("  [SKIP] text_ssl.pt already cached — delete to retrain.")
-        return
-    set_seed(42)
-    tok    = AutoTokenizer.from_pretrained(MODEL_NAME)
-    pool_t = pool[pool['transcript'].apply(
-        lambda t: isinstance(t, str) and len(t.strip()) > 2)]
-    ds     = TextSSLDS(pool_t['transcript'].values, tok)
-    dl     = DataLoader(ds, batch_size=16, shuffle=True, drop_last=True)
-    m      = TextSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    opt    = torch.optim.AdamW([
-        {'params': [p for n,p in m.named_parameters() if 'bert' in n and p.requires_grad], 'lr': 2e-5},
-        {'params': [p for n,p in m.named_parameters() if 'proj' in n],                    'lr': 1e-3}
-    ], weight_decay=0.01)
-    sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
-    loss_fn = InfoNCELoss(SSL_TEMP)
-    print(f"  Pool: {len(pool_t)} | Batches/ep: {len(dl)} | Epochs: {SSL_EPOCHS}")
-    for ep in range(1, SSL_EPOCHS+1):
-        m.train(); ep_loss = 0.0
-        for batch in dl:
-            ids  = batch['input_ids'].to(DEVICE)
-            mask = batch['attention_mask'].to(DEVICE)
-            opt.zero_grad()
-            # SimCSE: same tokens, two forward passes — dropout is the augmentation
-            z1 = m(ids, mask)
-            z2 = m(ids, mask)
-            loss = loss_fn(z1, z2)
-            loss.backward(); opt.step()
-            ep_loss += loss.item()
-        sch.step()
-        if ep % 5 == 0 or ep == 1:
-            print(f"  Ep {ep:02d}/{SSL_EPOCHS} | InfoNCE: {ep_loss/len(dl):.4f}")
-    # Save BERT weights only (drop projection head)
-    torch.save({k: v for k,v in m.state_dict().items() if 'proj' not in k}, str(ckpt))
-    print(f"  [SAVED] {ckpt}")
-    del m; torch.cuda.empty_cache()
 
 
 # ─────────────────────────────────────────────────────────
@@ -988,9 +887,7 @@ if __name__ == "__main__":
     pool = pd.concat([tr, va]).reset_index(drop=True)
     print(f"  SSL labelled pool: {len(pool)} samples (train + val)")
 
-    # Phase 1: per-modal SSL on labelled pool
-    train_audio_ssl(pool)
-    train_text_ssl(pool)
+    # Phase 1-C: video SSL on labelled pool (audio/text SSL skipped — marginal gain)
     train_video_ssl(pool)
 
     # Phase 1-D: cross-modal SSL with small unlabelled augmentation
