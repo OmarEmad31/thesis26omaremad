@@ -556,51 +556,65 @@ def train_video_ssl(pool):
     print(f"  [SAVED] {ckpt}")
 
 # ─────────────────────────────────────────────────────────
-# PHASE 1-D — CROSS-MODAL SSL (Audio ↔ Video InfoNCE)
+# PHASE 1-D — CROSS-MODAL SSL (Audio ↔ Video ↔ Text)
 # ─────────────────────────────────────────────────────────
-class CrossModalPairDS(Dataset):
-    """Paired (audio_waveform, video_seq) for the same utterance.
-    Filters to rows where both audio and video are accessible.
+class CrossModalTripletDS(Dataset):
+    """Triplet (audio, video, text) for the same utterance.
+    Filters to rows where all three modalities are accessible.
     Works with labelled or unlabelled rows — no emotion column needed.
     """
     def __init__(self, df, sr=16000, maxlen=80000):
+        self.tok = AutoTokenizer.from_pretrained(MODEL_NAME)
         rows = []
         for _, row in df.iterrows():
             sid = str(row['sample_id']).replace("::","__").replace("/","_").replace(".mp4","")
             pc, _, _ = get_vid_paths(sid)
-            if pc is not None and pc.exists() and resolve_audio_path(row) is not None:
+            has_vid = pc is not None and pc.exists()
+            has_aud = resolve_audio_path(row) is not None
+            has_txt = isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
+            if has_vid and has_aud and has_txt:
                 rows.append(row)
         self.df = pd.DataFrame(rows).reset_index(drop=True)
         self.sr = sr; self.maxlen = maxlen
-        print(f"  Cross-modal valid pairs: {len(self.df)}")
+        print(f"  Cross-modal valid triplets: {len(self.df)}")
 
     def __len__(self): return len(self.df)
 
     def __getitem__(self, i):
         r = self.df.iloc[i]
+        # Audio
         try:
             p = resolve_audio_path(r)
             y, _ = librosa.load(str(p), sr=self.sr)
             y, _ = librosa.effects.trim(y, top_db=25)
             y = y[:self.maxlen] if len(y) > self.maxlen else np.pad(y, (0, self.maxlen-len(y)))
         except: y = np.zeros(self.maxlen, dtype=np.float32)
+        # Video
         sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
         pc, pd_, pr = get_vid_paths(sid)
         try:
             seq = np.concatenate([np.load(pc), np.load(pd_), np.load(pr)], -1).astype(np.float32)
         except: seq = np.zeros((16, 3584), dtype=np.float32)
-        return torch.tensor(y, dtype=torch.float32), torch.tensor(seq, dtype=torch.float32)
+        # Text
+        txt = clean(str(r.get('transcript', '')))
+        enc = self.tok(txt, truncation=True, padding='max_length', max_length=64, return_tensors='pt')
+        return (torch.tensor(y, dtype=torch.float32),
+                torch.tensor(seq, dtype=torch.float32),
+                enc['input_ids'].squeeze(0),
+                enc['attention_mask'].squeeze(0))
 
 
 def train_cross_modal_ssl(pool, unlabelled_df=None):
-    """Phase 1-D: Audio↔Video InfoNCE. Audio encoder starts from audio_ssl.pt.
-    Video encoder is randomly initialised (no separate video SSL needed).
-    Saves audio_cm_ssl.pt and video_cm_ssl.pt for FT to load.
+    """Phase 1-D: 3-way Audio↔Video↔Text cross-modal InfoNCE.
+    Loss = (InfoNCE(A,V) + InfoNCE(A,T) + InfoNCE(V,T)) / 3
+    All encoders start from pretrained weights; top-3 layers unfrozen.
+    Saves audio_cm_ssl.pt, video_cm_ssl.pt, text_cm_ssl.pt.
     """
-    sep("PHASE 1-D -- CROSS-MODAL SSL (Audio ↔ Video)")
+    sep("PHASE 1-D -- CROSS-MODAL SSL (Audio ↔ Video ↔ Text)")
     ckpt_a = SSL_DIR / "audio_cm_ssl.pt"
     ckpt_v = SSL_DIR / "video_cm_ssl.pt"
-    if ckpt_a.exists() and ckpt_v.exists():
+    ckpt_t = SSL_DIR / "text_cm_ssl.pt"
+    if ckpt_a.exists() and ckpt_v.exists() and ckpt_t.exists():
         print("  [SKIP] Cross-modal checkpoints cached — delete to retrain.")
         return
     torch.cuda.empty_cache()
@@ -613,23 +627,15 @@ def train_cross_modal_ssl(pool, unlabelled_df=None):
         combined = pool
         print(f"  Pool: {len(pool)} labelled only")
 
-    ds = CrossModalPairDS(combined)
+    ds = CrossModalTripletDS(combined)
     if len(ds) < 8:
-        print(f"  [SKIP] Only {len(ds)} valid pairs — need >= 8."); return
+        print(f"  [SKIP] Only {len(ds)} valid triplets — need >= 8."); return
     dl = DataLoader(ds, batch_size=CM_BATCH_SIZE, shuffle=True, drop_last=True,
                     num_workers=0, pin_memory=False)
 
-    # Audio encoder: start from audio_ssl.pt if available
+    # ── Audio encoder: WavLM pretrained, unfreeze top-3 layers ────────────────
     a_enc = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    if (SSL_DIR / "audio_ssl.pt").exists():
-        sd = torch.load(SSL_DIR / "audio_ssl.pt", map_location=DEVICE)
-        a_enc.backbone.load_state_dict(sd['backbone'])
-        a_enc.lw.data = sd['lw']
-        print("  Audio: loaded audio_ssl.pt")
-    else:
-        print("  Audio: using WavLM pretrained weights")
-
-    # Freeze all WavLM; unfreeze only top-3 layers (9-11)
+    print("  Audio: WavLM pretrained weights")
     for p in a_enc.backbone.parameters(): p.requires_grad = False
     a_enc.lw.requires_grad = True
     a_top3 = []
@@ -637,52 +643,71 @@ def train_cross_modal_ssl(pool, unlabelled_df=None):
         for p in a_enc.backbone.encoder.layers[i].parameters():
             p.requires_grad = True; a_top3.append(p)
 
-    # Video encoder: random init (no separate video SSL)
+    # ── Video encoder: random init (no separate video SSL) ────────────────────
     v_enc = VideoSSLModel(proj_dim=SSL_PROJ_DIM, drop=0.1).to(DEVICE)
-    print("  Video: random init (trained from scratch in cross-modal SSL)")
+    print("  Video: random init")
 
-    # Cross-modal projection heads
+    # ── Text encoder: MARBERT pretrained, unfreeze top-3 layers ──────────────
+    t_enc = TextSSLModel(SSL_PROJ_DIM).to(DEVICE)
+    print("  Text: MARBERT pretrained weights")
+    for p in t_enc.bert.parameters(): p.requires_grad = False
+    t_top3 = []
+    for i in [9, 10, 11]:
+        for p in t_enc.bert.encoder.layer[i].parameters():
+            p.requires_grad = True; t_top3.append(p)
+
+    # ── Per-modality projection heads into shared cross-modal space ───────────
     a_cm_proj = ProjectionHead(768*2, SSL_PROJ_DIM).to(DEVICE)
     v_cm_proj = ProjectionHead(512,   SSL_PROJ_DIM).to(DEVICE)
-    proj_params = list(a_cm_proj.parameters()) + list(v_cm_proj.parameters())
+    t_cm_proj = ProjectionHead(768*3, SSL_PROJ_DIM).to(DEVICE)
+    proj_params = (list(a_cm_proj.parameters()) +
+                   list(v_cm_proj.parameters()) +
+                   list(t_cm_proj.parameters()))
 
     opt = torch.optim.AdamW([
         {'params': [a_enc.lw],        'lr': 1e-3,  'weight_decay': 0.01},
         {'params': a_top3,             'lr': 2e-6,  'weight_decay': 0.01},
         {'params': v_enc.parameters(), 'lr': 1e-5,  'weight_decay': 0.01},
+        {'params': t_top3,             'lr': 2e-6,  'weight_decay': 0.01},
         {'params': proj_params,        'lr': 1e-3,  'weight_decay': 0.01},
     ])
     sch        = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CM_SSL_EPOCHS)
     loss_fn    = InfoNCELoss(CM_TEMP)
     scaler     = GradScaler()
-    clip_params = a_top3 + [a_enc.lw] + list(v_enc.parameters()) + proj_params
+    clip_params = a_top3 + t_top3 + [a_enc.lw] + list(v_enc.parameters()) + proj_params
 
     eff = CM_BATCH_SIZE * CM_GRAD_ACC
-    print(f"  Pairs: {len(ds)} | Batch: {CM_BATCH_SIZE} (x{CM_GRAD_ACC}={eff} eff) | Epochs: {CM_SSL_EPOCHS}")
+    print(f"  Triplets: {len(ds)} | Batch: {CM_BATCH_SIZE} (x{CM_GRAD_ACC}={eff} eff) | Epochs: {CM_SSL_EPOCHS}")
     for ep in range(1, CM_SSL_EPOCHS+1):
-        a_enc.train(); v_enc.train(); a_cm_proj.train(); v_cm_proj.train()
+        a_enc.train(); v_enc.train(); t_enc.train()
+        a_cm_proj.train(); v_cm_proj.train(); t_cm_proj.train()
         ep_loss = 0.0; opt.zero_grad()
-        for step, (aud, vid) in enumerate(dl):
+        for step, (aud, vid, ids, mask) in enumerate(dl):
             aud, vid = aud.to(DEVICE), vid.to(DEVICE)
+            ids, mask = ids.to(DEVICE), mask.to(DEVICE)
             with autocast("cuda"):
                 z_a = a_cm_proj(a_enc.encode(aud))
                 z_v = v_cm_proj(v_enc.encode(vid))
-                loss = loss_fn(z_a, z_v) / CM_GRAD_ACC
+                z_t = t_cm_proj(t_enc.encode(ids, mask))
+                loss = (loss_fn(z_a, z_v) + loss_fn(z_a, z_t) + loss_fn(z_v, z_t)) / (3 * CM_GRAD_ACC)
             scaler.scale(loss).backward()
-            ep_loss += loss.item() * CM_GRAD_ACC
+            ep_loss += loss.item() * 3 * CM_GRAD_ACC
             if (step+1) % CM_GRAD_ACC == 0 or (step+1) == len(dl):
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
                 scaler.step(opt); scaler.update(); opt.zero_grad()
         sch.step()
         if ep % 5 == 0 or ep == 1:
-            print(f"  Ep {ep:02d}/{CM_SSL_EPOCHS} | A-V InfoNCE: {ep_loss/len(dl):.4f}")
+            print(f"  Ep {ep:02d}/{CM_SSL_EPOCHS} | 3-way InfoNCE: {ep_loss/len(dl):.4f}")
 
     torch.save({'backbone': a_enc.backbone.state_dict(), 'lw': a_enc.lw.data}, str(ckpt_a))
     torch.save({k: v for k,v in v_enc.state_dict().items()
                 if not k.startswith('proj.')}, str(ckpt_v))
-    print(f"  [SAVED] {ckpt_a.name}, {ckpt_v.name}")
-    del a_enc, v_enc, a_cm_proj, v_cm_proj; torch.cuda.empty_cache()
+    torch.save({k: v for k,v in t_enc.state_dict().items()
+                if not k.startswith('proj.')}, str(ckpt_t))
+    print(f"  [SAVED] {ckpt_a.name}, {ckpt_v.name}, {ckpt_t.name}")
+    del a_enc, v_enc, t_enc, a_cm_proj, v_cm_proj, t_cm_proj
+    torch.cuda.empty_cache()
 
 
 # ─────────────────────────────────────────────────────────
@@ -785,9 +810,11 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
         ds_te = TextFTDS(test_df['transcript'].values, test_df['emotion_final'].values, tok)
         m = TextFTModel(SSL_PROJ_DIM).to(DEVICE)
         if use_ssl:
-            if (SSL_DIR/"text_ssl.pt").exists():
-                m.backbone.load_state_dict(torch.load(SSL_DIR/"text_ssl.pt", map_location=DEVICE), strict=False)
-                print("  [SSL] loaded text_ssl.pt")
+            sd_path = (SSL_DIR/"text_cm_ssl.pt" if (SSL_DIR/"text_cm_ssl.pt").exists()
+                       else SSL_DIR/"text_ssl.pt")
+            if sd_path.exists():
+                m.backbone.load_state_dict(torch.load(sd_path, map_location=DEVICE), strict=False)
+                print(f"  [SSL] loaded {sd_path.name}")
             else:
                 print("  [SSL] no text checkpoint — using pretrained MARBERT")
         lr_bb, lr_hd = 1e-5, 5e-4
@@ -932,14 +959,11 @@ if __name__ == "__main__":
 
     unlabelled_df = load_unlabelled()
 
-    # 1-A: Audio SSL on labelled + unlabelled
-    audio_pool = pd.concat([pool, unlabelled_df], ignore_index=True) if len(unlabelled_df) > 0 else pool
-    train_audio_ssl(audio_pool)
-
-    # 1-B: Text SSL — SKIPPED (MARBERT already pretrained on Egyptian Arabic)
-    # 1-C: Video SSL — SKIPPED (covered by cross-modal SSL below)
-
-    # 1-D: Cross-modal SSL (Audio ↔ Video) on labelled + unlabelled
+    # No individual modality SSL — all adaptation via 3-way cross-modal SSL
+    # 1-A Audio SSL  : SKIPPED
+    # 1-B Text SSL   : SKIPPED
+    # 1-C Video SSL  : SKIPPED
+    # 1-D Cross-modal SSL (Audio ↔ Video ↔ Text) on labelled + unlabelled
     train_cross_modal_ssl(pool, unlabelled_df)
 
     sep("PHASE 1 COMPLETE -- Encoders pre-trained.")
