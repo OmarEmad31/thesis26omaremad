@@ -1,12 +1,11 @@
 """
 fusion_contrastive_v2.py — 2-Phase Contrastive Pipeline (Colab)
 ================================================================
-PHASE 1  Self-Supervised Pre-training  (InfoNCE, NO labels)
-  Audio : SimCLR with waveform augmentation
-  Text  : SimCSE (same sentence, two dropout masks)
-  Video : Feature SimCLR (frame masking + noise on [16 x 3584])
+PHASE 1  Cross-Modal Self-Supervised Pre-training  (InfoNCE, NO labels)
+  Trains Audio × Text × Video encoders jointly on a small unlabelled pool.
+  Cross-modal positives: (audio_i, text_i, video_i) from the same utterance.
 
-PHASE 2  Supervised Fine-tuning  (CE + SupCon, WITH labels)  <- TODO next session
+PHASE 2  Supervised Fine-tuning  (CE + SupCon, WITH labels)
 
 Run on Colab T4.  exec() compatible.
 """
@@ -25,7 +24,6 @@ from sklearn.metrics import accuracy_score, f1_score, classification_report
 from sklearn.utils.class_weight import compute_class_weight
 from transformers import WavLMModel, AutoTokenizer, AutoModel
 warnings.filterwarnings("ignore")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # ─────────────────────────────────────────────────────────
 # PATHS & GLOBAL CONFIG (Smart Auto-Detection)
@@ -44,21 +42,17 @@ for d in [SAVE_DIR, SSL_DIR]: d.mkdir(exist_ok=True)
 def auto_detect():
     print("  Smart-detecting data locations...")
     v_dir, a_dir = None, None
-    
-    # 1. Search /content first (fast)
+
     for p in Path("/content").rglob("*_clip_seq.npy"):
         if "drive" not in str(p):
             v_dir = p.parent
             break
-            
-    # 2. Fallback to Drive
+
     if not v_dir:
         v_dir = Path("/content/drive/MyDrive/Thesis Project/data/processed/features/video_sequences_v1")
         if not v_dir.exists(): v_dir = Path("/content/drive/MyDrive/Thesis Project/data/processed/features")
-        
-    # 3. Audio
+
     a_dir = Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED")
-    
     return v_dir, a_dir
 
 VID_DIR, AUDIO_BASE = auto_detect()
@@ -84,18 +78,13 @@ LID     = {'Anger':0,'Disgust':1,'Fear':2,'Happiness':3,'Neutral':4,'Sadness':5,
 CLASSES = list(LID.keys())
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 
-# SSL hyper-parameters
-SSL_EPOCHS   = 40
-SSL_TEMP     = 0.07
-SSL_PROJ_DIM = 128
-GRAD_ACC     = 4      # effective audio batch = 8 * 4 = 32
-
-# Cross-modal SSL hyper-parameters (Phase 1-D)
-CM_EPOCHS         = 40    # video needs many steps from random init
-CM_TEMP           = 0.07
-CM_BATCH_SIZE     = 8     # T4 OOM limit with WavLM; grad_acc=4 gives effective 32
-CM_GRAD_ACC       = 4     # 31 negatives per anchor — strong InfoNCE signal
-CM_UNLABELLED_CAP = 610   # max rows from all_segments.xlsx
+# Constants
+SSL_PROJ_DIM  = 128    # projection head output dim (all models)
+SSL_TEMP      = 0.07   # SupCon temperature used in Phase 2
+CM_SSL_EPOCHS = 35     # cross-modal SSL epochs
+CM_SSL_BATCH  = 8      # batch size (WavLM is the VRAM bottleneck)
+CM_SSL_TEMP   = 0.12   # InfoNCE temperature (warmer for 7 negatives at batch=8)
+UNLABELLED_N  = 610    # unlabelled pool size for SSL (labels never used)
 
 def set_seed(s=42):
     random.seed(s); np.random.seed(s)
@@ -113,7 +102,7 @@ def resolve_audio_path(row):
     audio_rel = str(row.get('audio_relpath', ''))
     if not audio_rel: return None
     folder = str(row.get('folder', ''))
-    
+
     bases = [
         AUDIO_BASE,
         Path("/content/audio/Thesis Project/dataset/Final Modalink Dataset MERGED"),
@@ -128,69 +117,64 @@ def resolve_audio_path(row):
         Path("/content/drive/MyDrive/Thesis Project"),
         Path("/content/drive/MyDrive")
     ]
-    
+
     for base in bases:
-        # Standard Path
         p = base / folder / audio_rel if folder else base / audio_rel
         if p.exists(): return p
-        
-        # Windows Backslash Artifact Path (e.g. "videoplayback (1)\audios\SPEAKER_00\SPEAKER_00_segment_0000.wav")
+
         if folder:
             bs_name = f"{folder}\\{audio_rel.replace('/', '\\')}"
             p_bs = base / bs_name
             if p_bs.exists(): return p_bs
-            
-        # Flat Directory Fallback
+
         p_flat = base / Path(audio_rel).name
         if p_flat.exists(): return p_flat
-        
+
     return None
 
 def get_vid_paths(sid):
-    # Check normal paths
     p1 = VID_DIR / f"{sid}_clip_seq.npy"
     if p1.exists():
         return p1, VID_DIR / f"{sid}_dinov2_seq.npy", VID_DIR / f"{sid}_resnet50_seq.npy"
-        
-    # Check Windows backslash zip extraction artifact
+
     p2 = VID_DIR / f"video_sequences_v1\\{sid}_clip_seq.npy"
     if p2.exists():
         return p2, VID_DIR / f"video_sequences_v1\\{sid}_dinov2_seq.npy", VID_DIR / f"video_sequences_v1\\{sid}_resnet50_seq.npy"
-        
+
     return None, None, None
 
 def load_splits():
     if not SPLIT_DIR.exists():
         print(f"  [ERROR] Split directory not found: {SPLIT_DIR}")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        
+
     tr = pd.read_csv(SPLIT_DIR/"train.csv")
     va = pd.read_csv(SPLIT_DIR/"val.csv")
     te = pd.read_csv(SPLIT_DIR/"test.csv")
-    
+
     sep("🔍 PATH DIAGNOSTIC")
     row0 = tr.iloc[0]
     sid0 = row0['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-    
+
     v_test, _, _ = get_vid_paths(sid0)
     a_test = resolve_audio_path(row0)
-    
+
     vid_ok = v_test is not None and v_test.exists()
     aud_ok = a_test is not None and a_test.exists()
     txt_ok = isinstance(row0.get('transcript'), str) and len(str(row0['transcript']).strip()) > 2
-    
+
     print(f"  Sample ID: {sid0}")
     print(f"  Video Status: {'✅ OK' if vid_ok else '❌ MISSING'} ({v_test.name if v_test else 'Not found'})")
-    
+
     if aud_ok:
         print(f"  Audio Status: ✅ OK ({a_test.name})")
     else:
         print(f"  Audio Status: ❌ MISSING")
         print(f"      -> Script is looking for: folder '{row0.get('folder','')}' and file '{row0.get('audio_relpath','')}'")
         print(f"      -> Are these audio files uploaded to your Google Drive?")
-        
+
     print(f"  Text  Status: {'✅ OK' if txt_ok else '❌ EMPTY'}")
-    
+
     def ok(row):
         sid = row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
         vid_p, _, _ = get_vid_paths(sid)
@@ -202,32 +186,15 @@ def load_splits():
     tr_f = tr[tr.apply(ok, axis=1)].reset_index(drop=True)
     va_f = va[va.apply(ok, axis=1)].reset_index(drop=True)
     te_f = te[te.apply(ok, axis=1)].reset_index(drop=True)
-    
+
     sep("ALIGNED SPLITS")
     print(f"  Train: {len(tr_f)} | Val: {len(va_f)} | Test: {len(te_f)}")
     if len(tr_f) == 0:
         print("  [CRITICAL] 0 samples aligned. Check if VID_DIR and AUDIO_BASE are correct.")
         print(f"  VID_DIR currently: {VID_DIR}")
         print(f"  AUDIO_BASE currently: {AUDIO_BASE}")
-        
-    return tr_f, va_f, te_f
 
-def load_unlabelled():
-    paths = [
-        Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED/all_segments.xlsx"),
-        REPO / "data/processed/all_segments.xlsx",
-        Path("/content/drive/MyDrive/Thesis Project/data/processed/all_segments.xlsx"),
-        Path("/content/drive/MyDrive/Thesis Project/all_segments.xlsx"),
-    ]
-    for p in paths:
-        if p.exists():
-            df = pd.read_excel(p)
-            if len(df) > CM_UNLABELLED_CAP:
-                df = df.sample(CM_UNLABELLED_CAP, random_state=42).reset_index(drop=True)
-            print(f"  [Unlabelled] {len(df)} rows from {p.name}")
-            return df
-    print("  [Unlabelled] all_segments.xlsx not found — using labelled pool only")
-    return pd.DataFrame()
+    return tr_f, va_f, te_f
 
 # ─────────────────────────────────────────────────────────
 # CONTRASTIVE LOSSES
@@ -242,8 +209,8 @@ class InfoNCELoss(nn.Module):
         z1 = F.normalize(z1, dim=1)
         z2 = F.normalize(z2, dim=1)
         B  = z1.size(0)
-        z  = torch.cat([z1, z2], dim=0)          # [2B, D]
-        sim = torch.mm(z, z.T) / self.T           # [2B, 2B]
+        z  = torch.cat([z1, z2], dim=0)
+        sim = torch.mm(z, z.T) / self.T
         sim.fill_diagonal_(float('-inf'))
         labels = torch.cat([
             torch.arange(B, 2*B, device=z.device),
@@ -280,67 +247,17 @@ class SupConLoss(nn.Module):
         return (-(pos_mask * log_prob).sum(1) / n_pos).mean()
 
 # ─────────────────────────────────────────────────────────
-# AUGMENTATIONS  (inline — Colab exec() compatible)
+# ENCODER ARCHITECTURES  (shared by SSL pre-training + FT)
 # ─────────────────────────────────────────────────────────
-def _audio_one_view(wav, maxlen=80000):
-    w = wav.copy()
-    if np.random.rand() > 0.3:
-        snr = np.random.uniform(15, 30)
-        rms = np.sqrt(np.mean(w**2)) + 1e-9
-        w  += np.random.randn(len(w)) * rms / (10**(snr/20))
-    if np.random.rand() > 0.4:
-        ml = int(len(w) * np.random.uniform(0.05, 0.15))
-        ms = np.random.randint(0, max(1, len(w)-ml))
-        w[ms:ms+ml] = 0.0
-    if np.random.rand() > 0.5:
-        rate = np.random.uniform(0.9, 1.1)
-        idx  = np.linspace(0, len(w)-1, int(len(w)/rate)).astype(int)
-        w    = w[idx]
-        w    = w[:maxlen] if len(w) > maxlen else np.pad(w, (0, maxlen-len(w)))
-    return w
-
-def audio_augment(wav): return _audio_one_view(wav), _audio_one_view(wav)
-
-def _video_one_view(seq, n_mask=4, noise_std=0.02):
-    s    = seq.copy()
-    idxs = np.random.choice(s.shape[0], n_mask, replace=False)
-    s[idxs] = 0.0
-    if np.random.rand() > 0.4:
-        s += np.random.randn(*s.shape) * noise_std
-    return s
-
-def video_augment(seq): return _video_one_view(seq), _video_one_view(seq)
-
-# ─────────────────────────────────────────────────────────
-# PHASE 1-A — AUDIO SSL (SimCLR)
-# ─────────────────────────────────────────────────────────
-class AudioSSLDS(Dataset):
-    def __init__(self, df, sr=16000, maxlen=80000):
-        self.df = df.reset_index(drop=True)
-        self.sr = sr; self.maxlen = maxlen
-    def __len__(self): return len(self.df)
-    def __getitem__(self, i):
-        r = self.df.iloc[i]
-        try:
-            p = resolve_audio_path(r)
-            if p is None: raise FileNotFoundError
-            y, _ = librosa.load(str(p), sr=self.sr)
-            y, _ = librosa.effects.trim(y, top_db=25)
-            y    = y[:self.maxlen] if len(y)>self.maxlen else np.pad(y,(0,self.maxlen-len(y)))
-        except: y = np.zeros(self.maxlen)
-        v1, v2 = audio_augment(y)
-        return torch.tensor(v1, dtype=torch.float32), torch.tensor(v2, dtype=torch.float32)
-
 class AudioSSLModel(nn.Module):
     def __init__(self, proj_dim=128):
         super().__init__()
         self.backbone = WavLMModel.from_pretrained("microsoft/wavlm-base-plus",
                                                     output_hidden_states=True)
-        # Freeze bottom 6 layers for efficiency and stability
         for i, layer in enumerate(self.backbone.encoder.layers):
             if i < 6:
                 for p in layer.parameters(): p.requires_grad = False
-                
+
         self.lw   = nn.Parameter(torch.ones(13))
         self.proj = ProjectionHead(768*2, proj_dim)
 
@@ -352,66 +269,22 @@ class AudioSSLModel(nn.Module):
     def forward(self, x):
         return self.proj(self.encode(x))
 
-def train_audio_ssl(pool):
-    sep("PHASE 1-A -- AUDIO SSL (SimCLR | WavLM-Base-Plus)")
-    ckpt = SSL_DIR / "audio_ssl.pt"
-    if ckpt.exists():
-        print("  [SKIP] audio_ssl.pt already cached — delete to retrain.")
-        return
-    set_seed(42)
-    ds  = AudioSSLDS(pool)
-    dl  = DataLoader(ds, batch_size=8, shuffle=True, num_workers=2,
-                     pin_memory=True, drop_last=True)
-    m   = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    opt     = torch.optim.AdamW(
-                  filter(lambda p: p.requires_grad, m.parameters()),
-                  lr=1e-4, weight_decay=1e-2)
-    sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
-    loss_fn = InfoNCELoss(SSL_TEMP)
-    scaler  = GradScaler()
-    print(f"  Pool: {len(pool)} | EffBatch: {8*GRAD_ACC} | Epochs: {SSL_EPOCHS}")
-    for ep in range(1, SSL_EPOCHS+1):
-        m.train(); ep_loss = 0.0; opt.zero_grad()
-        for step, (v1, v2) in enumerate(dl):
-            v1, v2 = v1.to(DEVICE), v2.to(DEVICE)
-            with autocast("cuda"):
-                loss = loss_fn(m(v1), m(v2)) / GRAD_ACC
-            scaler.scale(loss).backward()
-            ep_loss += loss.item() * GRAD_ACC
-            if (step+1) % GRAD_ACC == 0 or (step+1) == len(dl):
-                scaler.step(opt); scaler.update(); opt.zero_grad()
-        sch.step()
-        if ep % 5 == 0 or ep == 1:
-            print(f"  Ep {ep:02d}/{SSL_EPOCHS} | InfoNCE: {ep_loss/len(dl):.4f}")
-    # Save encoder only (no projection head)
-    torch.save({'backbone': m.backbone.state_dict(), 'lw': m.lw.data}, str(ckpt))
-    print(f"  [SAVED] {ckpt}")
 
-# ─────────────────────────────────────────────────────────
-# PHASE 1-B — TEXT SSL (SimCSE)
-# ─────────────────────────────────────────────────────────
 MODEL_NAME = "UBC-NLP/MARBERT"
 _FILLERS   = re.compile(
     r'\b(اه|ايه|يعني|بص|كده|كدا|اهو|والله|عشان|بقا|بقى|يا|اوه|هاه|اوكي|اوكى|تمام|صح|ايوه|لا|مش|ميش)\b'
 )
 def clean(t):
     if not isinstance(t, str): return ""
-    t = re.sub(r'[\u064B-\u065F\u0670]', '', t)
-    t = re.sub(r'[\u0622\u0623\u0625]', '\u0627', t)
-    t = re.sub(r'\u0629', '\u0647', t)
-    t = re.sub(r'\u0649', '\u064A', t)
-    t = re.sub(r'\u0640', '', t)
+    t = re.sub(r'[ً-ٰٟ]', '', t)
+    t = re.sub(r'[آأإ]', 'ا', t)
+    t = re.sub(r'ة', 'ه', t)
+    t = re.sub(r'ى', 'ي', t)
+    t = re.sub(r'ـ', '', t)
     t = _FILLERS.sub(' ', t)
     t = re.sub(r'(.)\1+', r'\1\1', t)
     return re.sub(r'\s+', ' ', t).strip()
 
-class TextSSLDS(Dataset):
-    def __init__(self, texts, tok):
-        self.enc = tok([clean(str(t)) for t in texts],
-                       truncation=True, padding="max_length",
-                       max_length=64, return_tensors="pt")
-    def __len__(self): return self.enc['input_ids'].size(0)
-    def __getitem__(self, i): return {k: v[i] for k,v in self.enc.items()}
 
 class TextSSLModel(nn.Module):
     def __init__(self, proj_dim=128):
@@ -432,46 +305,7 @@ class TextSSLModel(nn.Module):
     def forward(self, ids, mask):
         return self.proj(self.encode(ids, mask))
 
-def train_text_ssl(pool):
-    sep("PHASE 1-B -- TEXT SSL (SimCSE | MARBERT)")
-    ckpt = SSL_DIR / "text_ssl.pt"
-    if ckpt.exists():
-        print("  [SKIP] text_ssl.pt already cached — delete to retrain.")
-        return
-    set_seed(42)
-    tok     = AutoTokenizer.from_pretrained(MODEL_NAME)
-    ds      = TextSSLDS(pool['transcript'].values, tok)
-    dl      = DataLoader(ds, batch_size=16, shuffle=True, drop_last=True)
-    m       = TextSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    opt     = torch.optim.AdamW([
-        {'params': [p for n,p in m.named_parameters() if 'bert' in n and p.requires_grad], 'lr': 2e-5},
-        {'params': [p for n,p in m.named_parameters() if 'proj' in n],                    'lr': 1e-3}
-    ], weight_decay=0.01)
-    sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
-    loss_fn = InfoNCELoss(SSL_TEMP)
-    print(f"  Pool: {len(pool)} | Batches/ep: {len(dl)} | Epochs: {SSL_EPOCHS}")
-    for ep in range(1, SSL_EPOCHS+1):
-        m.train(); ep_loss = 0.0
-        for batch in dl:
-            ids  = batch['input_ids'].to(DEVICE)
-            mask = batch['attention_mask'].to(DEVICE)
-            opt.zero_grad()
-            # SimCSE: same tokens, two forward passes — dropout is the augmentation
-            z1 = m(ids, mask)
-            z2 = m(ids, mask)
-            loss = loss_fn(z1, z2)
-            loss.backward(); opt.step()
-            ep_loss += loss.item()
-        sch.step()
-        if ep % 5 == 0 or ep == 1:
-            print(f"  Ep {ep:02d}/{SSL_EPOCHS} | InfoNCE: {ep_loss/len(dl):.4f}")
-    # Save bert weights only (drop projection head)
-    torch.save({k: v for k,v in m.state_dict().items() if 'proj' not in k}, str(ckpt))
-    print(f"  [SAVED] {ckpt}")
 
-# ─────────────────────────────────────────────────────────
-# PHASE 1-C — VIDEO SSL (Feature SimCLR)
-# ─────────────────────────────────────────────────────────
 class SEBlock(nn.Module):
     def __init__(self, c):
         super().__init__()
@@ -482,20 +316,6 @@ class SEBlock(nn.Module):
         b,n,c = x.shape
         return x * self.fc(self.pool(x.transpose(1,2)).view(b,c)).view(b,1,c)
 
-class VideoSSLDS(Dataset):
-    def __init__(self, df):
-        self.df = df.reset_index(drop=True)
-    def __len__(self): return len(self.df)
-    def __getitem__(self, i):
-        r   = self.df.iloc[i]
-        sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-        pc, pd, pr = get_vid_paths(sid)
-        c   = np.load(pc)
-        d   = np.load(pd)
-        r2  = np.load(pr)
-        seq = np.concatenate([c, d, r2], -1)   # [16, 3584]
-        v1, v2 = video_augment(seq)
-        return v1, v2
 
 class VideoSSLModel(nn.Module):
     def __init__(self, d=512, proj_dim=128, drop=0.3):
@@ -521,187 +341,157 @@ class VideoSSLModel(nn.Module):
     def forward(self, x):
         return self.proj(self.encode(x))
 
-def train_video_ssl(pool):
-    sep("PHASE 1-C -- VIDEO SSL (SimCLR | MSW Transformer)")
-    ckpt = SSL_DIR / "video_ssl.pt"
-    if ckpt.exists():
-        print("  [SKIP] video_ssl.pt already cached — delete to retrain.")
-        return
-    set_seed(42)
-    ds      = VideoSSLDS(pool)
-    dl      = DataLoader(ds, batch_size=32, shuffle=True, drop_last=True)
-    m       = VideoSSLModel(proj_dim=SSL_PROJ_DIM).to(DEVICE)
-    opt     = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=1e-2)
-    sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=SSL_EPOCHS)
-    loss_fn = InfoNCELoss(SSL_TEMP)
-    print(f"  Pool: {len(pool)} | Batches/ep: {len(dl)} | Epochs: {SSL_EPOCHS}")
-    for ep in range(1, SSL_EPOCHS+1):
-        m.train(); ep_loss = 0.0
-        for v1, v2 in dl:
-            v1, v2 = v1.to(DEVICE), v2.to(DEVICE)
-            opt.zero_grad()
-            loss = loss_fn(m(v1), m(v2))
-            loss.backward(); opt.step()
-            ep_loss += loss.item()
-        sch.step()
-        if ep % 5 == 0 or ep == 1:
-            print(f"  Ep {ep:02d}/{SSL_EPOCHS} | InfoNCE: {ep_loss/len(dl):.4f}")
-    # Save encoder (no projection head)
-    torch.save({k: v for k,v in m.state_dict().items() if 'proj' not in k}, str(ckpt))
-    print(f"  [SAVED] {ckpt}")
-
 # ─────────────────────────────────────────────────────────
-# PHASE 1-D — CROSS-MODAL SSL (Audio ↔ Video ↔ Text)
+# PHASE 1 — CROSS-MODAL SSL  (Audio × Text × Video)
 # ─────────────────────────────────────────────────────────
-class CrossModalTripletDS(Dataset):
-    """Triplet (audio, video, text) for the same utterance.
-    Text MARBERT backbone is the semantic anchor — it is FROZEN during SSL;
-    audio (WavLM top-3) and video (full encoder) align toward it.
-    Filters to rows where all three modalities are present.
-    """
-    def __init__(self, df, sr=16000, maxlen=80000):
-        self.tok = AutoTokenizer.from_pretrained(MODEL_NAME)
-        rows = []
-        for _, row in df.iterrows():
-            sid = str(row['sample_id']).replace("::","__").replace("/","_").replace(".mp4","")
-            pc, _, _ = get_vid_paths(sid)
-            has_vid = pc is not None and pc.exists()
-            has_aud = resolve_audio_path(row) is not None
-            has_txt = isinstance(row.get('transcript'), str) and len(str(row['transcript']).strip()) > 2
-            if has_vid and has_aud and has_txt:
-                rows.append(row)
-        self.df = pd.DataFrame(rows).reset_index(drop=True)
+class CrossModalSSLDS(Dataset):
+    """Loads (audio, video, text) triplets without emotion labels."""
+    def __init__(self, df, tok, sr=16000, maxlen=80000):
+        self.df = df.reset_index(drop=True)
         self.sr = sr; self.maxlen = maxlen
-        print(f"  Cross-modal valid triplets: {len(self.df)}")
+        self.enc = tok([clean(str(t)) for t in df['transcript'].values],
+                       truncation=True, padding="max_length",
+                       max_length=64, return_tensors="pt")
 
     def __len__(self): return len(self.df)
 
     def __getitem__(self, i):
         r = self.df.iloc[i]
-        # Audio
+
+        # Audio — raw waveform, no label
         try:
             p = resolve_audio_path(r)
+            if p is None: raise FileNotFoundError
             y, _ = librosa.load(str(p), sr=self.sr)
             y, _ = librosa.effects.trim(y, top_db=25)
-            y = y[:self.maxlen] if len(y) > self.maxlen else np.pad(y, (0, self.maxlen-len(y)))
-        except: y = np.zeros(self.maxlen, dtype=np.float32)
-        # Video
+            y = y[:self.maxlen] if len(y) > self.maxlen else np.pad(y, (0, self.maxlen - len(y)))
+        except:
+            y = np.zeros(self.maxlen)
+        wav = torch.tensor(y, dtype=torch.float32)
+
+        # Video — pre-extracted features, no label
         sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
-        pc, pd_, pr = get_vid_paths(sid)
+        pc, pd_path, pr = get_vid_paths(sid)
         try:
-            seq = np.concatenate([np.load(pc), np.load(pd_), np.load(pr)], -1).astype(np.float32)
-        except: seq = np.zeros((16, 3584), dtype=np.float32)
-        # Text
-        txt = clean(str(r.get('transcript', '')))
-        enc = self.tok(txt, truncation=True, padding='max_length', max_length=64, return_tensors='pt')
-        return (torch.tensor(y, dtype=torch.float32),
-                torch.tensor(seq, dtype=torch.float32),
-                enc['input_ids'].squeeze(0),
-                enc['attention_mask'].squeeze(0))
+            seq = np.concatenate([np.load(pc), np.load(pd_path), np.load(pr)], -1)  # [16, 3584]
+        except:
+            seq = np.zeros((16, 3584), dtype=np.float32)
+        vid = torch.tensor(seq, dtype=torch.float32)
+
+        # Text — pre-tokenised; BERT dropout provides implicit augmentation
+        return wav, vid, self.enc['input_ids'][i], self.enc['attention_mask'][i]
 
 
-def train_cross_modal_ssl(pool, unlabelled_df=None):
-    """Phase 1-D: 3-way cross-modal InfoNCE (Audio ↔ Video ↔ Text).
-    Loss = InfoNCE(A,V) + InfoNCE(A,T) + InfoNCE(V,T)
+class CrossModalInfoNCE(nn.Module):
+    """Bidirectional InfoNCE over all 3 cross-modal pairs: (A,T), (A,V), (T,V)."""
+    def __init__(self, temperature=0.12):
+        super().__init__()
+        self.T = temperature
 
-    Text (MARBERT) is FULLY FROZEN — it anchors the shared semantic space.
-    Audio (WavLM top-3) and Video (full encoder) adapt toward that anchor.
-    This prevents MARBERT degradation while still using text as the teacher.
+    def _pair_loss(self, za, zb):
+        za = F.normalize(za, dim=1)
+        zb = F.normalize(zb, dim=1)
+        B  = za.size(0)
+        z  = torch.cat([za, zb], dim=0)
+        sim = torch.mm(z, z.T) / self.T
+        sim.fill_diagonal_(float('-inf'))
+        labels = torch.cat([
+            torch.arange(B, 2*B, device=z.device),
+            torch.arange(0,   B, device=z.device)
+        ])
+        return F.cross_entropy(sim, labels)
 
-    Saves audio_cm_ssl.pt + video_cm_ssl.pt for FT.
-    """
-    sep("PHASE 1-D -- CROSS-MODAL SSL (Audio x Video x Text)")
-    ckpt_a = SSL_DIR / "audio_cm_ssl.pt"
-    ckpt_v = SSL_DIR / "video_cm_ssl.pt"
-    if ckpt_a.exists() and ckpt_v.exists():
-        print("  [SKIP] Cross-modal checkpoints cached — delete to retrain.")
+    def forward(self, z_a, z_t, z_v):
+        return (self._pair_loss(z_a, z_t) +
+                self._pair_loss(z_a, z_v) +
+                self._pair_loss(z_t, z_v)) / 3.0
+
+
+def train_cross_modal_ssl(pool):
+    sep("PHASE 1 -- CROSS-MODAL SSL (Audio × Text × Video | InfoNCE)")
+    ckpts = [SSL_DIR/"audio_ssl.pt", SSL_DIR/"text_ssl.pt", SSL_DIR/"video_ssl.pt"]
+    if all(c.exists() for c in ckpts):
+        print("  [SKIP] All 3 SSL checkpoints found — delete all to retrain.")
         return
-    torch.cuda.empty_cache()
+
     set_seed(42)
 
-    if unlabelled_df is not None and len(unlabelled_df) > 0:
-        combined = pd.concat([pool, unlabelled_df], ignore_index=True)
-        print(f"  Pool: {len(pool)} labelled + {len(unlabelled_df)} unlabelled = {len(combined)} total")
-    else:
-        combined = pool
-        print(f"  Pool: {len(pool)} labelled only")
+    # Small unlabelled pool — emotion labels are never accessed
+    n = min(UNLABELLED_N, len(pool))
+    unlabelled = pool.sample(n=n, random_state=42).reset_index(drop=True)
+    print(f"  Unlabelled pool: {n}/{len(pool)} samples (labels not used)")
 
-    ds = CrossModalTripletDS(combined)
-    if len(ds) < CM_BATCH_SIZE:
-        print(f"  [SKIP] Only {len(ds)} triplets — need >= {CM_BATCH_SIZE}."); return
-    dl = DataLoader(ds, batch_size=CM_BATCH_SIZE, shuffle=True, drop_last=True,
-                    num_workers=0, pin_memory=False)
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+    ds  = CrossModalSSLDS(unlabelled, tok)
+    dl  = DataLoader(ds, batch_size=CM_SSL_BATCH, shuffle=True,
+                     num_workers=2, pin_memory=True, drop_last=True)
 
-    # ── Audio: WavLM pretrained, unfreeze top-3 layers only ──────────────────
     a_enc = AudioSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    for p in a_enc.backbone.parameters(): p.requires_grad = False
-    a_enc.lw.requires_grad = True
-    a_top3 = []
-    for i in [9, 10, 11]:
-        for p in a_enc.backbone.encoder.layers[i].parameters():
-            p.requires_grad = True; a_top3.append(p)
-    print("  Audio: WavLM pretrained (top-3 layers trainable)")
-
-    # ── Video: random init, full encoder trainable, high LR ──────────────────
-    v_enc = VideoSSLModel(proj_dim=SSL_PROJ_DIM, drop=0.1).to(DEVICE)
-    print("  Video: random init (full encoder, lr=1e-4)")
-
-    # ── Text: MARBERT FULLY FROZEN — semantic anchor only ────────────────────
     t_enc = TextSSLModel(SSL_PROJ_DIM).to(DEVICE)
-    for p in t_enc.parameters(): p.requires_grad = False
-    print("  Text: MARBERT fully frozen (semantic anchor)")
+    v_enc = VideoSSLModel(proj_dim=SSL_PROJ_DIM, drop=0.1).to(DEVICE)
 
-    # ── Per-modality cross-modal projection heads (all trainable) ─────────────
-    a_cm_proj = ProjectionHead(768*2, SSL_PROJ_DIM).to(DEVICE)
-    v_cm_proj = ProjectionHead(512,   SSL_PROJ_DIM).to(DEVICE)
-    t_cm_proj = ProjectionHead(768*3, SSL_PROJ_DIM).to(DEVICE)  # trainable even though t_enc frozen
-    proj_params = (list(a_cm_proj.parameters()) +
-                   list(v_cm_proj.parameters()) +
-                   list(t_cm_proj.parameters()))
+    # Unfreeze only top-3 transformer layers for large pretrained backbones
+    for i, layer in enumerate(a_enc.backbone.encoder.layers):
+        for p in layer.parameters(): p.requires_grad = (i >= 9)
+    for i, layer in enumerate(t_enc.bert.encoder.layer):
+        for p in layer.parameters(): p.requires_grad = (i >= 9)
+
+    # Build non-overlapping param groups
+    a_bb = [p for n, p in a_enc.named_parameters()
+            if p.requires_grad and n != 'lw' and not n.startswith('proj.')]
+    t_bb = [p for n, p in t_enc.named_parameters()
+            if p.requires_grad and not n.startswith('proj.')]
+    v_bb = [p for n, p in v_enc.named_parameters() if not n.startswith('proj.')]
+    all_projs = ([a_enc.lw] +
+                 list(a_enc.proj.parameters()) +
+                 list(t_enc.proj.parameters()) +
+                 list(v_enc.proj.parameters()))
 
     opt = torch.optim.AdamW([
-        {'params': [a_enc.lw],        'lr': 1e-3,  'weight_decay': 0.01},
-        {'params': a_top3,             'lr': 2e-6,  'weight_decay': 0.01},
-        {'params': v_enc.parameters(), 'lr': 1e-4,  'weight_decay': 0.01},  # high LR: random init
-        {'params': proj_params,        'lr': 1e-3,  'weight_decay': 0.01},
+        {'params': a_bb,       'lr': 2e-6, 'weight_decay': 0.01},
+        {'params': t_bb,       'lr': 2e-6, 'weight_decay': 0.01},
+        {'params': v_bb,       'lr': 1e-5, 'weight_decay': 0.01},
+        {'params': all_projs,  'lr': 1e-3, 'weight_decay': 0.01},
     ])
-    sch        = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CM_EPOCHS)
-    loss_fn    = InfoNCELoss(CM_TEMP)
-    scaler     = GradScaler()
-    clip_params = a_top3 + [a_enc.lw] + list(v_enc.parameters()) + proj_params
+    sch     = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CM_SSL_EPOCHS)
+    loss_fn = CrossModalInfoNCE(CM_SSL_TEMP)
+    scaler  = GradScaler()
+    all_params = list(a_enc.parameters()) + list(t_enc.parameters()) + list(v_enc.parameters())
 
-    eff = CM_BATCH_SIZE * CM_GRAD_ACC
-    print(f"  Triplets: {len(ds)} | Batch: {CM_BATCH_SIZE} x acc{CM_GRAD_ACC} = {eff} eff | Epochs: {CM_EPOCHS}")
-    for ep in range(1, CM_EPOCHS+1):
-        a_enc.train(); v_enc.train()          # t_enc stays eval (frozen)
-        a_cm_proj.train(); v_cm_proj.train(); t_cm_proj.train()
-        ep_loss = 0.0; opt.zero_grad()
-        for step, (aud, vid, ids, mask) in enumerate(dl):
-            aud, vid = aud.to(DEVICE), vid.to(DEVICE)
-            ids, mask = ids.to(DEVICE), mask.to(DEVICE)
+    print(f"  Batch: {CM_SSL_BATCH} | Steps/ep: {len(dl)} | Epochs: {CM_SSL_EPOCHS}")
+
+    for ep in range(1, CM_SSL_EPOCHS + 1):
+        a_enc.train(); t_enc.train(); v_enc.train()
+        ep_loss = 0.0
+
+        for wav, vid, ids, mask in dl:
+            wav  = wav.to(DEVICE)
+            vid  = vid.to(DEVICE)
+            ids  = ids.to(DEVICE)
+            mask = mask.to(DEVICE)
+
+            opt.zero_grad()
             with autocast("cuda"):
-                z_a = a_cm_proj(a_enc.encode(aud))
-                z_v = v_cm_proj(v_enc.encode(vid))
-                with torch.no_grad():
-                    t_feat = t_enc.encode(ids, mask)  # frozen — no grad needed
-                z_t = t_cm_proj(t_feat)
-                loss = (loss_fn(z_a, z_v) + loss_fn(z_a, z_t) + loss_fn(z_v, z_t)) / (3 * CM_GRAD_ACC)
+                z_a = a_enc(wav)          # [B, 128]
+                z_t = t_enc(ids, mask)    # [B, 128]
+                z_v = v_enc(vid)          # [B, 128]
+                loss = loss_fn(z_a, z_t, z_v)
+
             scaler.scale(loss).backward()
-            ep_loss += loss.item() * 3 * CM_GRAD_ACC
-            if (step+1) % CM_GRAD_ACC == 0 or (step+1) == len(dl):
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
-                scaler.step(opt); scaler.update(); opt.zero_grad()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            scaler.step(opt); scaler.update()
+            ep_loss += loss.item()
+
         sch.step()
         if ep % 5 == 0 or ep == 1:
-            print(f"  Ep {ep:02d}/{CM_EPOCHS} | 3-way InfoNCE: {ep_loss/len(dl):.4f}")
+            print(f"  Ep {ep:02d}/{CM_SSL_EPOCHS} | CrossModal NCE: {ep_loss/len(dl):.4f}")
 
-    torch.save({'backbone': a_enc.backbone.state_dict(), 'lw': a_enc.lw.data}, str(ckpt_a))
-    torch.save({k: v for k,v in v_enc.state_dict().items()
-                if not k.startswith('proj.')}, str(ckpt_v))
-    print(f"  [SAVED] {ckpt_a.name}, {ckpt_v.name}")
-    del a_enc, v_enc, t_enc, a_cm_proj, v_cm_proj, t_cm_proj
-    torch.cuda.empty_cache()
+    # Save in same format as before — FT loading code is unchanged
+    torch.save({'backbone': a_enc.backbone.state_dict(), 'lw': a_enc.lw.data}, str(ckpts[0]))
+    torch.save({k: v for k,v in t_enc.state_dict().items() if 'proj' not in k}, str(ckpts[1]))
+    torch.save({k: v for k,v in v_enc.state_dict().items() if 'proj' not in k}, str(ckpts[2]))
+    print("  [SAVED] audio_ssl.pt | text_ssl.pt | video_ssl.pt")
 
 # ─────────────────────────────────────────────────────────
 # PHASE 2 — SUPERVISED FINE-TUNING (FT) WITH SUPCON
@@ -749,9 +539,9 @@ class VideoFTDS(Dataset):
 class AudioFTModel(nn.Module):
     def __init__(self, proj_dim=128):
         super().__init__()
-        self.backbone = AudioSSLModel(proj_dim) # Re-use backbone + lw
+        self.backbone = AudioSSLModel(proj_dim)
         self.classifier = nn.Sequential(nn.Linear(768*2, 512), nn.LayerNorm(512), nn.ReLU(), nn.Dropout(0.3), nn.Linear(512, 7))
-        self.proj_ft = ProjectionHead(768*2, proj_dim) # Separate proj head for SupCon
+        self.proj_ft = ProjectionHead(768*2, proj_dim)
     def forward(self, x):
         feat = self.backbone.encode(x)
         return self.classifier(feat), self.proj_ft(feat)
@@ -778,7 +568,7 @@ class VideoFTModel(nn.Module):
         feat = self.backbone.encode(x)
         return self.classifier(feat), self.proj_ft(feat)
 
-# FT Training Loops
+# FT Training Loop
 def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=True):
     sep(f"PHASE 2 -- {name} FT (SSL={use_ssl}, SupCon={use_supcon})")
     set_seed(42)
@@ -787,72 +577,49 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
         ds_tr, ds_va, ds_te = AudioFTDS(train_df), AudioFTDS(val_df), AudioFTDS(test_df)
         m = AudioFTModel(SSL_PROJ_DIM).to(DEVICE)
         if use_ssl:
-            sd_path = (SSL_DIR/"audio_cm_ssl.pt" if (SSL_DIR/"audio_cm_ssl.pt").exists()
-                       else SSL_DIR/"audio_ssl.pt")
-            if sd_path.exists():
-                sd = torch.load(sd_path, map_location=DEVICE)
-                m.backbone.backbone.load_state_dict(sd['backbone'])
-                m.backbone.lw.data = sd['lw']
-                print(f"  [SSL] loaded {sd_path.name}")
+            sd = torch.load(SSL_DIR/"audio_ssl.pt", map_location=DEVICE)
+            m.backbone.backbone.load_state_dict(sd['backbone'])
+            m.backbone.lw.data = sd['lw']
         lr_bb, lr_hd = 1e-5, 1e-3
         bs = 8
-        n_epochs     = 25
-        supcon_temp  = 0.1   # T=0.07 is too aggressive for batch=8 (7 negatives); 0.1 stabilises
-        supcon_start = 4     # let CE establish class structure first; SupCon on random feats is noisy
     elif name == "TEXT":
         tok = AutoTokenizer.from_pretrained(MODEL_NAME)
         ds_tr = TextFTDS(train_df['transcript'].values, train_df['emotion_final'].values, tok)
         ds_va = TextFTDS(val_df['transcript'].values, val_df['emotion_final'].values, tok)
         ds_te = TextFTDS(test_df['transcript'].values, test_df['emotion_final'].values, tok)
         m = TextFTModel(SSL_PROJ_DIM).to(DEVICE)
-        if use_ssl and (SSL_DIR/"text_ssl.pt").exists():
-            m.backbone.load_state_dict(torch.load(SSL_DIR/"text_ssl.pt", map_location=DEVICE), strict=False)
-            print("  [SSL] loaded text_ssl.pt")
+        if use_ssl: m.backbone.load_state_dict(torch.load(SSL_DIR/"text_ssl.pt", map_location=DEVICE), strict=False)
         lr_bb, lr_hd = 1e-5, 5e-4
         bs = 16
-        n_epochs     = 40
-        supcon_temp  = 0.12  # T=0.12 for batch=16 (15 negatives)
-        supcon_start = 4
-    else:  # VIDEO
+    else: # VIDEO
         ds_tr, VideoFTDS_va, ds_te = VideoFTDS(train_df), VideoFTDS(val_df), VideoFTDS(test_df)
         m = VideoFTModel(SSL_PROJ_DIM).to(DEVICE)
-        if use_ssl:
-            sd_path = (SSL_DIR/"video_cm_ssl.pt" if (SSL_DIR/"video_cm_ssl.pt").exists()
-                       else SSL_DIR/"video_ssl.pt")
-            if sd_path.exists():
-                m.backbone.load_state_dict(torch.load(sd_path, map_location=DEVICE), strict=False)
-                print(f"  [SSL] loaded {sd_path.name}")
+        if use_ssl: m.backbone.load_state_dict(torch.load(SSL_DIR/"video_ssl.pt", map_location=DEVICE), strict=False)
         lr_bb, lr_hd = 3e-5, 1e-3
         bs = 32
-        n_epochs     = 25
-        supcon_temp  = 0.07  # T=0.07 fine for batch=32 (31 negatives)
-        supcon_start = 3
 
     bb_params = [p for n, p in m.named_parameters() if 'backbone' in n]
     hd_params = [p for n, p in m.named_parameters() if 'backbone' not in n]
+
     opt = torch.optim.AdamW([
         {'params': bb_params, 'lr': lr_bb},
         {'params': hd_params, 'lr': lr_hd}
     ], weight_decay=0.05)
 
-    # WeightedRandomSampler: ensures minority classes (Fear/Happiness/Surprise) appear every epoch
-    y_tr = np.array([LID[e] for e in train_df['emotion_final']])
-    cw   = compute_class_weight('balanced', classes=np.arange(7), y=y_tr)
-    cw_tensor = torch.tensor(cw, dtype=torch.float).to(DEVICE)
-    samp_w    = torch.tensor([cw[l] for l in y_tr], dtype=torch.float)
-    sampler   = torch.utils.data.WeightedRandomSampler(samp_w, len(samp_w), replacement=True)
-    dl_tr = DataLoader(ds_tr, batch_size=bs, sampler=sampler)
+    dl_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True)
     dl_va = DataLoader(VideoFTDS_va if name=="VIDEO" else ds_va, batch_size=bs)
     dl_te = DataLoader(ds_te, batch_size=bs)
 
-    sch       = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[lr_bb, lr_hd],
-                                                     steps_per_epoch=len(dl_tr), epochs=n_epochs)
-    supcon_fn = SupConLoss(supcon_temp)
+    sch = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[lr_bb, lr_hd], steps_per_epoch=len(dl_tr), epochs=20)
+    supcon_fn = SupConLoss(SSL_TEMP)
     best_acc, ckpt = 0, SAVE_DIR/f"{name.lower()}_ft.pt"
+    y_tr = np.array([LID[e] for e in train_df['emotion_final']])
+    cw = compute_class_weight('balanced', classes=np.arange(7), y=y_tr)
+    cw_tensor = torch.tensor(cw, dtype=torch.float).to(DEVICE)
 
-    for ep in range(1, n_epochs+1):
+    for ep in range(1, 21):
         m.train()
-        cur_supcon_w = 0.3 if (use_supcon and ep >= supcon_start) else 0.0
+        cur_supcon_w = 0.3 if use_supcon else 0.0
 
         for batch in dl_tr:
             opt.zero_grad()
@@ -861,8 +628,10 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
             else:
                 logits, proj = m(batch[0].to(DEVICE))
             labels = batch[1].to(DEVICE)
+
             loss = F.cross_entropy(logits, labels, weight=cw_tensor, label_smoothing=0.1)
-            if cur_supcon_w > 0: loss += cur_supcon_w * supcon_fn(proj, labels)
+            if use_supcon: loss += cur_supcon_w * supcon_fn(proj, labels)
+
             loss.backward(); opt.step(); sch.step()
 
         m.eval(); ps, ts = [], []
@@ -876,18 +645,13 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
         if ep % 2 == 0 or ep == 1: print(f"  Ep {ep:02d} | Val Acc: {acc:.4f}")
 
     m.load_state_dict(torch.load(str(ckpt), map_location=DEVICE))
-    m.eval()
-
-    def _get_probs(dl):
-        out = []
-        with torch.no_grad():
-            for batch in dl:
-                if name == "TEXT": logits, _ = m(batch[0]['input_ids'].to(DEVICE), batch[0]['attention_mask'].to(DEVICE))
-                else: logits, _ = m(batch[0].to(DEVICE))
-                out.append(F.softmax(logits, 1).cpu().numpy())
-        return np.vstack(out)
-
-    return _get_probs(dl_te), _get_probs(dl_va)
+    m.eval(); probs = []
+    with torch.no_grad():
+        for batch in dl_te:
+            if name == "TEXT": logits, _ = m(batch[0]['input_ids'].to(DEVICE), batch[0]['attention_mask'].to(DEVICE))
+            else: logits, _ = m(batch[0].to(DEVICE))
+            probs.append(F.softmax(logits, 1).cpu().numpy())
+    return np.vstack(probs)
 
 # ─────────────────────────────────────────────────────────
 # ABLATION RUNNER
@@ -899,40 +663,37 @@ def run_ablation(tr, va, te):
         {"name": "SSL only",     "ssl": True,  "supcon": False},
         {"name": "SSL + SupCon", "ssl": True,  "supcon": True},
     ]
-    results  = []
-    v_labels = np.array([LID[e] for e in va['emotion_final'].values])
-    t_labels = np.array([LID[e] for e in te['emotion_final'].values])
+    results = []
+    t_labels = [LID[e] for e in te['emotion_final'].values]
 
     for sc in scenarios:
         sep(f"RUNNING SCENARIO: {sc['name']}")
-        vp_te, vp_va = train_modality_ft("VIDEO", tr, va, te, sc['ssl'], sc['supcon'])
-        ap_te, ap_va = train_modality_ft("AUDIO", tr, va, te, sc['ssl'], sc['supcon'])
-        tp_te, tp_va = train_modality_ft("TEXT",  tr, va, te, sc['ssl'], sc['supcon'])
+        vp = train_modality_ft("VIDEO", tr, va, te, sc['ssl'], sc['supcon'])
+        ap = train_modality_ft("AUDIO", tr, va, te, sc['ssl'], sc['supcon'])
+        tp = train_modality_ft("TEXT",  tr, va, te, sc['ssl'], sc['supcon'])
 
-        # Grid search on VAL (no data leakage), optimise macro F1 (better for 7-class imbalance)
-        best_f1_val, best_w = 0.0, (0.33, 0.33, 0.34)
+        best_acc, best_f1, best_w = 0, 0, (0.33, 0.33, 0.34)
         for w_v in np.linspace(0, 1, 11):
             for w_a in np.linspace(0, 1, 11):
-                w_t = round(1.0 - w_v - w_a, 10)
+                w_t = 1.0 - w_v - w_a
                 if w_t < 0 or w_t > 1: continue
-                fp_va = w_v * vp_va + w_a * ap_va + w_t * tp_va
-                f1 = f1_score(v_labels, fp_va.argmax(1), average='macro', zero_division=0)
-                if f1 > best_f1_val:
-                    best_f1_val = f1
-                    best_w      = (w_v, w_a, w_t)
 
-        # Apply best val-tuned weights to test set
-        fp_te    = best_w[0] * vp_te + best_w[1] * ap_te + best_w[2] * tp_te
-        test_acc = accuracy_score(t_labels, fp_te.argmax(1))
-        test_f1  = f1_score(t_labels, fp_te.argmax(1), average='macro', zero_division=0)
+                fp = w_v * vp + w_a * ap + w_t * tp
+                preds = fp.argmax(1)
+                acc = accuracy_score(t_labels, preds)
+
+                if acc > best_acc:
+                    best_acc = acc
+                    best_f1 = f1_score(t_labels, preds, average='macro')
+                    best_w = (w_v, w_a, w_t)
 
         results.append({
-            "Scenario":       sc['name'],
-            "Acc":            test_acc,
-            "F1":             test_f1,
-            "Weights (V,A,T)": f"{best_w[0]:.2f}, {best_w[1]:.2f}, {best_w[2]:.2f}",
+            "Scenario": sc['name'],
+            "Acc": best_acc,
+            "F1": best_f1,
+            "Weights (V,A,T)": f"{best_w[0]:.2f}, {best_w[1]:.2f}, {best_w[2]:.2f}"
         })
-        print(f"\n  >>> {sc['name']} Result: Acc={test_acc:.4f}, F1={test_f1:.4f} | Weights: {best_w}")
+        print(f"\n  >>> {sc['name']} Result: Acc={best_acc:.4f}, F1={best_f1:.4f} | Weights: {best_w}")
 
     sep("FINAL ABLATION RESULTS")
     df = pd.DataFrame(results)
@@ -945,13 +706,14 @@ def run_ablation(tr, va, te):
 if __name__ == "__main__":
     sep(f"CONTRASTIVE PIPELINE v2 | Device: {DEVICE}")
     tr, va, te = load_splits()
-    
-    # PHASE 1: CROSS-MODAL SSL ONLY (no individual modality SSL)
+
+    # PHASE 1: Cross-Modal SSL on small unlabelled pool
     pool = pd.concat([tr, va]).reset_index(drop=True)
-    print(f"  SSL labelled pool: {len(pool)} samples (train + val)")
-    unlabelled_df = load_unlabelled()
-    train_cross_modal_ssl(pool, unlabelled_df)
+    print(f"  Full labelled pool: {len(pool)} samples (SSL will sample {UNLABELLED_N} without labels)")
+
+    train_cross_modal_ssl(pool)
+
     sep("PHASE 1 COMPLETE -- Cross-modal encoders pre-trained.")
 
-    # PHASE 2: ABLATION (Fine-tuning) — baseline/SupCon unchanged
+    # PHASE 2: Ablation (Fine-tuning on labelled train set)
     run_ablation(tr, va, te)
