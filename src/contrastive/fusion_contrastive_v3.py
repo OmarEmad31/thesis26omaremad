@@ -496,10 +496,10 @@ def train_cross_modal_ssl(ssl_pool):
                 z_t2 = t_enc(ids_v2, mask)  # view 2
 
                 # 4-pair loss: A-T, A-V, T-V, T1-T2
-                loss = (loss_fn(z_a, z_t) +
-                        loss_fn(z_a, z_v) +
-                        loss_fn(z_t, z_v) +
-                        loss_fn(z_t, z_t2)) / 4.0
+                loss = (loss_fn._pair_loss(z_a, z_t) +
+                        loss_fn._pair_loss(z_a, z_v) +
+                        loss_fn._pair_loss(z_t, z_v) +
+                        loss_fn._pair_loss(z_t, z_t2)) / 4.0
                 loss = loss / CM_GRAD_ACC  # FIX 3: scale for accumulation
 
             scaler.scale(loss).backward()
