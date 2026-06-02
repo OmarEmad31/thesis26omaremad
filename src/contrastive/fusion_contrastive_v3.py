@@ -2,7 +2,7 @@
 fusion_contrastive_v3.py — 2-Phase Contrastive Pipeline (Colab)
 ================================================================
 FIXES over v2:
-  FIX 1 — SSL pool is now SEPARATE from FT train/val (held-out subset of train)
+  FIX 1 — SSL pool uses truly unlabelled data from all_segments.xlsx (not carved from labelled train)
   FIX 2 — Fusion weights searched on VALIDATION set, not test set
   FIX 3 — Gradient accumulation for effective batch ~32 in cross-modal SSL
   FIX 4 — VideoFTDS_va variable name bug fixed
@@ -62,6 +62,7 @@ def auto_detect():
     return v_dir, a_dir
 
 VID_DIR, AUDIO_BASE = auto_detect()
+UNLABELLED_XLSX = AUDIO_BASE / "all_segments.xlsx"
 print(f"  Final VID_DIR:    {VID_DIR}")
 print(f"  Final AUDIO_BASE: {AUDIO_BASE}")
 
@@ -77,8 +78,7 @@ CM_SSL_BATCH  = 8
 # FIX 3: gradient accumulation steps → effective batch = 8 × 4 = 32
 CM_GRAD_ACC   = 4
 CM_SSL_TEMP   = 0.12
-# FIX 1: fraction of training set held out exclusively for SSL pre-training
-SSL_HOLDOUT_FRAC = 0.30   # 30% of train used for SSL only; remaining 70% used for FT
+UNLABELLED_N  = 1500   # max samples drawn from all_segments.xlsx for SSL (labels never used)
 
 def set_seed(s=42):
     random.seed(s); np.random.seed(s)
@@ -166,27 +166,29 @@ def load_splits():
 
 
 # ─────────────────────────────────────────────────────────
-# FIX 1 — SSL / FT SPLIT  (no overlap)
+# FIX 1 — UNLABELLED SSL POOL  (from all_segments.xlsx)
 # ─────────────────────────────────────────────────────────
-def make_ssl_ft_split(tr, seed=42):
+def load_unlabelled_pool(n=UNLABELLED_N, seed=42):
     """
-    Splits training data into:
-      - ssl_pool : held-out, labels NEVER used, fed to Phase 1
-      - ft_train : used exclusively for Phase 2 supervised fine-tuning
-
-    This ensures Phase 1 and Phase 2 see DIFFERENT samples, giving SSL
-    a genuine generalisation challenge and a fair comparison to baseline.
+    Loads truly unlabelled segments from all_segments.xlsx.
+    Only rows where 'Final Overall (majority of modalities)' is NaN are kept —
+    these segments were never assigned an emotion label by any annotator.
+    Column mapping mirrors what CrossModalSSLDS expects:
+      folder, audio_relpath, sample_id, transcript
     """
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(len(tr))
-    n_ssl = int(len(tr) * SSL_HOLDOUT_FRAC)
-    ssl_idx = idx[:n_ssl]
-    ft_idx  = idx[n_ssl:]
-    ssl_pool = tr.iloc[ssl_idx].reset_index(drop=True)
-    ft_train = tr.iloc[ft_idx].reset_index(drop=True)
-    print(f"  SSL pool  (no labels used) : {len(ssl_pool)} samples")
-    print(f"  FT train  (labeled)        : {len(ft_train)} samples")
-    return ssl_pool, ft_train
+    df = pd.read_excel(str(UNLABELLED_XLSX))
+    unlabelled = df[df['Final Overall (majority of modalities)'].isna()].copy()
+    unlabelled['folder']        = unlabelled['Folder']
+    unlabelled['audio_relpath'] = unlabelled['audio_file']
+    unlabelled['sample_id']     = unlabelled['Folder'] + '::' + unlabelled['video_file']
+    unlabelled = unlabelled[
+        unlabelled['transcript'].apply(
+            lambda t: isinstance(t, str) and len(t.strip()) > 2)
+    ].reset_index(drop=True)
+    n_use = min(n, len(unlabelled))
+    pool  = unlabelled.sample(n=n_use, random_state=seed).reset_index(drop=True)
+    print(f"  Unlabelled pool : {len(unlabelled)} available → using {n_use} (labels never accessed)")
+    return pool
 
 
 # ─────────────────────────────────────────────────────────
@@ -712,7 +714,7 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
 # ─────────────────────────────────────────────────────────
 # ABLATION RUNNER
 # ─────────────────────────────────────────────────────────
-def run_ablation(ft_train, va, te):
+def run_ablation(tr, va, te):
     """
     FIX 2: Fusion weights are searched on VALIDATION set (va), then
             the winning weights are applied to TEST set (te) for final numbers.
@@ -734,9 +736,9 @@ def run_ablation(ft_train, va, te):
         sep(f"RUNNING SCENARIO: {sc['name']}")
 
         # Get test-set probabilities per modality
-        vp_te = train_modality_ft("VIDEO", ft_train, va, te, sc['ssl'], sc['supcon'])
-        ap_te = train_modality_ft("AUDIO", ft_train, va, te, sc['ssl'], sc['supcon'])
-        tp_te = train_modality_ft("TEXT",  ft_train, va, te, sc['ssl'], sc['supcon'])
+        vp_te = train_modality_ft("VIDEO", tr, va, te, sc['ssl'], sc['supcon'])
+        ap_te = train_modality_ft("AUDIO", tr, va, te, sc['ssl'], sc['supcon'])
+        tp_te = train_modality_ft("TEXT",  tr, va, te, sc['ssl'], sc['supcon'])
 
         # Also get validation-set probabilities for weight search
         # Re-run inference on val using the saved checkpoints
@@ -812,13 +814,13 @@ if __name__ == "__main__":
     sep(f"CONTRASTIVE PIPELINE v3 | Device: {DEVICE}")
     tr, va, te = load_splits()
 
-    # FIX 1: carve out SSL pool BEFORE FT train — zero overlap
-    sep("CREATING SSL / FT SPLIT")
-    ssl_pool, ft_train = make_ssl_ft_split(tr, seed=42)
+    # SSL pool: truly unlabelled segments from all_segments.xlsx (no emotion label ever assigned)
+    sep("LOADING UNLABELLED SSL POOL")
+    ssl_pool = load_unlabelled_pool()
 
-    # PHASE 1: SSL on held-out pool (labels never accessed)
+    # PHASE 1: SSL on unlabelled pool (labels never accessed)
     train_cross_modal_ssl(ssl_pool)
     sep("PHASE 1 COMPLETE")
 
-    # PHASE 2: Ablation on ft_train (different samples from SSL pool)
-    run_ablation(ft_train, va, te)
+    # PHASE 2: Ablation using ALL labelled train data
+    run_ablation(tr, va, te)
