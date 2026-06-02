@@ -42,11 +42,12 @@ cands = glob.glob("/content/*thesis*") + glob.glob("/content/*omaremad*")
 cands = [c for c in cands if os.path.isdir(c) and (Path(c)/"src").exists()]
 _repo_str = cands[0] if cands else "/content/thesis"
 
-REPO       = Path(_repo_str)
-SPLIT_DIR  = REPO / "data/processed/splits/multimodal_eligible"
-SAVE_DIR   = Path("/content/fusion_models")
-SSL_DIR    = Path("/content/ssl_pretrained")
-for d in [SAVE_DIR, SSL_DIR]: d.mkdir(exist_ok=True)
+REPO        = Path(_repo_str)
+SPLIT_DIR   = REPO / "data/processed/splits/multimodal_eligible"
+SAVE_DIR    = Path("/content/fusion_models")
+SSL_DIR     = Path("/content/ssl_pretrained")
+SSL_VID_DIR = Path("/content/ssl_video_features")   # on-demand features for unlabelled SSL pool
+for d in [SAVE_DIR, SSL_DIR, SSL_VID_DIR]: d.mkdir(exist_ok=True)
 
 def auto_detect():
     print("  Smart-detecting data locations...")
@@ -127,6 +128,10 @@ def get_vid_paths(sid):
     p2 = VID_DIR / f"video_sequences_v1\\{sid}_clip_seq.npy"
     if p2.exists():
         return p2, VID_DIR / f"video_sequences_v1\\{sid}_dinov2_seq.npy", VID_DIR / f"video_sequences_v1\\{sid}_resnet50_seq.npy"
+    # On-demand features extracted for SSL unlabelled pool
+    p3 = SSL_VID_DIR / f"{sid}_clip_seq.npy"
+    if p3.exists():
+        return p3, SSL_VID_DIR / f"{sid}_dinov2_seq.npy", SSL_VID_DIR / f"{sid}_resnet50_seq.npy"
     return None, None, None
 
 def load_splits():
@@ -211,6 +216,98 @@ def load_unlabelled_pool(exclude_ids=None, n=UNLABELLED_N, seed=42):
     pool  = unlabelled.sample(n=n_use, random_state=seed).reset_index(drop=True)
     print(f"  SSL pool : {n_use} samples (labels never accessed)")
     return pool, vid_frac
+
+
+# ─────────────────────────────────────────────────────────
+# SSL VIDEO FEATURE EXTRACTION  (unlabelled pool, on-demand)
+# ─────────────────────────────────────────────────────────
+def extract_ssl_video_features(ssl_pool):
+    """
+    Extracts CLIP+DINOv2+ResNet50 frame features [16, D] for each sample
+    in ssl_pool that doesn't already have .npy files in SSL_VID_DIR.
+    Mirrors video_stage3_extract_sequences.py exactly (same timm model IDs).
+    Saves clip_seq, dinov2_seq, resnet50_seq per sample.
+    """
+    import timm, cv2
+    from torchvision import transforms
+    from PIL import Image as PILImage
+
+    def _resolve_video_path(row):
+        folder = str(row.get('folder', row.get('Folder', '')))
+        vfile  = str(row.get('video_file', ''))
+        if not vfile: return None
+        for base in [AUDIO_BASE, AUDIO_BASE / folder]:
+            p = base / vfile
+            if p.exists(): return p
+            p2 = base / folder / vfile
+            if p2.exists(): return p2
+        return None
+
+    def _sample_frames(v_path, n=16):
+        cap = cv2.VideoCapture(str(v_path))
+        if not cap.isOpened(): return []
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0: cap.release(); return []
+        idxs = set(np.linspace(0, total - 1, n).astype(int))
+        buf, cur = {}, 0
+        while cur <= max(idxs):
+            ret, f = cap.read()
+            if not ret: break
+            if cur in idxs:
+                buf[cur] = PILImage.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
+            cur += 1
+        cap.release()
+        frames = [buf[i] for i in sorted(buf.keys())]
+        while len(frames) < n:
+            frames.append(frames[-1] if frames else PILImage.new('RGB', (224, 224)))
+        return frames[:n]
+
+    # Which samples still need extraction?
+    needs = [row for _, row in ssl_pool.iterrows()
+             if not (SSL_VID_DIR / f"{row['sample_id'].replace('::','__').replace('/','_').replace('.mp4','')}_clip_seq.npy").exists()]
+
+    if not needs:
+        print("  All SSL video features already extracted.")
+        return
+
+    print(f"  Extracting video features for {len(needs)}/{len(ssl_pool)} SSL samples...")
+
+    models_cfg = [
+        ("clip",     "vit_base_patch32_clip_224"),
+        ("dinov2",   "vit_base_patch14_dinov2"),
+        ("resnet50", "resnet50"),
+    ]
+
+    for mname, mid in models_cfg:
+        print(f"  [{mname}] loading {mid}...")
+        model = timm.create_model(mid, pretrained=True, num_classes=0).to(DEVICE)
+        model.eval()
+        cfg = timm.data.resolve_model_data_config(model)
+        tf  = transforms.Compose([
+            transforms.Resize(cfg['input_size'][1:]),
+            transforms.CenterCrop(cfg['input_size'][1:]),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=cfg['mean'], std=cfg['std']),
+        ])
+        ok = skip = 0
+        for row in needs:
+            sid   = row['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
+            fpath = SSL_VID_DIR / f"{sid}_{mname}_seq.npy"
+            if fpath.exists(): ok += 1; continue
+            vp = _resolve_video_path(row)
+            if vp is None: skip += 1; continue
+            frames = _sample_frames(vp)
+            if not frames: skip += 1; continue
+            batch = torch.stack([tf(f) for f in frames]).to(DEVICE)
+            with torch.no_grad():
+                feat = model(batch)
+                if feat.dim() > 2: feat = feat.mean(dim=[2, 3])
+            np.save(str(fpath), feat.cpu().numpy())
+            ok += 1
+        print(f"  [{mname}] saved={ok}, skipped={skip} (video not found on Drive)")
+        del model; torch.cuda.empty_cache()
+
+    print("  Video feature extraction complete.")
 
 
 # ─────────────────────────────────────────────────────────
@@ -866,12 +963,16 @@ if __name__ == "__main__":
     tr, va, te = load_splits()
 
     sep("LOADING UNLABELLED SSL POOL")
-    # Pass val+test IDs so they are explicitly excluded from SSL pool
     _excl = set(va['sample_id'].values) | set(te['sample_id'].values)
     ssl_pool, vid_frac = load_unlabelled_pool(exclude_ids=_excl)
 
+    # Extract video features for SSL pool if not already present
+    if vid_frac < 0.2:
+        sep("EXTRACTING SSL VIDEO FEATURES")
+        extract_ssl_video_features(ssl_pool)
+        vid_frac = 1.0   # features now on disk; full 4-pair SSL will run
+
     # PHASE 1: SSL on unlabelled pool (labels never accessed)
-    # vid_frac controls whether video pairs are included (skipped if pool lacks .npy features)
     train_cross_modal_ssl(ssl_pool, vid_frac=vid_frac)
     sep("PHASE 1 COMPLETE")
 
