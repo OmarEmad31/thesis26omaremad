@@ -970,7 +970,14 @@ if __name__ == "__main__":
     if vid_frac < 0.2:
         sep("EXTRACTING SSL VIDEO FEATURES")
         extract_ssl_video_features(ssl_pool)
-        vid_frac = 1.0   # features now on disk; full 4-pair SSL will run
+        # Re-probe after extraction to get true coverage (not blindly assume 1.0)
+        def _recheck(r):
+            sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
+            pc, _, _ = get_vid_paths(sid)
+            return pc is not None and pc.exists()
+        _probe2  = ssl_pool.sample(min(20, len(ssl_pool)), random_state=1)
+        vid_frac = _probe2.apply(_recheck, axis=1).mean()
+        print(f"  Video coverage after extraction: {vid_frac:.0%}")
 
     # PHASE 1: SSL on unlabelled pool (labels never accessed)
     train_cross_modal_ssl(ssl_pool, vid_frac=vid_frac)
