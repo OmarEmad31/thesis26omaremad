@@ -168,12 +168,17 @@ def load_splits():
 # ─────────────────────────────────────────────────────────
 # FIX 1 — UNLABELLED SSL POOL  (from all_segments.xlsx)
 # ─────────────────────────────────────────────────────────
-def load_unlabelled_pool(n=UNLABELLED_N, seed=42):
+def load_unlabelled_pool(exclude_ids=None, n=UNLABELLED_N, seed=42):
     """
     Loads truly unlabelled segments from all_segments.xlsx (NaN emotion label).
-    Probes 20 random samples to report video feature (.npy) availability.
-    Video coverage is passed to train_cross_modal_ssl so it can skip
-    video pairs and avoid training the video encoder on zero-vectors.
+
+    exclude_ids: set of sample_id strings from val+test splits. Explicitly
+      removed even if NaN filter didn't catch them — guarantees val/test audio
+      and text are never seen during SSL regardless of annotation completeness
+      in the xlsx.
+
+    Returns (pool_df, vid_frac) where vid_frac is the fraction of pool samples
+    that have video .npy features available (from a 20-sample probe).
     """
     df = pd.read_excel(str(UNLABELLED_XLSX))
     unlabelled = df[df['Final Overall (majority of modalities)'].isna()].copy()
@@ -184,6 +189,14 @@ def load_unlabelled_pool(n=UNLABELLED_N, seed=42):
         unlabelled['transcript'].apply(
             lambda t: isinstance(t, str) and len(t.strip()) > 2)
     ].reset_index(drop=True)
+
+    # Explicit guard: remove any val/test samples regardless of NaN filter accuracy
+    if exclude_ids:
+        before = len(unlabelled)
+        unlabelled = unlabelled[~unlabelled['sample_id'].isin(exclude_ids)].reset_index(drop=True)
+        removed = before - len(unlabelled)
+        if removed:
+            print(f"  Removed {removed} val/test sample(s) found in unlabelled pool (annotation gap in xlsx)")
 
     def _has_vid(r):
         sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
@@ -853,7 +866,9 @@ if __name__ == "__main__":
     tr, va, te = load_splits()
 
     sep("LOADING UNLABELLED SSL POOL")
-    ssl_pool, vid_frac = load_unlabelled_pool()
+    # Pass val+test IDs so they are explicitly excluded from SSL pool
+    _excl = set(va['sample_id'].values) | set(te['sample_id'].values)
+    ssl_pool, vid_frac = load_unlabelled_pool(exclude_ids=_excl)
 
     # PHASE 1: SSL on unlabelled pool (labels never accessed)
     # vid_frac controls whether video pairs are included (skipped if pool lacks .npy features)
