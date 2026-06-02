@@ -168,13 +168,12 @@ def load_splits():
 # ─────────────────────────────────────────────────────────
 # FIX 1 — UNLABELLED SSL POOL  (from all_segments.xlsx)
 # ─────────────────────────────────────────────────────────
-def load_unlabelled_pool(tr_fallback=None, n=UNLABELLED_N, seed=42):
+def load_unlabelled_pool(n=UNLABELLED_N, seed=42):
     """
     Loads truly unlabelled segments from all_segments.xlsx (NaN emotion label).
-    Probes 20 random samples to check video feature (.npy) availability.
-    If < 20% have video features, falls back to tr_fallback (labelled data
-    with labels never accessed) so the video encoder trains on real features
-    instead of zero-vectors.
+    Probes 20 random samples to report video feature (.npy) availability.
+    Video coverage is passed to train_cross_modal_ssl so it can skip
+    video pairs and avoid training the video encoder on zero-vectors.
     """
     df = pd.read_excel(str(UNLABELLED_XLSX))
     unlabelled = df[df['Final Overall (majority of modalities)'].isna()].copy()
@@ -186,7 +185,6 @@ def load_unlabelled_pool(tr_fallback=None, n=UNLABELLED_N, seed=42):
             lambda t: isinstance(t, str) and len(t.strip()) > 2)
     ].reset_index(drop=True)
 
-    # Probe video feature availability on 20 random samples
     def _has_vid(r):
         sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
         pc, _, _ = get_vid_paths(sid)
@@ -194,19 +192,12 @@ def load_unlabelled_pool(tr_fallback=None, n=UNLABELLED_N, seed=42):
 
     probe    = unlabelled.sample(min(20, len(unlabelled)), random_state=0)
     vid_frac = probe.apply(_has_vid, axis=1).mean()
-    print(f"  Video feature coverage (probe 20 samples): {vid_frac:.0%}")
+    print(f"  Video feature coverage (probe): {vid_frac:.0%}")
 
-    if vid_frac < 0.2 and tr_fallback is not None:
-        # Unlabelled data lacks video features → SSL video encoder would train on zeros.
-        # Fall back to labelled pool with labels stripped so video SSL is meaningful.
-        print("  Low video coverage → falling back to tr+va as SSL pool (labels never accessed)")
-        pool = tr_fallback.sample(n=min(n, len(tr_fallback)), random_state=seed).reset_index(drop=True)
-    else:
-        n_use = min(n, len(unlabelled))
-        pool  = unlabelled.sample(n=n_use, random_state=seed).reset_index(drop=True)
-
-    print(f"  SSL pool : {len(pool)} samples (labels never accessed)")
-    return pool
+    n_use = min(n, len(unlabelled))
+    pool  = unlabelled.sample(n=n_use, random_state=seed).reset_index(drop=True)
+    print(f"  SSL pool : {n_use} samples (labels never accessed)")
+    return pool, vid_frac
 
 
 # ─────────────────────────────────────────────────────────
@@ -436,18 +427,28 @@ class CrossModalInfoNCE(nn.Module):
                 self._pair_loss(z_t, z_v)) / 3.0
 
 
-def train_cross_modal_ssl(ssl_pool):
+def train_cross_modal_ssl(ssl_pool, vid_frac=1.0):
     """
     FIX 1: receives ssl_pool (labels already dropped before this call).
     FIX 3: gradient accumulation → effective batch = CM_SSL_BATCH × CM_GRAD_ACC.
     FIX 6: real token masking applied per-batch for text views.
     FIX 7: SSL loss logged every epoch.
+    vid_frac: fraction of pool with valid video features (from load_unlabelled_pool probe).
+      If < 0.2, skip A-V and T-V pairs so video encoder is not trained on zero-vectors.
+      video_ssl.pt is only saved when video pairs are computed.
     """
     sep("PHASE 1 -- CROSS-MODAL SSL (Audio × Text × Video | InfoNCE)")
     ckpts = [SSL_DIR/"audio_ssl.pt", SSL_DIR/"text_ssl.pt", SSL_DIR/"video_ssl.pt"]
-    if all(c.exists() for c in ckpts):
-        print("  [SKIP] All 3 SSL checkpoints found — delete all to retrain.")
+    # Only require audio+text checkpoints to skip; video may not exist if pool had no features
+    if ckpts[0].exists() and ckpts[1].exists():
+        status = "all 3" if ckpts[2].exists() else "audio+text (no video features in pool)"
+        print(f"  [SKIP] SSL checkpoints found ({status}) — delete to retrain.")
         return
+
+    has_video_ssl = vid_frac >= 0.2
+    if not has_video_ssl:
+        print(f"  Video coverage {vid_frac:.0%} < 20% — running audio-text SSL only.")
+        print(f"  Video encoder will NOT receive SSL weights (avoids training on zero-vectors).")
 
     set_seed(42)
     eff_batch = CM_SSL_BATCH * CM_GRAD_ACC
@@ -509,17 +510,22 @@ def train_cross_modal_ssl(ssl_pool):
             ids_v2 = mask_tokens(ids)
 
             with autocast("cuda"):
-                z_a = a_enc(wav)
-                z_t = t_enc(ids_v1, mask)   # view 1
-                z_v = v_enc(vid)
-                # second text view for text–text pair (optional, adds signal)
-                z_t2 = t_enc(ids_v2, mask)  # view 2
+                z_a  = a_enc(wav)
+                z_t  = t_enc(ids_v1, mask)   # view 1
+                z_t2 = t_enc(ids_v2, mask)   # view 2
 
-                # 4-pair loss: A-T, A-V, T-V, T1-T2
-                loss = (loss_fn._pair_loss(z_a, z_t) +
-                        loss_fn._pair_loss(z_a, z_v) +
-                        loss_fn._pair_loss(z_t, z_v) +
-                        loss_fn._pair_loss(z_t, z_t2)) / 4.0
+                if has_video_ssl:
+                    z_v  = v_enc(vid)
+                    # 4-pair loss: A-T, A-V, T-V, T1-T2
+                    loss = (loss_fn._pair_loss(z_a, z_t) +
+                            loss_fn._pair_loss(z_a, z_v) +
+                            loss_fn._pair_loss(z_t, z_v) +
+                            loss_fn._pair_loss(z_t, z_t2)) / 4.0
+                else:
+                    # Audio-text only: A-T and T1-T2 (no video pairs to avoid zero-vector training)
+                    loss = (loss_fn._pair_loss(z_a, z_t) +
+                            loss_fn._pair_loss(z_t, z_t2)) / 2.0
+
                 loss = loss / CM_GRAD_ACC  # FIX 3: scale for accumulation
 
             scaler.scale(loss).backward()
@@ -538,8 +544,11 @@ def train_cross_modal_ssl(ssl_pool):
 
     torch.save({'backbone': a_enc.backbone.state_dict(), 'lw': a_enc.lw.data}, str(ckpts[0]))
     torch.save({k: v for k,v in t_enc.state_dict().items() if 'proj' not in k}, str(ckpts[1]))
-    torch.save({k: v for k,v in v_enc.state_dict().items() if 'proj' not in k}, str(ckpts[2]))
-    print("  [SAVED] audio_ssl.pt | text_ssl.pt | video_ssl.pt")
+    if has_video_ssl:
+        torch.save({k: v for k,v in v_enc.state_dict().items() if 'proj' not in k}, str(ckpts[2]))
+        print("  [SAVED] audio_ssl.pt | text_ssl.pt | video_ssl.pt")
+    else:
+        print("  [SAVED] audio_ssl.pt | text_ssl.pt  (video_ssl.pt skipped — no video features in pool)")
 
 
 # ─────────────────────────────────────────────────────────
@@ -658,8 +667,11 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
         ds_te = VideoFTDS(test_df)
         m     = VideoFTModel(SSL_PROJ_DIM).to(DEVICE)
         if use_ssl:
-            m.backbone.load_state_dict(
-                torch.load(SSL_DIR/"video_ssl.pt", map_location=DEVICE), strict=False)
+            _vid_ckpt = SSL_DIR/"video_ssl.pt"
+            if _vid_ckpt.exists():
+                m.backbone.load_state_dict(torch.load(_vid_ckpt, map_location=DEVICE), strict=False)
+            else:
+                print(f"  [INFO] video_ssl.pt not found (pool had no video features) — video uses random init")
         lr_bb = 3e-5 if use_ssl else 1e-5  # FIX 5
         lr_hd = 1e-3
         bs    = 32
@@ -840,14 +852,12 @@ if __name__ == "__main__":
     sep(f"CONTRASTIVE PIPELINE v3 | Device: {DEVICE}")
     tr, va, te = load_splits()
 
-    # SSL pool: truly unlabelled segments from all_segments.xlsx.
-    # tr+va passed as fallback in case unlabelled data lacks video features.
     sep("LOADING UNLABELLED SSL POOL")
-    ssl_pool = load_unlabelled_pool(
-        tr_fallback=pd.concat([tr, va]).reset_index(drop=True))
+    ssl_pool, vid_frac = load_unlabelled_pool()
 
     # PHASE 1: SSL on unlabelled pool (labels never accessed)
-    train_cross_modal_ssl(ssl_pool)
+    # vid_frac controls whether video pairs are included (skipped if pool lacks .npy features)
+    train_cross_modal_ssl(ssl_pool, vid_frac=vid_frac)
     sep("PHASE 1 COMPLETE")
 
     # PHASE 2: Ablation using ALL labelled train data
