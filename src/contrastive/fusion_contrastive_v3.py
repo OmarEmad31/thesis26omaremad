@@ -73,7 +73,7 @@ DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 # Constants
 SSL_PROJ_DIM  = 128
 SSL_TEMP      = 0.07
-CM_SSL_EPOCHS = 35
+CM_SSL_EPOCHS = 50
 CM_SSL_BATCH  = 8
 # FIX 3: gradient accumulation steps → effective batch = 8 × 4 = 32
 CM_GRAD_ACC   = 4
@@ -168,13 +168,13 @@ def load_splits():
 # ─────────────────────────────────────────────────────────
 # FIX 1 — UNLABELLED SSL POOL  (from all_segments.xlsx)
 # ─────────────────────────────────────────────────────────
-def load_unlabelled_pool(n=UNLABELLED_N, seed=42):
+def load_unlabelled_pool(tr_fallback=None, n=UNLABELLED_N, seed=42):
     """
-    Loads truly unlabelled segments from all_segments.xlsx.
-    Only rows where 'Final Overall (majority of modalities)' is NaN are kept —
-    these segments were never assigned an emotion label by any annotator.
-    Column mapping mirrors what CrossModalSSLDS expects:
-      folder, audio_relpath, sample_id, transcript
+    Loads truly unlabelled segments from all_segments.xlsx (NaN emotion label).
+    Probes 20 random samples to check video feature (.npy) availability.
+    If < 20% have video features, falls back to tr_fallback (labelled data
+    with labels never accessed) so the video encoder trains on real features
+    instead of zero-vectors.
     """
     df = pd.read_excel(str(UNLABELLED_XLSX))
     unlabelled = df[df['Final Overall (majority of modalities)'].isna()].copy()
@@ -185,9 +185,27 @@ def load_unlabelled_pool(n=UNLABELLED_N, seed=42):
         unlabelled['transcript'].apply(
             lambda t: isinstance(t, str) and len(t.strip()) > 2)
     ].reset_index(drop=True)
-    n_use = min(n, len(unlabelled))
-    pool  = unlabelled.sample(n=n_use, random_state=seed).reset_index(drop=True)
-    print(f"  Unlabelled pool : {len(unlabelled)} available → using {n_use} (labels never accessed)")
+
+    # Probe video feature availability on 20 random samples
+    def _has_vid(r):
+        sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
+        pc, _, _ = get_vid_paths(sid)
+        return pc is not None and pc.exists()
+
+    probe    = unlabelled.sample(min(20, len(unlabelled)), random_state=0)
+    vid_frac = probe.apply(_has_vid, axis=1).mean()
+    print(f"  Video feature coverage (probe 20 samples): {vid_frac:.0%}")
+
+    if vid_frac < 0.2 and tr_fallback is not None:
+        # Unlabelled data lacks video features → SSL video encoder would train on zeros.
+        # Fall back to labelled pool with labels stripped so video SSL is meaningful.
+        print("  Low video coverage → falling back to tr+va as SSL pool (labels never accessed)")
+        pool = tr_fallback.sample(n=min(n, len(tr_fallback)), random_state=seed).reset_index(drop=True)
+    else:
+        n_use = min(n, len(unlabelled))
+        pool  = unlabelled.sample(n=n_use, random_state=seed).reset_index(drop=True)
+
+    print(f"  SSL pool : {len(pool)} samples (labels never accessed)")
     return pool
 
 
@@ -657,17 +675,25 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
     dl_va = DataLoader(ds_va, batch_size=bs)
     dl_te = DataLoader(ds_te, batch_size=bs)
 
+    # SSL scenarios need more epochs to adapt contrastive reps to classification
+    n_epochs  = 25 if use_ssl else 20
     sch       = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=[lr_bb, lr_hd], steps_per_epoch=len(dl_tr), epochs=20)
+        opt, max_lr=[lr_bb, lr_hd], steps_per_epoch=len(dl_tr), epochs=n_epochs)
     supcon_fn = SupConLoss(SSL_TEMP)
     best_acc, ckpt = 0, SAVE_DIR / f"{name.lower()}_ft.pt"
+
+    # Lower SupCon weight for SSL+SupCon to reduce val→test overfit
+    supcon_final_w = 0.2 if (use_ssl and use_supcon) else 0.3
 
     y_tr     = np.array([LID[e] for e in train_df['emotion_final']])
     cw       = compute_class_weight('balanced', classes=np.arange(7), y=y_tr)
     cw_tensor = torch.tensor(cw, dtype=torch.float).to(DEVICE)
 
-    for ep in range(1, 21):
+    for ep in range(1, n_epochs + 1):
         m.train()
+        # SupCon warmup: ramp from 0 → supcon_final_w over first 5 epochs
+        # CE dominates early so backbone stabilises before contrastive loss kicks in
+        cur_supcon_w = supcon_final_w * min(1.0, ep / 5.0) if use_supcon else 0.0
         for batch in dl_tr:
             opt.zero_grad()
             if name == "TEXT":
@@ -677,7 +703,7 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
                 logits, proj = m(batch[0].to(DEVICE))
             labels = batch[1].to(DEVICE)
             loss   = F.cross_entropy(logits, labels, weight=cw_tensor, label_smoothing=0.1)
-            if use_supcon: loss += 0.3 * supcon_fn(proj, labels)
+            if use_supcon: loss += cur_supcon_w * supcon_fn(proj, labels)
             loss.backward(); opt.step(); sch.step()
 
         m.eval(); ps, ts = [], []
@@ -814,9 +840,11 @@ if __name__ == "__main__":
     sep(f"CONTRASTIVE PIPELINE v3 | Device: {DEVICE}")
     tr, va, te = load_splits()
 
-    # SSL pool: truly unlabelled segments from all_segments.xlsx (no emotion label ever assigned)
+    # SSL pool: truly unlabelled segments from all_segments.xlsx.
+    # tr+va passed as fallback in case unlabelled data lacks video features.
     sep("LOADING UNLABELLED SSL POOL")
-    ssl_pool = load_unlabelled_pool()
+    ssl_pool = load_unlabelled_pool(
+        tr_fallback=pd.concat([tr, va]).reset_index(drop=True))
 
     # PHASE 1: SSL on unlabelled pool (labels never accessed)
     train_cross_modal_ssl(ssl_pool)
