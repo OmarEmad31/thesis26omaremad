@@ -51,14 +51,30 @@ for d in [SAVE_DIR, SSL_DIR, SSL_VID_DIR]: d.mkdir(exist_ok=True)
 
 def auto_detect():
     print("  Smart-detecting data locations...")
+
+    # Auto-extract zip if the local target dir is missing or empty.
+    # Never rglob over /content/ — the Drive mount is a network FS and hangs.
+    vid_local = Path("/content/video_sequences_v1")
+    zip_path  = Path("/content/drive/MyDrive/video_sequences_v1.zip")
+    if zip_path.exists() and not (vid_local.exists() and any(vid_local.glob("*_clip_seq.npy"))):
+        import subprocess as _sp
+        print("  Extracting video_sequences_v1.zip → /content/ ...")
+        _sp.run(["unzip", "-q", str(zip_path), "-d", "/content/"], check=True)
+        print("  Extraction complete.")
+
+    # Check known candidate paths in priority order (no rglob).
     v_dir = None
-    for p in Path("/content").rglob("*_clip_seq.npy"):
-        if "drive" not in str(p):
-            v_dir = p.parent; break
+    for candidate in [
+        Path("/content/video_sequences_v1"),
+        Path("/content/drive/MyDrive/Thesis Project/data/processed/features/video_sequences_v1"),
+        Path("/content/drive/MyDrive/Thesis Project/data/processed/features"),
+    ]:
+        if candidate.exists() and any(candidate.glob("*_clip_seq.npy")):
+            v_dir = candidate
+            break
     if not v_dir:
-        v_dir = Path("/content/drive/MyDrive/Thesis Project/data/processed/features/video_sequences_v1")
-        if not v_dir.exists():
-            v_dir = Path("/content/drive/MyDrive/Thesis Project/data/processed/features")
+        v_dir = Path("/content/drive/MyDrive/Thesis Project/data/processed/features")
+
     a_dir = Path("/content/drive/MyDrive/Thesis Project/dataset/Final Modalink Dataset MERGED")
     return v_dir, a_dir
 
