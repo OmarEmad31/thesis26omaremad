@@ -59,7 +59,9 @@ def auto_detect():
     if zip_path.exists() and not (vid_local.exists() and any(vid_local.glob("*_clip_seq.npy"))):
         import subprocess as _sp
         print("  Extracting video_sequences_v1.zip → /content/ ...")
-        _sp.run(["unzip", "-q", str(zip_path), "-d", "/content/"], check=True)
+        r = _sp.run(["unzip", "-q", str(zip_path), "-d", "/content/"], capture_output=True)
+        if r.returncode not in (0, 1):  # 1 = warnings only, extraction still succeeded
+            raise RuntimeError(f"unzip failed (code {r.returncode}): {r.stderr.decode()[:300]}")
         print("  Extraction complete.")
 
     # Check known candidate paths in priority order (no rglob).
