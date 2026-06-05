@@ -54,15 +54,27 @@ def auto_detect():
 
     # Auto-extract zip if the local target dir is missing or empty.
     # Never rglob over /content/ — the Drive mount is a network FS and hangs.
+    import subprocess as _sp
+
     vid_local = Path("/content/video_sequences_v1")
     zip_path  = Path("/content/drive/MyDrive/video_sequences_v1.zip")
     if zip_path.exists() and not (vid_local.exists() and any(vid_local.glob("*_clip_seq.npy"))):
-        import subprocess as _sp
         print("  Extracting video_sequences_v1.zip → /content/ ...")
         r = _sp.run(["unzip", "-q", str(zip_path), "-d", "/content/"], capture_output=True)
         if r.returncode not in (0, 1):  # 1 = warnings only, extraction still succeeded
             raise RuntimeError(f"unzip failed (code {r.returncode}): {r.stderr.decode()[:300]}")
         print("  Extraction complete.")
+
+    # Auto-extract pre-computed SSL pool video features (1500 unlabelled samples)
+    ssl_vid_local = Path("/content/ssl_video_features")
+    ssl_zip_path  = Path("/content/drive/MyDrive/ssl_video_features.zip")
+    if ssl_zip_path.exists() and not (ssl_vid_local.exists() and any(ssl_vid_local.glob("*_clip_seq.npy"))):
+        print("  Extracting ssl_video_features.zip → /content/ ...")
+        r = _sp.run(["unzip", "-q", str(ssl_zip_path), "-d", "/content/"], capture_output=True)
+        if r.returncode not in (0, 1):
+            print(f"  [WARN] ssl_video_features.zip extraction issue: {r.stderr.decode()[:200]}")
+        else:
+            print(f"  SSL video features extracted.")
 
     # Check known candidate paths in priority order (no rglob).
     v_dir = None
@@ -874,7 +886,16 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
             else:
                 logits, _ = m(batch[0].to(DEVICE))
             probs.append(F.softmax(logits, 1).cpu().numpy())
-    return np.vstack(probs)
+
+    all_probs = np.vstack(probs)
+    te_labels_arr = np.array([LID[e] for e in test_df['emotion_final'].values])
+    te_preds = all_probs.argmax(1)
+    mod_acc = accuracy_score(te_labels_arr, te_preds)
+    mod_f1  = f1_score(te_labels_arr, te_preds, average='macro', zero_division=0)
+    print(f"\n  ── {name} TEST (SSL={use_ssl}, SupCon={use_supcon}) ──")
+    print(f"     Accuracy : {mod_acc:.4f}")
+    print(f"     F1 macro : {mod_f1:.4f}")
+    return all_probs
 
 
 # ─────────────────────────────────────────────────────────
@@ -966,6 +987,11 @@ def run_ablation(tr, va, te):
         })
         print(f"\n  >>> {sc['name']} | Val Acc: {best_acc_val:.4f} | "
               f"Test Acc: {test_acc:.4f} | Test F1: {test_f1:.4f} | Weights: {best_w}")
+
+        per_cls_f1 = f1_score(te_labels, fp_te.argmax(1), average=None, zero_division=0)
+        print(f"  Per-emotion F1 [{sc['name']}]:")
+        for cls_name, cls_f1 in zip(CLASSES, per_cls_f1):
+            print(f"    {cls_name:<12s}: {cls_f1:.4f}")
 
     sep("FINAL ABLATION RESULTS")
     df = pd.DataFrame(results)
