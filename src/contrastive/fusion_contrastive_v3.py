@@ -43,7 +43,9 @@ cands = [c for c in cands if os.path.isdir(c) and (Path(c)/"src").exists()]
 _repo_str = cands[0] if cands else "/content/thesis"
 
 REPO        = Path(_repo_str)
-SPLIT_DIR   = REPO / "data/processed/splits/multimodal_eligible"
+# Support both repo layouts: old data/ tree and new top-level splits/
+_split_candidate = REPO / "data/processed/splits/multimodal_eligible"
+SPLIT_DIR   = _split_candidate if _split_candidate.exists() else REPO / "splits"
 SAVE_DIR    = Path("/content/fusion_models")
 SSL_DIR     = Path("/content/ssl_pretrained")
 SSL_VID_DIR = Path("/content/ssl_video_features")   # on-demand features for unlabelled SSL pool
