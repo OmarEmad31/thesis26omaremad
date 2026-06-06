@@ -802,8 +802,6 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
     grad_acc  = 1  # default; overridden for audio below
 
     y_tr = np.array([LID[e] for e in train_df['emotion_final']])
-    cw   = compute_class_weight('balanced', classes=np.arange(7), y=y_tr)
-    cw_t = torch.tensor(cw, dtype=torch.float).to(DEVICE)
 
     if name == "AUDIO":
         ds_tr = AudioFTDS(train_df, augment=True)   # time masking + noise during training
@@ -882,15 +880,17 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
     opt_steps_per_epoch = max(1, len(dl_tr) // grad_acc)
     sch = make_lr_scheduler(opt, n_epochs, opt_steps_per_epoch, warmup_frac=0.05)
 
-    # V4-01: FocalLoss (γ=2) with class weights and label smoothing=0.05
-    loss_fn   = FocalLoss(gamma=2.0, weight=cw_t, label_smoothing=0.05)
+    # V4-01: FocalLoss (γ=2).  No class-weight here — WeightedRandomSampler already
+    # balances the batch distribution.  Adding class weights on top would doubly penalise
+    # minority classes (~20× for Surprise) and cause the model to memorise those samples.
+    loss_fn   = FocalLoss(gamma=2.0, weight=None, label_smoothing=0.05)
     # V4-05: SupCon temperature=0.15 (was 0.07 — too tight); weight=0.05 (was 0.2–0.3)
     supcon_fn = SupConLoss(temperature=0.15)
     SUPCON_W  = 0.05
 
     best_f1, no_improve = 0.0, 0
-    ckpt = SAVE_DIR / f"{name.lower()}_ft.pt"
-    scaler = GradScaler()
+    ckpt   = SAVE_DIR / f"{name.lower()}_ft.pt"
+    scaler = GradScaler()  # used with autocast below for mixed-precision FT
 
     for ep in range(1, n_epochs + 1):
         m.train()
@@ -902,23 +902,26 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
         opt.zero_grad()
 
         for batch_i, batch in enumerate(dl_tr):
-            if name == "TEXT":
-                logits, proj = m(batch[0]['input_ids'].to(DEVICE),
-                                 batch[0]['attention_mask'].to(DEVICE))
-            else:
-                logits, proj = m(batch[0].to(DEVICE))
-            labels = batch[1].to(DEVICE)
+            with autocast("cuda"):
+                if name == "TEXT":
+                    logits, proj = m(batch[0]['input_ids'].to(DEVICE),
+                                     batch[0]['attention_mask'].to(DEVICE))
+                else:
+                    logits, proj = m(batch[0].to(DEVICE))
+                labels = batch[1].to(DEVICE)
+                loss   = loss_fn(logits, labels)
+                if use_supcon:
+                    loss = loss + cur_supcon_w * supcon_fn(proj, labels)
+                loss = loss / grad_acc
 
-            loss = loss_fn(logits, labels)
-            if use_supcon:
-                loss = loss + cur_supcon_w * supcon_fn(proj, labels)
-            loss = loss / grad_acc
-            loss.backward()
+            scaler.scale(loss).backward()
             acc_loss += loss.item() * grad_acc
 
             if (batch_i + 1) % grad_acc == 0 or (batch_i + 1) == len(dl_tr):
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(m.parameters(), max_norm=1.0)
-                opt.step(); sch.step(); opt.zero_grad()
+                scaler.step(opt); scaler.update()
+                sch.step(); opt.zero_grad()
                 opt_step_count += 1
 
         m.eval(); ps, ts = [], []
