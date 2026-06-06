@@ -690,9 +690,9 @@ def train_cross_modal_ssl(ssl_pool, vid_frac=1.0):
 # PHASE 2 — FINE-TUNING MODEL CLASSES
 # ─────────────────────────────────────────────────────────
 class AudioFTDS(Dataset):
-    def __init__(self, df, sr=16000, maxlen=80000):
+    def __init__(self, df, sr=16000, maxlen=80000, augment=False):
         self.df = df.reset_index(drop=True)
-        self.sr = sr; self.maxlen = maxlen
+        self.sr = sr; self.maxlen = maxlen; self.augment = augment
     def __len__(self): return len(self.df)
     def __getitem__(self, i):
         r = self.df.iloc[i]
@@ -703,6 +703,13 @@ class AudioFTDS(Dataset):
             y, _ = librosa.effects.trim(y, top_db=25)
             y    = y[:self.maxlen] if len(y)>self.maxlen else np.pad(y,(0,self.maxlen-len(y)))
         except: y = np.zeros(self.maxlen)
+        if self.augment:
+            # time masking: zero out up to 15% of waveform at a random position
+            mask_len = random.randint(0, int(0.15 * self.maxlen))
+            start    = random.randint(0, max(0, self.maxlen - mask_len))
+            y = y.copy(); y[start:start + mask_len] = 0.0
+            # light additive noise (std=0.001, imperceptible but prevents exact memorisation)
+            y = (y + 0.001 * np.random.randn(len(y))).astype(np.float32)
         return torch.tensor(y, dtype=torch.float32), torch.tensor(LID[r['emotion_final']], dtype=torch.long)
 
 class TextFTDS(Dataset):
@@ -715,14 +722,21 @@ class TextFTDS(Dataset):
         return {k: v[i] for k,v in self.enc.items()}, torch.tensor(self.labels[i], dtype=torch.long)
 
 class VideoFTDS(Dataset):
-    def __init__(self, df):
-        self.df = df.reset_index(drop=True)
+    def __init__(self, df, augment=False):
+        self.df = df.reset_index(drop=True); self.augment = augment
     def __len__(self): return len(self.df)
     def __getitem__(self, i):
         r   = self.df.iloc[i]
         sid = r['sample_id'].replace("::","__").replace("/","_").replace(".mp4","")
         pc, pd, pr = get_vid_paths(sid)
         seq = np.concatenate([np.load(pc), np.load(pd), np.load(pr)], -1)
+        if self.augment:
+            # randomly zero out 1–3 frames (out of 16) to improve temporal robustness
+            n_drop = random.randint(1, 3)
+            for idx in random.sample(range(16), n_drop):
+                seq[idx] = 0.0
+            # tiny feature noise (std=0.01) — keeps embeddings in training distribution
+            seq = (seq + 0.01 * np.random.randn(*seq.shape)).astype(np.float32)
         return torch.tensor(seq, dtype=torch.float32), torch.tensor(LID[r['emotion_final']], dtype=torch.long)
 
 class AudioFTModel(nn.Module):
@@ -792,7 +806,7 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
     cw_t = torch.tensor(cw, dtype=torch.float).to(DEVICE)
 
     if name == "AUDIO":
-        ds_tr = AudioFTDS(train_df)
+        ds_tr = AudioFTDS(train_df, augment=True)   # time masking + noise during training
         ds_va = AudioFTDS(val_df)
         ds_te = AudioFTDS(test_df)
         m     = AudioFTModel(SSL_PROJ_DIM).to(DEVICE)
@@ -803,7 +817,11 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
             # V4-08: unfreeze WavLM layers 4+ for SSL-pretrained (more adaptation capacity)
             for i, layer in enumerate(m.backbone.backbone.encoder.layers):
                 for p in layer.parameters(): p.requires_grad = (i >= 4)
-        lr_bb = 3e-5 if use_ssl else 1e-5
+        else:
+            # Non-SSL: unfreeze layers 6+ (pre-trained backbone, fewer layers = less overfit)
+            for i, layer in enumerate(m.backbone.backbone.encoder.layers):
+                for p in layer.parameters(): p.requires_grad = (i >= 6)
+        lr_bb = 3e-5 if use_ssl else 2e-5  # WavLM is pre-trained; gentle LR
         lr_hd = 1e-3
         bs    = 8
         grad_acc = 4  # V4-10: effective batch = 32
@@ -821,15 +839,15 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
             for i, layer in enumerate(m.backbone.bert.encoder.layer):
                 for p in layer.parameters(): p.requires_grad = (i >= 6)
         else:
-            # Non-SSL: unfreeze layers 8+ (cold start — fewer layers to avoid overfit)
+            # Non-SSL: unfreeze layers 7+ (one extra layer vs v3 for more capacity)
             for i, layer in enumerate(m.backbone.bert.encoder.layer):
-                for p in layer.parameters(): p.requires_grad = (i >= 8)
-        lr_bb = 3e-5 if use_ssl else 1e-5
+                for p in layer.parameters(): p.requires_grad = (i >= 7)
+        lr_bb = 3e-5 if use_ssl else 2e-5  # MARBERT is pre-trained
         lr_hd = 5e-4
         bs    = 16
 
     else:  # VIDEO
-        ds_tr = VideoFTDS(train_df)
+        ds_tr = VideoFTDS(train_df, augment=True)   # frame dropout + feature noise during training
         ds_va = VideoFTDS(val_df)
         ds_te = VideoFTDS(test_df)
         m     = VideoFTModel(SSL_PROJ_DIM).to(DEVICE)
@@ -839,7 +857,10 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
                 m.backbone.load_state_dict(torch.load(_vid_ckpt, map_location=DEVICE), strict=False)
             else:
                 print(f"  [INFO] video_ssl.pt not found — video uses random init")
-        lr_bb = 3e-5 if use_ssl else 1e-5
+        # CRITICAL FIX: non-SSL video backbone is RANDOMLY INITIALIZED (custom transformer,
+        # no pre-trained weights). It needs head-level LR (1e-3), not fine-tuning LR (1e-5).
+        # Using 1e-5 starved the transformer of gradients → capped baseline video at ~53%.
+        lr_bb = 3e-5 if use_ssl else 1e-3
         lr_hd = 1e-3
         bs    = 32
 
