@@ -240,12 +240,15 @@ def load_unlabelled_pool(exclude_ids=None, n=UNLABELLED_N, seed=42):
         pc, _, _ = get_vid_paths(sid)
         return pc is not None and pc.exists()
 
-    probe    = unlabelled.sample(min(20, len(unlabelled)), random_state=0)
+    n_use = min(n, len(unlabelled))
+    pool  = unlabelled.sample(n=n_use, random_state=seed).reset_index(drop=True)
+
+    # Probe the POOL (not the full unlabelled set) — we only care about coverage
+    # for the 1500 samples actually used in SSL, not the full 4000+ candidate pool
+    probe    = pool.sample(min(20, len(pool)), random_state=0)
     vid_frac = probe.apply(_has_vid, axis=1).mean()
     print(f"  Video feature coverage (probe): {vid_frac:.0%}")
 
-    n_use = min(n, len(unlabelled))
-    pool  = unlabelled.sample(n=n_use, random_state=seed).reset_index(drop=True)
     print(f"  SSL pool : {n_use} samples (labels never accessed)")
     return pool, vid_frac
 
