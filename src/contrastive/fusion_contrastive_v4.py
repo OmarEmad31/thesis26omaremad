@@ -451,7 +451,8 @@ def clean(t):
     return re.sub(r'\s+', ' ', t).strip()
 
 
-def mask_tokens(input_ids, mask_token_id=3, mask_prob=0.15, pad_token_id=0):
+def mask_tokens(input_ids, mask_token_id=4, mask_prob=0.15, pad_token_id=0):
+    # MARBERT: [PAD]=0 [UNK]=1 [CLS]=2 [SEP]=3 [MASK]=4  — default=4 not 3
     ids = input_ids.clone()
     prob_matrix = torch.rand_like(ids, dtype=torch.float)
     padding_mask = ids.eq(pad_token_id)
@@ -645,8 +646,8 @@ def train_cross_modal_ssl(ssl_pool, vid_frac=1.0):
             ids  = ids.to(DEVICE)
             mask = mask.to(DEVICE)
 
-            ids_v1 = mask_tokens(ids)
-            ids_v2 = mask_tokens(ids)
+            ids_v1 = mask_tokens(ids, mask_token_id=tok.mask_token_id)
+            ids_v2 = mask_tokens(ids, mask_token_id=tok.mask_token_id)
 
             with autocast("cuda"):
                 z_a  = a_enc(wav)
@@ -713,13 +714,21 @@ class AudioFTDS(Dataset):
         return torch.tensor(y, dtype=torch.float32), torch.tensor(LID[r['emotion_final']], dtype=torch.long)
 
 class TextFTDS(Dataset):
-    def __init__(self, texts, labels, tok):
+    def __init__(self, texts, labels, tok, augment=False):
         self.enc = tok([clean(str(t)) for t in texts], truncation=True,
                        padding="max_length", max_length=64, return_tensors="pt")
         self.labels = [LID[l] for l in labels]
+        self.augment = augment
+        self.mask_token_id = tok.mask_token_id  # MARBERT: 4, not 3
+        self.pad_token_id  = tok.pad_token_id or 0
     def __len__(self): return len(self.labels)
     def __getitem__(self, i):
-        return {k: v[i] for k,v in self.enc.items()}, torch.tensor(self.labels[i], dtype=torch.long)
+        ids  = self.enc['input_ids'][i]
+        attn = self.enc['attention_mask'][i]
+        if self.augment:
+            ids = mask_tokens(ids, mask_token_id=self.mask_token_id,
+                              pad_token_id=self.pad_token_id)
+        return {'input_ids': ids, 'attention_mask': attn}, torch.tensor(self.labels[i], dtype=torch.long)
 
 class VideoFTDS(Dataset):
     def __init__(self, df, augment=False):
@@ -826,7 +835,8 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
 
     elif name == "TEXT":
         tok   = AutoTokenizer.from_pretrained(MODEL_NAME)
-        ds_tr = TextFTDS(train_df['transcript'].values, train_df['emotion_final'].values, tok)
+        # augment=True during training: 15% random token masking (same as SSL, but now with correct MASK id)
+        ds_tr = TextFTDS(train_df['transcript'].values, train_df['emotion_final'].values, tok, augment=True)
         ds_va = TextFTDS(val_df['transcript'].values,   val_df['emotion_final'].values,   tok)
         ds_te = TextFTDS(test_df['transcript'].values,  test_df['emotion_final'].values,  tok)
         m     = TextFTModel(SSL_PROJ_DIM).to(DEVICE)
@@ -840,9 +850,12 @@ def train_modality_ft(name, train_df, val_df, test_df, use_ssl=True, use_supcon=
             # Non-SSL: unfreeze layers 7+ (one extra layer vs v3 for more capacity)
             for i, layer in enumerate(m.backbone.bert.encoder.layer):
                 for p in layer.parameters(): p.requires_grad = (i >= 7)
+        # Freeze BERT embedding layer: 637 samples too few to fine-tune embeddings safely
+        for p in m.backbone.bert.embeddings.parameters():
+            p.requires_grad = False
         lr_bb = 3e-5 if use_ssl else 2e-5  # MARBERT is pre-trained
         lr_hd = 5e-4
-        bs    = 16
+        bs    = 32  # was 16 — larger batch gives SupCon ~4-5 samples/class (was ~2)
 
     else:  # VIDEO
         ds_tr = VideoFTDS(train_df, augment=True)   # frame dropout + feature noise during training
